@@ -321,7 +321,18 @@ struct ChatView: View {
                                 id: message.id,
                                 alias: alias
                             )
-                        }
+                        },
+                        // Retry re-enters ``send``, so it answers to the same
+                        // lifecycle gate — and must LOOK like it does. It used
+                        // to render at full weight in every state and then do
+                        // nothing at all when the model wasn't running: the
+                        // gate fired, the banner flashed 400pt away at the
+                        // bottom of the window, and the button the user
+                        // actually pressed gave no feedback whatsoever. It now
+                        // dims and carries the Send tooltip's sentence, which
+                        // is the pattern ``sendOrStopButton`` already uses.
+                        retryEnabled: readiness.sendAllowed,
+                        retryTooltip: readiness.sendTooltip
                     )
                     .frame(maxWidth: contentMaxWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -644,6 +655,13 @@ private struct MessageRow: View {
     var toolResults: [String: ChatMessage] = [:]
     var onEdit: (String) -> Bool = { _ in false }
     var onRetry: () -> Bool = { false }
+    /// Whether Retry can actually start a turn right now. Mirrors the
+    /// composer's Send gate so a dead button is never shown at full
+    /// weight — see the call site in ``ChatView.transcriptRows``.
+    var retryEnabled: Bool = true
+    /// The one sentence explaining a disabled Retry. Same string the
+    /// Send button uses, so both channels say the same thing.
+    var retryTooltip: String = "Retry response"
 
     @State private var reasoningExpanded: Bool = false
     @State private var isEditing: Bool = false
@@ -833,7 +851,9 @@ private struct MessageRow: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
-            assistantActions
+            if showsAssistantActions {
+                assistantActions
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -857,12 +877,36 @@ private struct MessageRow: View {
             QuietIconButton(
                 symbol: "arrow.clockwise",
                 label: "Retry response",
+                help: retryEnabled ? "Retry response" : retryTooltip,
                 size: RapidTheme.ControlHeight.mini
             ) {
                 _ = onRetry()
             }
-            .disabled(isStreaming)
+            .disabled(isStreaming || !retryEnabled)
+            .accessibilityHint(retryEnabled ? "" : retryTooltip)
         }
+    }
+
+    /// Whether this assistant row is a finished ANSWER the user can copy
+    /// or regenerate — as opposed to a mid-turn tool dispatch.
+    ///
+    /// A tool round-trip writes two assistant rows into the transcript:
+    /// the one that requested the tool (prose empty, ``toolCalls``
+    /// populated, and the chips rendered under it), then the one that
+    /// reads the results and actually answers. Rendering the action row
+    /// under BOTH put a stray copy/retry pair between the weather chip
+    /// and the sentence it produced — pointing at nothing the user
+    /// thinks of as a response, since the visible answer is the row
+    /// below. Copy would have yielded the empty string, and Retry would
+    /// have rewound the same user turn the second row's Retry already
+    /// covers.
+    ///
+    /// Keyed on the tool-dispatch shape rather than "is the last row" so
+    /// it holds for every round of a multi-round turn, and for a row
+    /// still streaming its follow-up prose.
+    private var showsAssistantActions: Bool {
+        guard let calls = message.toolCalls, !calls.isEmpty else { return true }
+        return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var assistantCopyText: String {
