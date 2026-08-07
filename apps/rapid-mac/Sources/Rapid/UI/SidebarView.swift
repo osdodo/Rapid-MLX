@@ -377,8 +377,12 @@ struct SidebarView: View {
             )
         }
         Divider()
-        Button("Delete", role: .destructive) {
+        // Carries a glyph like every other item: a lone text row in an
+        // otherwise all-icon menu reads as a rendering bug, not emphasis.
+        Button(role: .destructive) {
             pendingDeletion = conv
+        } label: {
+            Label("Delete", systemImage: "trash")
         }
     }
 
