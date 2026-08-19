@@ -2882,6 +2882,39 @@ flow_chat_depth() {
     log "  markdown rendered: table cells and list items are their own elements,"
     log "  no raw fences, pipe rows or list markers, code block nested and intact,"
     log "  and the CJK answer kept its emoji and its right-to-left run"
+
+    # #2056: changing appearance used to leave the code card resolved against
+    # the old theme. Exercise the live transition on a transcript that already
+    # contains both a fenced block and a table, then hold every rendered shape
+    # to the same contract in Dark before returning to the light baseline.
+    open_settings
+    see_settings "$OUT/depth-settings.json"
+    press "$OUT/depth-settings.json" Settings.Category.appearance \
+        "$OUT/depth-appearance-open.json" \
+        || die "Appearance category is not pressable during markdown theme coverage"
+    see_settings "$OUT/depth-appearance.json"
+    press "$OUT/depth-appearance.json" Settings.Appearance.Theme.dark \
+        "$OUT/depth-dark-press.json" \
+        || die "Dark appearance is not pressable during markdown theme coverage"
+    see_settings "$OUT/depth-dark.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.dark")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/depth-dark.json" >/dev/null \
+        || die "Dark appearance did not become selected"
+    transcript_only "$OUT/depth-dark.json" "$OUT/depth-dark-transcript.json"
+    assert_rendered_shapes "$OUT/depth-dark-transcript.json" "$OUT/depth-dark"
+
+    press "$OUT/depth-dark.json" Settings.Appearance.Theme.light \
+        "$OUT/depth-light-press.json" \
+        || die "Light appearance is not pressable after the dark markdown check"
+    see_settings "$OUT/depth-light.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.light")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/depth-light.json" >/dev/null \
+        || die "Light appearance did not become selected"
+    log "  live Light → Dark → Light kept code blocks and tables rendered"
     baseline chat-depth.five-turns "$OUT/turn5-settled.json"
 
     # Restore has to bring back the WHOLE conversation. `chat-restore` only
