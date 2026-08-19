@@ -379,6 +379,12 @@ jobs:
         env:
           RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/math-rendering
 
+      - name: 'Golden flow: markdown-appearance'
+        continue-on-error: true
+        run: ./scripts/gui-golden-flows.sh --flow markdown-appearance
+        env:
+          RAPID_GUI_GOLDEN_OUT: ${{ runner.temp }}/golden/markdown-appearance
+
       - name: 'Golden flow: slow-stream-stop'
         continue-on-error: true
         run: ./scripts/gui-golden-flows.sh --flow slow-stream-stop
@@ -477,7 +483,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["GOLDEN_ROOT"])
-          expected = 24
+          expected = 25
           results = sorted(root.glob("*/result.json"))
           failures = []
           for path in results:
