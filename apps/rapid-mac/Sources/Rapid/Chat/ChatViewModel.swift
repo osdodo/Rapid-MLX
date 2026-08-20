@@ -179,6 +179,13 @@ final class ChatViewModel {
     /// process; production wires this from ``RapidApp.init``.
     private weak var server: ServerManager?
 
+    /// Store holding the full text of documents attached to conversations.
+    ///
+    /// Held so conversation deletion can delete the extracts too. Injectable
+    /// for the same reason ``conversationStoreURL`` is: a test that deletes a
+    /// seeded conversation must not reach into the user's real cache.
+    private let documentCache: DocumentContentCache
+
     init(
         client: ChatStreamClient = ChatStreamClient(),
         tools: any ToolRegistry = EmptyToolRegistry(),
@@ -187,7 +194,8 @@ final class ChatViewModel {
         customInstructions: CustomInstructionsConfig? = nil,
         server: ServerManager? = nil,
         persistsConversations: Bool = true,
-        conversationStoreURL: URL? = nil
+        conversationStoreURL: URL? = nil,
+        documentCache: DocumentContentCache = .shared
     ) {
         self.client = client
         self.tools = tools
@@ -197,6 +205,7 @@ final class ChatViewModel {
         self.server = server
         self.persistsConversations = persistsConversations
         self.conversationStoreURL = conversationStoreURL
+        self.documentCache = documentCache
         // Seed disabledTools from the persistent store. Anything explicitly set
         // to ``false`` in UserDefaults goes in; unknown keys default to enabled.
         var disabled = Set<String>()
@@ -491,7 +500,25 @@ final class ChatViewModel {
 
     /// Delete a saved conversation. If it was the open one, drop to a fresh
     /// empty transcript.
+    ///
+    /// Deleting the transcript deletes the DOCUMENTS attached to it. The
+    /// conversation is the only place those attachments are visible, so once it
+    /// is gone the user has no way to see — let alone remove — the full-text
+    /// extracts sitting in Application Support. Before the preview/full-text
+    /// split the whole extract lived inline in the history file and went with
+    /// it; this restores that property.
     func deleteConversation(_ id: UUID) {
+        // Collect the attachment ids BEFORE the transcript is torn down: the
+        // active-conversation branch below empties `messages`, and the stored
+        // conversation is removed after that.
+        var attachmentIDs: [UUID] = []
+        if id == activeConversationID {
+            attachmentIDs += messages.flatMap { $0.fileAttachments.map(\.id) }
+        }
+        if let stored = conversations.first(where: { $0.id == id }) {
+            attachmentIDs += stored.messages.flatMap { $0.fileAttachments.map(\.id) }
+        }
+
         // If deleting the OPEN conversation, tear down the live transcript
         // FIRST — otherwise the `isStreaming = false` below fires
         // persistActive() via didSet while the deleted messages + id are
@@ -510,6 +537,11 @@ final class ChatViewModel {
         }
         conversations.removeAll { $0.id == id }
         saveConversations()
+        // Last, so a failure anywhere above cannot leave the transcript intact
+        // while its documents are gone. ``remove`` also cancels any extraction
+        // still running, which for a large scan is minutes of Vision work on a
+        // document nobody will read again.
+        documentCache.remove(contentsOf: attachmentIDs)
     }
 
     // MARK: - In-memory message storage
