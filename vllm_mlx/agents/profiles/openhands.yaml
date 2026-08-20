@@ -19,7 +19,7 @@ config:
     api_key field is encrypted with a key held by the app, so the file cannot
     be edited by hand. Configure it through the running app instead:
 
-      rapid-mlx launch openhands --server-url {base_url_no_v1} --model {model_id}
+      RAPID_MLX_API_KEY={api_key_shell} rapid-mlx launch openhands --server-url {base_url_no_v1} --model {model_id}
 
     (Start OpenHands first — the settings are only writable while it runs.)
 

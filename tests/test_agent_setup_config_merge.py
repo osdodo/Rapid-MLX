@@ -496,6 +496,28 @@ class TestManualAndBearerProfiles:
         assert "setup failed" in output
         assert "configured!" not in output
 
+    def test_openhands_printed_command_preserves_shell_quoted_bearer(self, monkeypatch):
+        from vllm_mlx.agents import get_profile
+
+        bearer = "key with $(shell) and 'quotes'"
+        monkeypatch.setenv("RAPID_MLX_API_KEY", bearer)
+        profile = get_profile("openhands")
+        assert profile is not None
+
+        guide = get_setup_instructions(profile, "http://127.0.0.1:8001/v1", "model")
+        command = next(
+            line.strip()
+            for line in guide.splitlines()
+            if line.strip().startswith("RAPID_MLX_API_KEY=")
+        )
+        words = shlex.split(command)
+
+        # This models the guide-render step followed later by executing the
+        # printed command in a fresh shell: the assignment carries the live
+        # key instead of falling back to sk-noop.
+        assert words[0] == f"RAPID_MLX_API_KEY={bearer}"
+        assert words[1:4] == ["rapid-mlx", "launch", "openhands"]
+
     def test_opencode_bearer_is_json_escaped(self, monkeypatch):
         from vllm_mlx.agents import get_profile
 

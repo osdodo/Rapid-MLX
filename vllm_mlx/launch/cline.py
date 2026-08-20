@@ -184,8 +184,15 @@ def write_or_patch_config(
     secrets = _load_mapping(data_dir / "secrets.json")
     providers = _load_mapping(data_dir / "settings" / "providers.json")
 
-    _write_legacy(data_dir, base_url, model, api_key, state, secrets)
-    _write_next(data_dir, base_url, model, api_key, providers)
+    _patch_legacy(base_url, model, api_key, state, secrets)
+    _patch_next(base_url, model, api_key, providers)
+    _common.atomic_write_json_transaction(
+        [
+            (data_dir / "globalState.json", state),
+            (data_dir / "secrets.json", secrets),
+            (data_dir / "settings" / "providers.json", providers),
+        ]
+    )
     return global_state_path
 
 
@@ -197,8 +204,7 @@ def _load_mapping(path: Path) -> dict:
     return value
 
 
-def _write_legacy(
-    data_dir: Path,
+def _patch_legacy(
     base_url: str,
     model: str,
     api_key: str,
@@ -216,9 +222,6 @@ def _write_legacy(
     configuration we just wrote and inviting the user to pick a cloud
     provider (which would overwrite it).
     """
-    path = data_dir / "globalState.json"
-    _common.backup_existing(path)
-
     state["planModeApiProvider"] = "openai"
     state["actModeApiProvider"] = "openai"
     state["openAiBaseUrl"] = base_url
@@ -226,20 +229,11 @@ def _write_legacy(
     state["actModeOpenAiModelId"] = model
     state["welcomeViewCompleted"] = True
 
-    _common.atomic_write_json(path, state)
-
-    # The API key is a secret in Cline's model, stored in a separate
-    # 0600 file. ``atomic_write_json`` creates via mkstemp, which is
-    # already 0600, so the mode matches what Cline itself writes.
-    secrets_path = data_dir / "secrets.json"
-    _common.backup_existing(secrets_path)
+    # The API key is a secret in Cline's model, stored separately.
     secrets["openAiApiKey"] = api_key
-    _common.atomic_write_json(secrets_path, secrets)
 
 
-def _write_next(
-    data_dir: Path, base_url: str, model: str, api_key: str, doc: dict
-) -> None:
+def _patch_next(base_url: str, model: str, api_key: str, doc: dict) -> None:
     """Patch the next bundle's settings/providers.json.
 
     The file is validated with a strict zod schema on read: ``version``
@@ -248,9 +242,6 @@ def _write_next(
     taking the user's other providers with it. So we pin both, and we
     only ever add/replace our own provider entry.
     """
-    path = data_dir / "settings" / "providers.json"
-    _common.backup_existing(path)
-
     doc["version"] = 1
     providers = doc.get("providers")
     if not isinstance(providers, dict):
@@ -278,5 +269,3 @@ def _write_next(
     }
     doc["providers"] = providers
     doc["lastUsedProvider"] = _PROVIDER_ID
-
-    _common.atomic_write_json(path, doc)

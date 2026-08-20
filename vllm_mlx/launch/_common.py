@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared helpers for the per-client launch adapters.
 
-The four adapters in this package each patch a single JSON config file,
-so they all need the same three primitives:
+The adapters in this package patch one or more JSON config files, so they
+share the same primitives:
 
 * Discover the config path on this host (respecting both macOS and
   Linux conventions where each client's authors picked something
@@ -13,6 +13,8 @@ so they all need the same three primitives:
 * Atomically write the patched config to ``<path>.new`` and rename it
   over the target so a Ctrl-C between bytes never leaves a half-written
   JSON file on disk.
+* For multi-file client state, stage and validate every replacement before
+  publishing any of them, then roll all targets back if a commit fails.
 
 Keeping these helpers here (rather than re-implemented per adapter)
 means a fix to the atomic-write logic — e.g. tightening the temp-file
@@ -24,9 +26,11 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -207,6 +211,141 @@ def atomic_write_json(path: Path, data: object) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+@dataclass(frozen=True)
+class _OriginalFile:
+    path: Path
+    existed: bool
+    content: bytes | None
+    mode: int | None
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes made by replace/unlink."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _stage_json(path: Path, data: object) -> str:
+    """Write and validate one sibling temp file without publishing it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".new", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Validate the exact bytes that will be renamed, not the in-memory
+        # object from which they were produced.
+        with open(temporary, encoding="utf-8") as handle:
+            json.load(handle)
+        return temporary
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _restore_original(original: _OriginalFile) -> None:
+    """Restore one transaction participant, including its prior mode."""
+    path = original.path
+    if not original.existed:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_directory(path.parent)
+        return
+
+    assert original.content is not None and original.mode is not None
+    fd, temporary = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".rollback", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(original.content)
+            os.fchmod(handle.fileno(), original.mode)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json_transaction(replacements: list[tuple[Path, object]]) -> None:
+    """Publish several JSON files as one rollback-capable transaction.
+
+    Every replacement is serialized, fsynced, and parsed back before the
+    first target changes. If any replace or directory fsync then fails, all
+    targets whose commit may have started are restored byte-for-byte with
+    their prior permission bits; targets that did not previously exist are
+    removed.
+    """
+    paths = [path for path, _ in replacements]
+    if len(paths) != len(set(paths)):
+        raise ValueError("transaction contains the same target more than once")
+
+    originals: list[_OriginalFile] = []
+    staged: list[tuple[_OriginalFile, str]] = []
+    try:
+        for path, data in replacements:
+            if path.exists():
+                info = path.stat()
+                original = _OriginalFile(
+                    path, True, path.read_bytes(), stat.S_IMODE(info.st_mode)
+                )
+            else:
+                original = _OriginalFile(path, False, None, None)
+            originals.append(original)
+            staged.append((original, _stage_json(path, data)))
+
+        # Backups are also prepared before commit. A backup permission or disk
+        # failure therefore cannot leave even the first live file updated.
+        for original in originals:
+            if original.existed:
+                backup_existing(original.path)
+
+        attempted: list[_OriginalFile] = []
+        try:
+            for original, temporary in staged:
+                # Record before replace because an OS error does not prove the
+                # directory entry stayed untouched.
+                attempted.append(original)
+                os.replace(temporary, original.path)
+                _fsync_directory(original.path.parent)
+        except BaseException as commit_error:
+            rollback_errors: list[str] = []
+            for original in reversed(attempted):
+                try:
+                    _restore_original(original)
+                except BaseException as rollback_error:
+                    rollback_errors.append(f"{original.path}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "configuration commit failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from commit_error
+            raise
+    finally:
+        for _, temporary in staged:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def load_json_lenient(path: Path) -> dict:

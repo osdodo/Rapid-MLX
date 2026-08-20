@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field, replace
 
 
@@ -234,6 +235,7 @@ class AgentProfile:
                 .replace("{model_id}", _template_value(model_id))
                 .replace("{base_url_no_v1}", _template_value(base_url_no_v1))
                 .replace("{context_length}", ctx_str)
+                .replace("{api_key_shell}", shlex.quote(api_key))
                 .replace("{api_key}", _template_value(api_key))
             )
 

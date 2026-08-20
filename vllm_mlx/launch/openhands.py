@@ -37,11 +37,13 @@ reasoning effort, condenser and tool config — untouched.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Ports probed, in order, when ``OPENHANDS_URL`` is unset. agent-canvas
 # defaults its ingress to 8000 but users move it (``--port``), most often
@@ -53,6 +55,71 @@ _PROBE_PORTS = (8000, 8010, 3000, 8001, 8002, 8003, 8080)
 # Session credential the agent-server requires on every ``/api`` call.
 # Written by agent-canvas at first launch, 0600.
 _API_KEY_FILE = "api-key.txt"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the session credential never changes origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"OpenHands redirect refused (target: {newurl})",
+            headers,
+            fp,
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _urlopen(request: urllib.request.Request, *, timeout: int):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+def _validate_local_origin(value: str) -> str:
+    """Return a normalized, credential-safe loopback HTTP(S) origin."""
+    if not value or value != value.strip() or any(ch.isspace() for ch in value):
+        raise ValueError("OPENHANDS_URL must be a valid loopback HTTP(S) origin")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ValueError(
+            "OPENHANDS_URL must be a valid loopback HTTP(S) origin"
+        ) from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.netloc.endswith(":")
+        or port == 0
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "OPENHANDS_URL must be a loopback HTTP(S) origin without "
+            "userinfo, path, query, or fragment"
+        )
+
+    host = hostname.lower()
+    if host != "localhost":
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = False
+        if not is_loopback:
+            raise ValueError(
+                "OPENHANDS_URL must use localhost or a loopback IP address; "
+                "remote OpenHands endpoints are not trusted with the session key"
+            )
+
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{parsed.scheme}://{rendered_host}" + (f":{port}" if port else "")
 
 
 def _data_dir() -> Path:
@@ -78,7 +145,7 @@ def _is_openhands(url: str, session_key: str) -> bool:
         headers={"X-Session-API-Key": session_key},
     )
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with _urlopen(request, timeout=2) as response:
             return response.status == 200
     except (urllib.error.HTTPError, OSError):
         return False
@@ -94,7 +161,7 @@ def _base_url(session_key: str | None = None) -> str:
     """
     override = os.environ.get("OPENHANDS_URL")
     if override:
-        return override.rstrip("/")
+        return _validate_local_origin(override)
     default = f"http://127.0.0.1:{_PROBE_PORTS[0]}"
     if session_key is None:
         return default
@@ -196,10 +263,16 @@ def write_or_patch_config(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=10):
+        with _urlopen(request, timeout=10):
             pass
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:200]
+        if 300 <= exc.code < 400:
+            raise RuntimeError(
+                f"OpenHands redirect refused at {openhands_url}; redirects are "
+                "disabled so X-Session-API-Key cannot be forwarded to another "
+                "origin. Set OPENHANDS_URL directly to the trusted loopback origin."
+            ) from exc
         # Reaching a 404 means the sweep found nothing and fell back, or
         # OPENHANDS_URL points somewhere else. Either way the fix is a
         # port, not something inside OpenHands — and :8000 is rapid-mlx's

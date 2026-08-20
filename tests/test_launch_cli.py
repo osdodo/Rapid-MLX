@@ -17,6 +17,8 @@ import io
 import json
 import os
 import re
+import shlex
+import stat
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -279,6 +281,137 @@ class TestCline:
         assert not list(data_dir.glob("globalState.json.bak.*"))
         assert not list(data_dir.glob("secrets.json.bak.*"))
 
+    @pytest.mark.parametrize("failure_target", range(3))
+    def test_replace_failure_rolls_back_all_files_and_modes(
+        self, fake_home, monkeypatch, failure_target
+    ):
+        data_dir = fake_home / "cline-data"
+        paths = [
+            data_dir / "globalState.json",
+            data_dir / "secrets.json",
+            data_dir / "settings" / "providers.json",
+        ]
+        originals = [
+            b'{"preferredLanguage":"English"}\n',
+            b'{"openRouterApiKey":"keep-me"}\n',
+            b'{"version":1,"providers":{}}\n',
+        ]
+        modes = [0o640, 0o600, 0o644]
+        for path, content, mode in zip(paths, originals, modes):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            path.chmod(mode)
+
+        real_replace = _common.os.replace
+        failed = False
+
+        def fail_one_commit(source, destination):
+            nonlocal failed
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                not failed
+                and source_path.name.endswith(".new")
+                and destination_path == paths[failure_target]
+            ):
+                failed = True
+                raise OSError("injected replace failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(_common.os, "replace", fail_one_commit)
+        with pytest.raises(OSError, match="injected replace failure"):
+            cline.write_or_patch_config(
+                "http://127.0.0.1:8000", "model", api_key="live-bearer"
+            )
+
+        assert failed
+        for path, content, mode in zip(paths, originals, modes):
+            assert path.read_bytes() == content
+            assert stat.S_IMODE(path.stat().st_mode) == mode
+        assert not list(data_dir.rglob("*.new"))
+        assert not list(data_dir.rglob("*.rollback"))
+
+    def test_directory_fsync_failure_rolls_back_replaced_files(
+        self, fake_home, monkeypatch
+    ):
+        data_dir = fake_home / "cline-data"
+        paths = [
+            data_dir / "globalState.json",
+            data_dir / "secrets.json",
+            data_dir / "settings" / "providers.json",
+        ]
+        originals = [b"{}\n", b"{}\n", b'{"version":1}\n']
+        for path, content in zip(paths, originals):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        real_fsync_directory = _common._fsync_directory
+        calls = 0
+
+        def fail_second_commit(directory):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected directory fsync failure")
+            return real_fsync_directory(directory)
+
+        monkeypatch.setattr(_common, "_fsync_directory", fail_second_commit)
+        with pytest.raises(OSError, match="injected directory fsync failure"):
+            cline.write_or_patch_config("http://127.0.0.1:8000", "model")
+
+        for path, content in zip(paths, originals):
+            assert path.read_bytes() == content
+
+    def test_fresh_install_replace_failure_removes_all_new_targets(
+        self, fake_home, monkeypatch
+    ):
+        data_dir = fake_home / "cline-data"
+        data_dir.mkdir(parents=True)
+        targets = [
+            data_dir / "globalState.json",
+            data_dir / "secrets.json",
+            data_dir / "settings" / "providers.json",
+        ]
+        real_replace = _common.os.replace
+        failed = False
+
+        def fail_final_commit(source, destination):
+            nonlocal failed
+            if not failed and Path(destination) == targets[-1]:
+                failed = True
+                raise OSError("injected final replace failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(_common.os, "replace", fail_final_commit)
+        with pytest.raises(OSError, match="injected final replace failure"):
+            cline.write_or_patch_config("http://127.0.0.1:8000", "model")
+
+        assert failed
+        assert all(not target.exists() for target in targets)
+
+    def test_staging_failure_changes_no_live_file(self, fake_home, monkeypatch):
+        data_dir = fake_home / "cline-data"
+        data_dir.mkdir(parents=True)
+        state = data_dir / "globalState.json"
+        state.write_bytes(b'{"keep":true}\n')
+        real_stage = _common._stage_json
+        calls = 0
+
+        def fail_second_stage(path, data):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected staging failure")
+            return real_stage(path, data)
+
+        monkeypatch.setattr(_common, "_stage_json", fail_second_stage)
+        with pytest.raises(OSError, match="injected staging failure"):
+            cline.write_or_patch_config("http://127.0.0.1:8000", "model")
+
+        assert state.read_bytes() == b'{"keep":true}\n'
+        assert not (data_dir / "secrets.json").exists()
+        assert not (data_dir / "settings" / "providers.json").exists()
+
     def test_cline_dir_env_relocates_the_tree(self, fake_home, monkeypatch):
         """A user who moved Cline off a synced home dir must get their
         REAL config patched, not the default path."""
@@ -386,7 +519,7 @@ class TestOpenHands:
             response.__exit__ = lambda *a: False
             return response
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(openhands, "_urlopen", fake_urlopen)
         return sent
 
     def test_detect_false_when_nothing_installed(self, fake_home):
@@ -455,6 +588,47 @@ class TestOpenHands:
             "api_key",
         }
 
+    def test_rendered_guide_command_keeps_auth_on_later_launch(
+        self, fake_home, monkeypatch, capsys
+    ):
+        from vllm_mlx.agents import get_profile
+        from vllm_mlx.agents.adapter import get_setup_instructions
+
+        self._install(fake_home)
+        bearer = "key with $(shell) and 'quotes'"
+        monkeypatch.setenv("RAPID_MLX_API_KEY", bearer)
+        profile = get_profile("openhands")
+        assert profile is not None
+        guide = get_setup_instructions(
+            profile, "http://127.0.0.1:8001/v1", "guide-model"
+        )
+        command = next(
+            line.strip()
+            for line in guide.splitlines()
+            if line.strip().startswith("RAPID_MLX_API_KEY=")
+        )
+
+        # Model a separate shell executing the copied command after the guide
+        # process exits. Only the printed assignment may carry the credential.
+        monkeypatch.delenv("RAPID_MLX_API_KEY")
+        words = shlex.split(command)
+        name, copied_bearer = words.pop(0).split("=", 1)
+        assert name == "RAPID_MLX_API_KEY"
+        monkeypatch.setenv(name, copied_bearer)
+        sent = self._capture(monkeypatch)
+        launch_cli.launch_command(
+            _make_args(
+                client=words[2],
+                server_url=words[4],
+                model=words[6],
+            )
+        )
+
+        llm = json.loads(sent[0].data)["agent_settings_diff"]["llm"]
+        assert llm["api_key"] == bearer
+        assert llm["api_key"] != "sk-noop"
+        capsys.readouterr()
+
     def test_not_installed_raises_actionable_error(self, fake_home):
         with pytest.raises(FileNotFoundError, match="does not appear to be installed"):
             openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
@@ -474,7 +648,7 @@ class TestOpenHands:
         def refuse(request, timeout=None):
             raise OSError("connection refused")
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", refuse)
+        monkeypatch.setattr(openhands, "_urlopen", refuse)
         with pytest.raises(RuntimeError, match="start OpenHands and re-run"):
             openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
 
@@ -496,6 +670,74 @@ class TestOpenHands:
         )
         self._capture(monkeypatch)
         openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
+
+    @pytest.mark.parametrize(
+        "unsafe_url",
+        [
+            "http://example.com:8000",
+            "https://example.com:8000",
+            "http://user@127.0.0.1:8000",
+            "http://user:pass@127.0.0.1:8000",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:0",
+            "http://[::1",
+            "ftp://127.0.0.1:8000",
+            "http://127.0.0.1:8000/api",
+            "http://127.0.0.1:8000?next=https://example.com",
+        ],
+    )
+    def test_openhands_url_rejects_untrusted_or_malformed_origins(
+        self, fake_home, monkeypatch, unsafe_url
+    ):
+        self._install(fake_home)
+        monkeypatch.setenv("OPENHANDS_URL", unsafe_url)
+        monkeypatch.setattr(
+            openhands,
+            "_urlopen",
+            lambda *a, **k: pytest.fail("unsafe URL reached the network"),
+        )
+
+        with pytest.raises(ValueError, match="OPENHANDS_URL"):
+            openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
+
+    def test_redirects_are_refused_before_a_target_request_is_created(self):
+        request = openhands.urllib.request.Request(
+            "http://127.0.0.1:8000/api/settings",
+            headers={"X-Session-API-Key": "session-secret"},
+        )
+        handler = openhands._NoRedirectHandler()
+
+        with pytest.raises(urllib.error.HTTPError, match="redirect refused") as exc:
+            handler.redirect_request(
+                request,
+                io.BytesIO(),
+                302,
+                "Found",
+                {"Location": "https://example.com/steal"},
+                "https://example.com/steal",
+            )
+
+        assert exc.value.url == request.full_url
+        assert "example.com/steal" in str(exc.value.reason)
+
+    def test_patch_redirect_surfaces_credential_safety_error(
+        self, fake_home, monkeypatch
+    ):
+        self._install(fake_home)
+        monkeypatch.setenv("OPENHANDS_URL", "http://127.0.0.1:8000")
+
+        def redirect(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                302,
+                "OpenHands redirect refused (target: https://example.com/steal)",
+                {"Location": "https://example.com/steal"},
+                io.BytesIO(),
+            )
+
+        monkeypatch.setattr(openhands, "_urlopen", redirect)
+        with pytest.raises(RuntimeError, match="redirect refused"):
+            openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
 
     def test_sweep_skips_a_port_that_is_not_openhands(self, fake_home, monkeypatch):
         # The real case this exists for: rapid-mlx holds :8000 (its own
@@ -521,7 +763,7 @@ class TestOpenHands:
             seen.append((request.full_url, request.get_header("X-session-api-key")))
             raise OSError("refused")
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(openhands, "_urlopen", fake_urlopen)
         with pytest.raises(RuntimeError):
             openhands.write_or_patch_config("http://127.0.0.1:8000", "model")
         assert seen, "no probe was attempted"
@@ -538,7 +780,7 @@ class TestOpenHands:
         def refuse(request, timeout=None):
             raise OSError("connection refused")
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", refuse)
+        monkeypatch.setattr(openhands, "_urlopen", refuse)
         with pytest.raises(RuntimeError, match=r"127\.0\.0\.1:8000"):
             openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
 
@@ -554,7 +796,7 @@ class TestOpenHands:
                 request.full_url, 404, "Not Found", {}, io.BytesIO(b'{"error":{}}')
             )
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", not_found)
+        monkeypatch.setattr(openhands, "_urlopen", not_found)
         with pytest.raises(RuntimeError, match="not as OpenHands"):
             openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
 
@@ -570,7 +812,7 @@ class TestOpenHands:
                 io.BytesIO(b'{"detail":"Unauthorized"}'),
             )
 
-        monkeypatch.setattr(openhands.urllib.request, "urlopen", unauthorized)
+        monkeypatch.setattr(openhands, "_urlopen", unauthorized)
         with pytest.raises(RuntimeError, match="HTTP 401"):
             openhands.write_or_patch_config("http://127.0.0.1:8001", "model")
 
