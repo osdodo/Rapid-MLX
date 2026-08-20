@@ -57,6 +57,15 @@ final class ChatViewModel {
 
     /// The whole tree, indexed: rebuilt lazily whenever ``treeShapeVersion``
     /// moves. ``children`` groups are pre-sorted in sibling order.
+    ///
+    /// READ-ONLY by contract. Because content writes do not move the shape
+    /// version, a snapshot built while an answer streams holds that row's
+    /// EARLY value; only the fields that never mutate after append — id,
+    /// role, parentID, createdAt — may be trusted from it. Every structural
+    /// mutation (``selectBranch``, ``deleteMessage``) re-reads node VALUES
+    /// from the live buffers via ``liveTree()`` before adopting or
+    /// persisting; feeding ``nodes`` back into ``adoptTree`` would restore a
+    /// truncated mid-stream answer over the finished one.
     private struct TreeSnapshot {
         var version = -1
         var nodes: [ChatMessage] = []
@@ -96,6 +105,14 @@ final class ChatViewModel {
         snapshot.roots.sort(by: MessageTree.precedes)
         cachedTree = snapshot
         return snapshot
+    }
+
+    /// The whole tree with CURRENT node values, straight from the live
+    /// buffers. The input to every structural mutation — never the cached
+    /// snapshot, whose values may predate the tokens that streamed in since
+    /// it was built.
+    private func liveTree() -> [ChatMessage] {
+        MessageTree.deduplicatingByID(messages + branchedAway)
     }
 
     /// Saved conversations, newest-updated first — the sidebar "Older"
@@ -1671,13 +1688,17 @@ final class ChatViewModel {
         let target = group[offset]
         guard target.id != anchor.id else { return false }
 
+        // From here on the operation MUTATES: leave the snapshot (its node
+        // values may be stale — see ``TreeSnapshot``) and work on the live
+        // buffers, which always carry the finished content.
+        let tree = liveTree()
         // Resolve DOWN from the chosen sibling: it is typically an interior
         // turn with its own continuation, and the transcript has to end at a
         // leaf. Prefer wherever the user last was inside that branch, falling
         // back to its newest tip for one never visited.
         let leaf = MessageTree.deepestLeaf(
             from: target.id,
-            in: snapshot.nodes,
+            in: tree,
             preferring: branchChoices
         )
         // Record the step itself before adopting. ``adoptTree`` only sees the
@@ -1686,7 +1707,7 @@ final class ChatViewModel {
         if let parent = target.parentID {
             branchChoices[parent] = target.id
         }
-        adoptTree(snapshot.nodes, activeLeafID: leaf)
+        adoptTree(tree, activeLeafID: leaf)
         // Persist WITHOUT touching updatedAt: switching branches is
         // navigation, not work, and should not reshuffle the sidebar — the
         // same reasoning as ``selectConversation``'s `touching: false`.
@@ -1753,7 +1774,9 @@ final class ChatViewModel {
     @discardableResult
     func deleteMessage(id: UUID) -> Bool {
         guard !isStreaming else { return false }
-        let tree = treeSnapshot().nodes
+        // Live values, not the snapshot: what survives the delete is re-split
+        // and persisted, so it must carry the finished content of every row.
+        let tree = liveTree()
         guard tree.contains(where: { $0.id == id }) else { return false }
         let doomed = MessageTree.subtree(of: id, in: tree)
         let remaining = tree.filter { !doomed.contains($0.id) }

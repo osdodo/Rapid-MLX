@@ -317,6 +317,32 @@ struct MessageBranchingTests {
         #expect(viewModel.deletionImpact(of: user.id) == 1)
     }
 
+    @Test("A snapshot built mid-stream never overwrites the finished answer")
+    func midStreamSnapshotDoesNotClobberFinalContent() {
+        // The branch-metadata snapshot is rebuilt only on SHAPE changes, so
+        // one built while an answer streams caches that row's early value —
+        // and the stream finishing is a content write that leaves the shape
+        // version untouched. Switching branches afterwards must re-read the
+        // live rows: adopting the stale snapshot would silently roll the
+        // finished answer back to its mid-stream prefix and persist that.
+        let (viewModel, _, answer) = seededModel()
+        viewModel.regenerateLast(alias: "test-model")
+        // Force the snapshot to exist while the replacement is streaming —
+        // exactly what rendering the transcript does.
+        _ = viewModel.branchPosition(of: viewModel.messages[1].id)
+        viewModel.stopAndPersist()
+        let finished = viewModel.messages[1]
+        #expect(finished.status != .streaming)
+
+        // Away to the original and back: both hops re-adopt the tree.
+        #expect(viewModel.selectBranch(at: 0, forSiblingOf: finished.id))
+        #expect(viewModel.messages[1].id == answer.id)
+        #expect(viewModel.selectBranch(at: 1, forSiblingOf: answer.id))
+        #expect(viewModel.messages[1].id == finished.id)
+        #expect(viewModel.messages[1].status == finished.status)
+        #expect(viewModel.messages[1].content == finished.content)
+    }
+
     @Test("Structural mutations are refused while a stream is in flight")
     func structuralMutationsRefusedWhileStreaming() {
         // The in-flight turn writes by INDEX into the visible path; every
