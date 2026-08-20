@@ -362,9 +362,10 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         try c.encode(contentTruncated, forKey: .contentTruncated)
         try c.encode(toolNotCalledFlagged, forKey: .toolNotCalledFlagged)
         try c.encode(toolCallArtifactSuppressed, forKey: .toolCallArtifactSuppressed)
-        // Omitted entirely for root turns, so a conversation that never
-        // branched encodes byte-identically to a pre-branching build's
-        // output and an older build reading it sees no unknown-shaped data.
+        // Omitted for root turns. Non-root rows always carry it — including
+        // in conversations that never branched — which is safe because it is
+        // an additive key every shipped decoder ignores; the conversation-
+        // level schema marker is the `branches` key, not this one.
         try c.encodeIfPresent(parentID, forKey: .parentID)
         try c.encode(createdAt, forKey: .createdAt)
     }

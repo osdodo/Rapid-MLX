@@ -42,6 +42,62 @@ final class ChatViewModel {
     /// ``ChatConversation/branchChoices`` for why it exists.
     private var branchChoices: [UUID: UUID] = [:]
 
+    /// Monotonic stamp of the tree's SHAPE — bumped when nodes are added,
+    /// moved between the two buffers, or removed. Streamed tokens landing in
+    /// an existing row leave it alone.
+    ///
+    /// Exists for ``treeSnapshot``: the per-row queries (`branchPosition`,
+    /// `deletionImpact`, `siblings`) run inside the transcript's ForEach, so
+    /// they re-execute for every visible row on every render pass — including
+    /// the pass after each streamed token. Rescanning and re-sorting
+    /// `branchedAway + messages` there is quadratic in transcript length at
+    /// thirty invalidations a second; reading a snapshot rebuilt only on
+    /// shape changes is not.
+    private var treeShapeVersion = 0
+
+    /// The whole tree, indexed: rebuilt lazily whenever ``treeShapeVersion``
+    /// moves. ``children`` groups are pre-sorted in sibling order.
+    private struct TreeSnapshot {
+        var version = -1
+        var nodes: [ChatMessage] = []
+        var byID: [UUID: ChatMessage] = [:]
+        var children: [UUID: [ChatMessage]] = [:]
+        var roots: [ChatMessage] = []
+
+        func childGroup(of parentID: UUID?) -> [ChatMessage] {
+            guard let parentID else { return roots }
+            return children[parentID] ?? []
+        }
+    }
+
+    private var cachedTree = TreeSnapshot()
+
+    /// The current tree snapshot, rebuilding it first if the shape moved.
+    private func treeSnapshot() -> TreeSnapshot {
+        if cachedTree.version == treeShapeVersion { return cachedTree }
+        // Path first: if a corrupt store ever produces the same id in both
+        // buffers, the visible row is the one that wins everywhere.
+        let nodes = MessageTree.deduplicatingByID(messages + branchedAway)
+        var snapshot = TreeSnapshot()
+        snapshot.version = treeShapeVersion
+        snapshot.nodes = nodes
+        snapshot.byID.reserveCapacity(nodes.count)
+        for node in nodes { snapshot.byID[node.id] = node }
+        for node in nodes {
+            if let parent = node.parentID {
+                snapshot.children[parent, default: []].append(node)
+            } else {
+                snapshot.roots.append(node)
+            }
+        }
+        for key in snapshot.children.keys {
+            snapshot.children[key]?.sort(by: MessageTree.precedes)
+        }
+        snapshot.roots.sort(by: MessageTree.precedes)
+        cachedTree = snapshot
+        return snapshot
+    }
+
     /// Saved conversations, newest-updated first — the sidebar "Older"
     /// list. Loaded from disk on init; upserted whenever the active
     /// conversation gains a user turn.
@@ -283,7 +339,12 @@ final class ChatViewModel {
         // fields. `messages` stays a linear transcript so a downgrade renders
         // the conversation the user was looking at instead of a flattened pile
         // of alternatives; `branches` is a new key an old build ignores.
-        let leaf = messages.last?.id
+        //
+        // The leaf pointer is only meaningful once alternatives exist — for a
+        // linear conversation the decoder's `messages.last` fallback IS the
+        // leaf. Omitting it keeps every branching key absent from a
+        // conversation that never branched.
+        let leaf = branchedAway.isEmpty ? nil : messages.last?.id
         if conversations.contains(where: { $0.id == activeConversationID }) {
             conversations = ConversationOrdering.updating(
                 conversations,
@@ -521,6 +582,7 @@ final class ChatViewModel {
             conversationEpoch &+= 1
             messages.removeAll()
             branchedAway.removeAll()
+            treeShapeVersion += 1
             branchChoices.removeAll()
             conversationInstructions = ""
             activeConversationID = UUID()
@@ -551,6 +613,7 @@ final class ChatViewModel {
         let visible = Set(path.map(\.id))
         messages = path
         branchedAway = tree.filter { !visible.contains($0.id) }
+        treeShapeVersion += 1
         // Record which way this path went at every fork it crosses. MERGED,
         // not replaced: forks that are not on this path keep the position
         // they had, which is the whole point — stepping to a sibling must not
@@ -571,12 +634,21 @@ final class ChatViewModel {
             linked.parentID = messages.last?.id
         }
         messages.append(linked)
+        treeShapeVersion += 1
         return messages.count - 1
     }
 
     /// Overwrite the message at ``index`` when it is still in range.
     private func updateMessage(at index: Int, with message: ChatMessage) {
         guard messages.indices.contains(index) else { return }
+        // Streamed tokens replace a row's CONTENT, which the branch metadata
+        // snapshot does not care about. Only a write that moves the row to a
+        // different node — new id or new parent — is a shape change; today no
+        // caller does that, and this guard keeps the invariant honest if one
+        // ever starts to.
+        if messages[index].id != message.id || messages[index].parentID != message.parentID {
+            treeShapeVersion += 1
+        }
         messages[index] = message
     }
 
@@ -608,6 +680,7 @@ final class ChatViewModel {
         persistActive(touching: false)
         messages.removeAll()
         branchedAway.removeAll()
+        treeShapeVersion += 1
         branchChoices.removeAll()
         conversationInstructions = ""
         activeConversationID = UUID()
@@ -627,6 +700,7 @@ final class ChatViewModel {
         // initialiser applies, for the same reason.
         messages = MessageTree.repairingLegacyChain(seeded)
         branchedAway.removeAll()
+        treeShapeVersion += 1
         branchChoices.removeAll()
     }
 
@@ -1410,6 +1484,7 @@ final class ChatViewModel {
         guard messages.indices.contains(index) else { return }
         branchedAway.append(contentsOf: messages[index...])
         messages = Array(messages.prefix(index))
+        treeShapeVersion += 1
     }
 
     /// Edit a user turn: replace its prose and re-send from that point.
@@ -1534,8 +1609,8 @@ final class ChatViewModel {
     /// Walking back to the first node after the owning user turn maps every
     /// row of a logical answer onto the same fork, so the control appears on
     /// the answer the user is looking at and both directions stay reachable.
-    private func branchAnchor(for id: UUID, in tree: [ChatMessage]) -> ChatMessage? {
-        guard let node = tree.first(where: { $0.id == id }) else { return nil }
+    private func branchAnchor(for id: UUID, in tree: TreeSnapshot) -> ChatMessage? {
+        guard let node = tree.byID[id] else { return nil }
         // A user turn branches on its own account (prompt edits).
         guard node.role != .user else { return node }
         var current = node
@@ -1545,7 +1620,7 @@ final class ChatViewModel {
         // every rendered row asks for its branch position. Without the seen
         // set this walk spins on the main actor and the window hangs.
         var seen: Set<UUID> = [node.id]
-        while let parent = tree.first(where: { $0.id == current.parentID }) {
+        while let parentID = current.parentID, let parent = tree.byID[parentID] {
             if parent.role == .user { return current }
             guard seen.insert(parent.id).inserted else { return current }
             current = parent
@@ -1559,18 +1634,18 @@ final class ChatViewModel {
     /// hides the switcher in that case rather than rendering a permanent
     /// `‹ 1/1 ›`.
     func siblings(of id: UUID) -> [ChatMessage] {
-        let tree = branchedAway + messages
+        let tree = treeSnapshot()
         guard let anchor = branchAnchor(for: id, in: tree) else { return [] }
-        return MessageTree.siblings(of: anchor.id, in: tree)
+        return tree.childGroup(of: anchor.parentID)
     }
 
     /// 1-based position of ``id`` among its alternatives, and how many there
     /// are — exactly what the `‹ 2/3 ›` control renders. ``nil`` when the
     /// turn has no alternatives.
     func branchPosition(of id: UUID) -> (index: Int, count: Int)? {
-        let tree = branchedAway + messages
+        let tree = treeSnapshot()
         guard let anchor = branchAnchor(for: id, in: tree) else { return nil }
-        let group = MessageTree.siblings(of: anchor.id, in: tree)
+        let group = tree.childGroup(of: anchor.parentID)
         guard group.count > 1, let offset = group.firstIndex(where: { $0.id == anchor.id }) else {
             return nil
         }
@@ -1586,12 +1661,12 @@ final class ChatViewModel {
     @discardableResult
     func selectBranch(at offset: Int, forSiblingOf id: UUID) -> Bool {
         guard !isStreaming else { return false }
-        let tree = branchedAway + messages
+        let snapshot = treeSnapshot()
         // Resolve to the fork this row belongs to before indexing, so a tool
         // round-trip's final answer selects among the same alternatives its
         // switcher displays.
-        guard let anchor = branchAnchor(for: id, in: tree) else { return false }
-        let group = MessageTree.siblings(of: anchor.id, in: tree)
+        guard let anchor = branchAnchor(for: id, in: snapshot) else { return false }
+        let group = snapshot.childGroup(of: anchor.parentID)
         guard group.indices.contains(offset) else { return false }
         let target = group[offset]
         guard target.id != anchor.id else { return false }
@@ -1602,7 +1677,7 @@ final class ChatViewModel {
         // back to its newest tip for one never visited.
         let leaf = MessageTree.deepestLeaf(
             from: target.id,
-            in: tree,
+            in: snapshot.nodes,
             preferring: branchChoices
         )
         // Record the step itself before adopting. ``adoptTree`` only sees the
@@ -1611,7 +1686,7 @@ final class ChatViewModel {
         if let parent = target.parentID {
             branchChoices[parent] = target.id
         }
-        adoptTree(tree, activeLeafID: leaf)
+        adoptTree(snapshot.nodes, activeLeafID: leaf)
         // Persist WITHOUT touching updatedAt: switching branches is
         // navigation, not work, and should not reshuffle the sidebar — the
         // same reasoning as ``selectConversation``'s `touching: false`.
@@ -1624,9 +1699,9 @@ final class ChatViewModel {
     /// control's disabled state matches what it does.
     @discardableResult
     func stepBranch(from id: UUID, by delta: Int) -> Bool {
-        let tree = branchedAway + messages
+        let tree = treeSnapshot()
         guard let anchor = branchAnchor(for: id, in: tree) else { return false }
-        let group = MessageTree.siblings(of: anchor.id, in: tree)
+        let group = tree.childGroup(of: anchor.parentID)
         guard let current = group.firstIndex(where: { $0.id == anchor.id }) else { return false }
         let target = current + delta
         guard group.indices.contains(target) else { return false }
@@ -1640,9 +1715,16 @@ final class ChatViewModel {
     /// take a dozen turns with it, and a user who has branched cannot see
     /// what is hanging off the other branches. Returns 0 for an unknown id.
     func deletionImpact(of id: UUID) -> Int {
-        let tree = branchedAway + messages
-        guard tree.contains(where: { $0.id == id }) else { return 0 }
-        return MessageTree.subtree(of: id, in: tree).count
+        let tree = treeSnapshot()
+        guard tree.byID[id] != nil else { return 0 }
+        var collected: Set<UUID> = [id]
+        var frontier: [UUID] = [id]
+        while let current = frontier.popLast() {
+            for child in tree.childGroup(of: current) where collected.insert(child.id).inserted {
+                frontier.append(child.id)
+            }
+        }
+        return collected.count
     }
 
     /// Confirmation title naming exactly what a delete would take.
@@ -1661,8 +1743,9 @@ final class ChatViewModel {
             : "Delete this message and the \(turnCount - 1) turn\(turnCount == 2 ? "" : "s") below it?"
     }
 
-    /// Delete a turn, every alternative continuation beneath it, and the
-    /// prompt that produced it when that prompt has nothing else under it.
+    /// Delete a turn and every alternative continuation beneath it. The
+    /// producing prompt stays: a childless prompt is still something the user
+    /// said, and the natural seed for a fresh regeneration.
     ///
     /// The whole subtree goes: re-parenting the orphans onto the deleted
     /// node's parent would splice together a prompt and an answer that never
@@ -1670,7 +1753,7 @@ final class ChatViewModel {
     @discardableResult
     func deleteMessage(id: UUID) -> Bool {
         guard !isStreaming else { return false }
-        let tree = branchedAway + messages
+        let tree = treeSnapshot().nodes
         guard tree.contains(where: { $0.id == id }) else { return false }
         let doomed = MessageTree.subtree(of: id, in: tree)
         let remaining = tree.filter { !doomed.contains($0.id) }

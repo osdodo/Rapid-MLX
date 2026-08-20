@@ -27,9 +27,22 @@ enum MessageTree {
     /// nodes stamped inside the same clock tick still order deterministically
     /// across launches (an unstable order would make the `‹ 2/3 ›` index jump
     /// around under the user).
-    private static func precedes(_ a: ChatMessage, _ b: ChatMessage) -> Bool {
+    static func precedes(_ a: ChatMessage, _ b: ChatMessage) -> Bool {
         if a.createdAt != b.createdAt { return a.createdAt < b.createdAt }
         return a.id.uuidString < b.id.uuidString
+    }
+
+    /// First occurrence of each id wins; later duplicates are dropped.
+    ///
+    /// Duplicate ids can only come from a corrupt or hand-merged file, but
+    /// they must be resolved ONCE, up front: `activePath`'s index already
+    /// keeps the first copy, while the sibling and subtree scans would count
+    /// every copy — so navigation and deletion could disagree about what a
+    /// node even is. Every consumer of a whole tree runs its input through
+    /// this first.
+    static func deduplicatingByID(_ messages: [ChatMessage]) -> [ChatMessage] {
+        var seen: Set<UUID> = []
+        return messages.filter { seen.insert($0.id).inserted }
     }
 
     /// Children of ``parentID`` in sibling order. Pass ``nil`` for the roots.
@@ -46,9 +59,6 @@ enum MessageTree {
         return children(of: node.parentID, in: messages)
     }
 
-    /// Walk down from ``id`` always taking the NEWEST child, and return the
-    /// leaf that terminates the walk.
-    ///
     /// Walk down from ``id`` and return the leaf that terminates the walk.
     ///
     /// Used when the user switches to a sibling: they pick a turn, and the

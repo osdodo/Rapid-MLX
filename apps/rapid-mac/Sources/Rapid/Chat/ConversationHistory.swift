@@ -135,17 +135,22 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     /// `[UUID: UUID]` as a flat array, the hand-written decoder asks for an
     /// object, and the map would be silently dropped on every reload — the
     /// feature would look like it worked all session and forget on relaunch.
-    /// Optional fields keep using ``encodeIfPresent`` so a conversation that
-    /// never branched still serialises byte-identically to a pre-branching
-    /// build's output.
+    ///
+    /// Compatibility contract, precisely: a conversation that never branched
+    /// carries NO conversation-level branching key (`branches`,
+    /// `activeLeafID`, `branchChoices` are all omitted). Its rows do carry
+    /// `parentID` — an additive per-row key every shipped decoder ignores —
+    /// so the output is decodable-identical to a pre-branching file, not
+    /// byte-identical. What is load-bearing is the `branches` key's absence,
+    /// which is the schema marker ``init(from:)`` keys on.
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encode(title, forKey: .title)
         try c.encode(messages, forKey: .messages)
-        // Omitted when empty, so a conversation that never branched still
-        // serialises byte-identically to a pre-branching build's output — and
-        // so its ABSENCE is a meaningful signal on the way back in.
+        // Omitted when empty — the key's ABSENCE is the schema signal on the
+        // way back in: no `branches` key means "linear transcript, links may
+        // be re-derived".
         if !branches.isEmpty {
             try c.encode(branches, forKey: .branches)
         }
@@ -221,7 +226,10 @@ extension ChatConversation {
     /// rather than at decode time so a hand-edited file cannot strand a
     /// subtree outside every path.
     var allMessages: [ChatMessage] {
-        MessageTree.promotingOrphans(messages + branches)
+        // Dedupe first — path wins over branches — so a corrupt file that
+        // carries the same id twice resolves to ONE node before any tree
+        // arithmetic sees it; see ``MessageTree/deduplicatingByID``.
+        MessageTree.promotingOrphans(MessageTree.deduplicatingByID(messages + branches))
     }
 
     /// The visible transcript — the root-to-leaf path ending at
@@ -231,8 +239,12 @@ extension ChatConversation {
     /// the outbound wire body, export, title derivation. For a conversation
     /// that never branched this is just ``messages``.
     var activePath: [ChatMessage] {
-        guard !branches.isEmpty else { return messages }
-        return MessageTree.activePath(
+        // One code path for every conversation — no `branches.isEmpty` fast
+        // path. For a valid linear transcript the derived walk returns the
+        // same array, and for a hand-edited one (dangling parents, cycles, a
+        // stale leaf pointer) it degrades through the same guards every
+        // branched conversation gets instead of returning raw storage.
+        MessageTree.activePath(
             in: allMessages,
             activeLeafID: activeLeafID ?? messages.last?.id,
             preferring: branchChoices

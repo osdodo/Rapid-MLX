@@ -220,6 +220,120 @@ struct MessageBranchingTests {
         #expect(!conversation.hasBranches)
     }
 
+    @Test("A never-branched save carries no conversation-level branching keys")
+    func neverBranchedSaveOmitsBranchingKeys() throws {
+        // The `branches` key's ABSENCE is the schema marker the decoder keys
+        // on, and `activeLeafID` / `branchChoices` ride along with it: a
+        // conversation that never branched must not emit any of the three.
+        // (Rows still carry `parentID` — an additive key old builds ignore.)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rapid-branching-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("conversations.json")
+
+        let viewModel = ChatViewModel(conversationStoreURL: file)
+        // A real send, not a dev seed: ``persistActive`` is what writes the
+        // file, and it runs on the send path.
+        viewModel.send("question", alias: "test-model")
+        viewModel.stopAndPersist()
+        ConversationStore.flush()
+
+        let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: file))
+        let stored = try #require((raw as? [[String: Any]])?.first)
+        #expect(stored["branches"] == nil)
+        #expect(stored["activeLeafID"] == nil)
+        #expect(stored["branchChoices"] == nil)
+    }
+
+    @Test("Deleting every alternative returns the file to the linear shape intact")
+    func drainedBranchesRoundTripSafely() throws {
+        // The migration marker is the `branches` key's presence, so the
+        // dangerous transition is branching and then deleting every
+        // alternative: the re-encoded file has no marker again, and the next
+        // decode must NOT re-chain it into something else. It survives
+        // because the remaining path still carries its parent links, which
+        // the legacy repair (keyed on "NO row has a parent") leaves alone.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rapid-branching-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("conversations.json")
+
+        let viewModel = ChatViewModel(conversationStoreURL: file)
+        let user = ChatMessage(role: .user, content: "question")
+        let answer = ChatMessage(role: .assistant, content: "first answer")
+        viewModel.devSeedMessages([user, answer])
+        viewModel.regenerateLast(alias: "test-model")
+        viewModel.stopAndPersist()
+        #expect(viewModel.deleteMessage(id: answer.id))
+        ConversationStore.flush()
+
+        let restored = try #require(ConversationStore.load(from: file).first)
+        #expect(!restored.hasBranches)
+        #expect(restored.activePath.count == 2)
+        #expect(restored.activePath.first?.content == "question")
+    }
+
+    @Test("Editing the opening prompt, then deleting the old branch, reloads intact")
+    func editedRootThenDrainedBranchesRoundTrip() throws {
+        // The nastiest shape for the old shape-inferred migration: editing
+        // the opening prompt makes a SECOND parentless root. Once the stale
+        // branch is deleted the file has no `branches` key again — reload
+        // must keep the surviving root's chain, not splice anything.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rapid-branching-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("conversations.json")
+
+        let viewModel = ChatViewModel(conversationStoreURL: file)
+        let user = ChatMessage(role: .user, content: "original question")
+        let answer = ChatMessage(role: .assistant, content: "original answer")
+        viewModel.devSeedMessages([user, answer])
+        #expect(
+            viewModel.editUserMessage(
+                id: user.id, newContent: "revised question", alias: "test-model"
+            )
+        )
+        viewModel.stopAndPersist()
+        #expect(viewModel.deleteMessage(id: user.id))
+        ConversationStore.flush()
+
+        let restored = try #require(ConversationStore.load(from: file).first)
+        #expect(!restored.hasBranches)
+        #expect(restored.activePath.first?.content == "revised question")
+        #expect(!restored.allMessages.contains { $0.id == user.id })
+        #expect(!restored.allMessages.contains { $0.id == answer.id })
+    }
+
+    @Test("Deleting the only answer keeps its prompt")
+    func deletingOnlyAnswerKeepsPrompt() {
+        // The subtree stops at the selected turn: a childless prompt is still
+        // something the user said, and the seed for a fresh regeneration.
+        let (viewModel, user, answer) = seededModel()
+        #expect(viewModel.deleteMessage(id: answer.id))
+        #expect(viewModel.messages.map(\.id) == [user.id])
+        #expect(viewModel.deletionImpact(of: user.id) == 1)
+    }
+
+    @Test("Structural mutations are refused while a stream is in flight")
+    func structuralMutationsRefusedWhileStreaming() {
+        // The in-flight turn writes by INDEX into the visible path; every
+        // structural entry point must refuse rather than move the rows under
+        // it.
+        let (viewModel, _, answer) = seededModel()
+        viewModel.regenerateLast(alias: "test-model")
+        defer { viewModel.stopAndPersist() }
+
+        #expect(viewModel.isStreaming)
+        let replacement = viewModel.messages[1]
+        #expect(!viewModel.deleteMessage(id: answer.id))
+        #expect(!viewModel.stepBranch(from: replacement.id, by: -1))
+        #expect(!viewModel.selectBranch(at: 0, forSiblingOf: replacement.id))
+        #expect(viewModel.messages.count == 2)
+    }
+
     // MARK: - Remembered position within a branch
 
     /// Two answers to one prompt, where the FIRST was continued for several
