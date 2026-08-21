@@ -24,6 +24,7 @@ import importlib.metadata as _im
 import importlib.util as _iu
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -230,7 +231,9 @@ def _bundled_sidecar_root() -> Path | None:
     We fingerprint that shape off ``sys.executable`` rather than trusting an
     env var: the desktop is not the only thing that spawns the sidecar (the
     user can run the shim by hand), so any env-var marker would be absent in
-    exactly the cases that matter.
+    exactly the cases that matter.  The shape alone is not provenance,
+    though: a custom Python installation can reproduce it.  Require one of
+    the two locations ``ServerLocator`` owns before changing doctor contracts.
     """
     try:
         exe = Path(sys.executable).resolve()
@@ -245,7 +248,50 @@ def _bundled_sidecar_root() -> Path | None:
         return None
     if not (root / "bin" / "rapid-mlx").exists():
         return None
-    return root
+
+    # Full DMG: <any app name>.app/Contents/Resources/rapid-mlx.  Users may
+    # rename the app after installation, so the stable macOS bundle suffix is
+    # the provenance signal rather than the display name.
+    embedded_shape = (
+        root.parent.name == "Resources"
+        and root.parents[1].name == "Contents"
+        and root.parents[2].suffix == ".app"
+    )
+    embedded = False
+    if embedded_shape:
+        try:
+            with (root.parents[1] / "Info.plist").open("rb") as handle:
+                plist = plistlib.load(handle)
+        except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+            plist = None
+        bundle_id = plist.get("CFBundleIdentifier") if isinstance(plist, dict) else None
+        # Production is exact; dogfood isolation appends a suffix so multiple
+        # personas can coexist without sharing preferences.
+        embedded = isinstance(bundle_id, str) and (
+            bundle_id == "com.rapidmlx.rapid"
+            or bundle_id.startswith("com.rapidmlx.rapid.dogfood-")
+        )
+
+    # Runtime override: ApplicationSupportLocator may root this under a
+    # dogfood HOME, but the suffix below is invariant.  Match the complete
+    # product-owned suffix so an arbitrary ``runtime-override/rapid-mlx``
+    # directory is not enough to suppress ordinary CLI diagnostics.
+    runtime_override = False
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        try:
+            expected_override = (
+                Path(home).expanduser().resolve()
+                / "Library"
+                / "Application Support"
+                / "Rapid"
+                / "runtime-override"
+                / "rapid-mlx"
+            ).resolve()
+        except OSError:
+            expected_override = None
+        runtime_override = root == expected_override
+    return root if embedded or runtime_override else None
 
 
 def _sidecar_repair_hint(root: Path) -> str:

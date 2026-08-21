@@ -49,6 +49,10 @@ def test_doctor_desktop_audio_contract_matches_the_extra() -> None:
     """
     from vllm_mlx.doctor import env_health
 
+    assert env_health._AUDIO_DESKTOP_IMPORTS == (
+        ("mlx-audio", "mlx_audio"),
+        ("soundfile", "soundfile"),
+    )
     doctor_names = {dist for dist, _ in env_health._AUDIO_DESKTOP_IMPORTS}
     assert doctor_names == {
         _dependency_name(spec) for spec in _extras()["audio-desktop"]

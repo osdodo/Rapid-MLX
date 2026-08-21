@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import plistlib
 from pathlib import Path
 from unittest import mock
 
@@ -274,9 +275,15 @@ def _stage_sidecar_bundle(tmp_path: Path, *, slot: str = "embedded") -> Path:
     ``runtime-override`` mirrors ``~/Library/Application Support/Rapid/
     runtime-override/rapid-mlx/``. Both share the identical bundle layout.
     """
-    parent = tmp_path / (
-        "runtime-override" if slot == "runtime-override" else "Resources"
-    )
+    if slot == "runtime-override":
+        parent = (
+            tmp_path / "Library" / "Application Support" / "Rapid" / "runtime-override"
+        )
+    else:
+        parent = tmp_path / "Rapid-MLX Desktop.app" / "Contents" / "Resources"
+        parent.parent.mkdir(parents=True)
+        with (parent.parent / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleIdentifier": "com.rapidmlx.rapid"}, handle)
     root = parent / "rapid-mlx"
     (root / "site-packages").mkdir(parents=True)
     (root / "bin").mkdir(parents=True)
@@ -301,6 +308,58 @@ def test_ordinary_install_is_not_treated_as_bundled_sidecar(tmp_path: Path):
     exe.parent.mkdir(parents=True)
     exe.write_text("")
     with mock.patch.object(eh.sys, "executable", str(exe)):
+        assert eh._bundled_sidecar_root() is None
+
+
+def test_custom_install_with_sidecar_shape_is_not_treated_as_desktop(
+    tmp_path: Path,
+):
+    """The three internal bundle paths are user-creatable and therefore do
+    not prove that Desktop owns the environment without a managed location."""
+    root = tmp_path / "custom-python" / "rapid-mlx"
+    (root / "site-packages").mkdir(parents=True)
+    (root / "bin").mkdir()
+    (root / "bin" / "rapid-mlx").write_text("#!/bin/sh\n")
+    exe = root / "python" / "bin" / "python3.12"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+
+    with mock.patch.object(eh.sys, "executable", str(exe)):
+        assert eh._bundled_sidecar_root() is None
+
+
+def test_unrelated_app_with_sidecar_shape_is_not_treated_as_desktop(
+    tmp_path: Path,
+):
+    """A generic app-bundle suffix is not Rapid-MLX provenance."""
+    exe = _stage_sidecar_bundle(tmp_path)
+    info = exe.parents[4] / "Info.plist"
+    with info.open("wb") as handle:
+        plistlib.dump({"CFBundleIdentifier": "com.example.other-app"}, handle)
+
+    with mock.patch.object(eh.sys, "executable", str(exe)):
+        assert eh._bundled_sidecar_root() is None
+
+
+def test_non_mapping_info_plist_is_not_treated_as_desktop(tmp_path: Path):
+    """A valid plist may have a non-dictionary root and must not crash doctor."""
+    exe = _stage_sidecar_bundle(tmp_path)
+    info = exe.parents[4] / "Info.plist"
+    with info.open("wb") as handle:
+        plistlib.dump(["not", "a", "bundle", "dictionary"], handle)
+
+    with mock.patch.object(eh.sys, "executable", str(exe)):
+        assert eh._bundled_sidecar_root() is None
+
+
+def test_runtime_override_must_belong_to_active_home(tmp_path: Path):
+    """A matching suffix under another home is not Desktop provenance."""
+    foreign_home = tmp_path / "foreign-home"
+    exe = _stage_sidecar_bundle(foreign_home, slot="runtime-override")
+    with (
+        mock.patch.object(eh.sys, "executable", str(exe)),
+        mock.patch.dict(eh.os.environ, {"HOME": str(tmp_path / "active-home")}),
+    ):
         assert eh._bundled_sidecar_root() is None
 
 
@@ -401,7 +460,10 @@ def test_runtime_override_is_not_told_to_reinstall_the_app(tmp_path: Path):
     upgrades, and the bootstrapper skips its download while the cache exists —
     so "reinstall the .app" alone repairs nothing."""
     exe = _stage_sidecar_bundle(tmp_path, slot="runtime-override")
-    with mock.patch.object(eh.sys, "executable", str(exe)):
+    with (
+        mock.patch.object(eh.sys, "executable", str(exe)),
+        mock.patch.dict(eh.os.environ, {"HOME": str(tmp_path)}),
+    ):
         root = eh._bundled_sidecar_root()
         hint = eh._sidecar_repair_hint(root)
 
@@ -418,7 +480,10 @@ def test_runtime_override_hint_avoids_the_nonexistent_update_entry_point(
     ``sidecar_*`` fields. Pointing users there for a broken runtime override is
     a dead-end recovery flow."""
     exe = _stage_sidecar_bundle(tmp_path, slot="runtime-override")
-    with mock.patch.object(eh.sys, "executable", str(exe)):
+    with (
+        mock.patch.object(eh.sys, "executable", str(exe)),
+        mock.patch.dict(eh.os.environ, {"HOME": str(tmp_path)}),
+    ):
         hint = eh._sidecar_repair_hint(eh._bundled_sidecar_root())
 
     assert "check for updates" not in hint.lower()
@@ -434,7 +499,10 @@ def test_runtime_override_hint_does_not_promise_an_automatic_reinstall(
     the hint must order "install the app that ships a sidecar" BEFORE the
     removal, and must not claim relaunching reinstalls the runtime."""
     exe = _stage_sidecar_bundle(tmp_path, slot="runtime-override")
-    with mock.patch.object(eh.sys, "executable", str(exe)):
+    with (
+        mock.patch.object(eh.sys, "executable", str(exe)),
+        mock.patch.dict(eh.os.environ, {"HOME": str(tmp_path)}),
+    ):
         root = eh._bundled_sidecar_root()
         hint = eh._sidecar_repair_hint(root)
 
@@ -456,6 +524,7 @@ def test_runtime_override_broken_audio_row_uses_the_runtime_hint(tmp_path: Path)
     exe = _stage_sidecar_bundle(tmp_path, slot="runtime-override")
     with (
         mock.patch.object(eh.sys, "executable", str(exe)),
+        mock.patch.dict(eh.os.environ, {"HOME": str(tmp_path)}),
         mock.patch.object(eh, "_safe_version", side_effect=fake_ver),
         mock.patch.object(
             eh, "_module_available", side_effect=lambda m: m != "soundfile"
