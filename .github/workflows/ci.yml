@@ -231,11 +231,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install mypy pydantic fastapi
+          # The checked-in budget belongs to this fully pinned type surface.
+          pip install --requirement config/mypy-requirements.txt
 
-      - name: Run mypy
-        run: mypy vllm_mlx/ --ignore-missing-imports --no-error-summary
-        continue-on-error: true
+      - name: Enforce shrink-only mypy error budget
+        run: python scripts/check_mypy_error_budget.py
 
   test-matrix:
     needs: changes
@@ -246,6 +246,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # diff-cover compares the PR head with the immutable base SHA. A
+          # shallow checkout can make that commit unavailable.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -255,7 +259,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests pyyaml
+          pip install pytest pytest-asyncio pytest-cov "diff-cover==8.0.3" pydantic fastapi jsonschema httpx psutil transformers requests pyyaml
 
       - name: Run unit tests (no MLX required)
         # NOTE: tests in this list MUST not import mlx / mlx_lm at module
@@ -266,6 +270,16 @@ jobs:
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
+            tests/test_cohere_command_reasoning_parser.py \
+            tests/test_responses_route.py::TestResponsesNonStream::test_structured_output_keeps_bare_json_out_of_reasoning \
+            tests/test_responses_route.py::TestResponsesStream::test_structured_output_streams_bare_json_as_output_text \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_uses_command_protocol_boundary \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_injects_boundary_on_following_chunk \
+            tests/test_responses_route.py::TestResponsesStream::test_reasoning_cap_exact_terminal_boundary_finishes_cleanly \
+            tests/test_postprocessor.py \
+            tests/test_reasoning_parser_truncation_finalize.py \
+            tests/test_reasoning_finalize_stop_in_think.py \
+            tests/test_per_request_thinking_budget.py \
             tests/test_tool_parsers.py \
             tests/test_native_tool_format.py \
             tests/test_prefix_cache.py \
@@ -286,6 +300,7 @@ jobs:
             tests/test_release_baselines.py \
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
+            tests/test_check_mypy_error_budget.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \
             tests/test_check_mlx_upstream_calls.py \
@@ -296,6 +311,7 @@ jobs:
             tests/test_community_bench_upload.py \
             tests/test_music_engine.py \
             tests/test_aliases_contract.py \
+            tests/test_chat_template_registry.py \
             tests/test_alias_subfolder.py \
             tests/test_ram_tier_recommendations_agree.py \
             tests/test_version_sync.py \
@@ -304,6 +320,17 @@ jobs:
             --cov=vllm_mlx \
             --cov-report=term-missing \
             --cov-report=xml
+
+      - name: Enforce changed-lines coverage
+        if: github.event_name == 'pull_request' && matrix.python-version == '3.11'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python -m diff_cover.diff_cover_tool \
+            coverage.xml \
+            --compare-branch "$PR_BASE_SHA" \
+            --show-uncovered \
+            --fail-under 100
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'

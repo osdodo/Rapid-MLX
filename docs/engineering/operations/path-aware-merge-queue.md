@@ -18,6 +18,11 @@ product area selects all applicable lanes.
   or macOS runner. Universal guards retain workflow-expression, immutable
   Action-pin, and architecture-SSOT checks.
 
+Engine classification includes the serving packages and their tests, scripts,
+examples, evaluations, benchmark inputs/results, regression harness, and
+engine-only type-check configuration. These paths must not allocate Desktop or
+GUI runners merely because they live outside the primary Python package.
+
 Engine-only contracts are admitted by the same fail-closed classifier as the
 engine test lanes. They include CLI/config fidelity, release and installer
 offline tests, and the parser microbenchmark. Desktop-only and
@@ -31,6 +36,44 @@ They must not be renamed or hidden behind workflow-level path filters without a
 matching branch-protection migration. `tests` includes lint, type-check job
 health, the MLX dependency-bound guard on pull requests, and all selected engine
 test lanes; `desktop-tests` includes every selected Desktop lane.
+
+### Type-error budget
+
+Engine changes run a shrink-only mypy debt ratchet. The checked-in
+`config/mypy-error-baseline.txt` records the current error count for each dirty
+file under the fully pinned Python 3.11 environment in
+`config/mypy-requirements.txt`. A new dirty file or an increase in any file's
+count blocks `tests`. When fixes reduce a count or clean a file completely, CI
+also blocks until the baseline is tightened with:
+
+```bash
+python scripts/check_mypy_error_budget.py --update
+```
+
+`--update` refuses growth and new dirty files, so it cannot be used as a casual
+bypass. The budget intentionally does not claim semantic identity for individual
+diagnostics: replacing one error with another while a dirty file's total stays
+flat is outside this first ratchet. This keeps the gate deterministic despite
+moving line numbers and messages while preventing debt from spreading or
+growing. As dirty files are repaired and removed from the baseline, they can
+never become dirty again without failing CI.
+
+### Changed-lines coverage
+
+Engine pull requests enforce 100% coverage for executable lines newly added or
+modified under `vllm_mlx/`. The Python 3.11 Linux unit-test leg already produces
+`coverage.xml`; `diff-cover` compares that report with the pull request's
+immutable base SHA and blocks the stable `tests` aggregate when a measurable
+changed line was not exercised. Comments, blank lines, deletions, tests, docs,
+and unchanged production lines do not enter the score.
+
+This is a new-debt ratchet, not a whole-repository percentage target. Existing
+uncovered code remains grandfathered until a pull request changes its executable
+lines, so ordinary feature and bug-fix work is not required to repair unrelated
+historical coverage debt. A production change that cannot run on the Linux lane
+must expose its behavior through a Linux-testable boundary or extend the coverage
+gate to consume trustworthy evidence from the relevant required lane; lowering
+the threshold is not the normal escape hatch.
 
 ## Merge gate
 
@@ -131,3 +174,11 @@ one serial consumer without changing which journeys are selected.
 If GUI artifact reuse is suspect, restore the build step inside
 `gui-golden-flows` and remove `gui-app-build` from its dependencies. This costs
 additional macOS build time but preserves the same release-shaped UI coverage.
+If the mypy budget gate is operationally broken, restore the prior advisory
+direct mypy command with `continue-on-error: true` while repairing the script.
+Do not increase counts or add files to the baseline merely to make a PR green.
+If changed-lines coverage is operationally broken, remove only the
+`Enforce changed-lines coverage` step while repairing its checkout or tooling;
+keep the existing advisory measurement and coverage XML upload as diagnostic
+evidence. Do not lower `--fail-under` or exclude changed production lines merely
+to make a pull request green.
