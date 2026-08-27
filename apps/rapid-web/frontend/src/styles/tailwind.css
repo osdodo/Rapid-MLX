@@ -1,0 +1,351 @@
+@import 'tailwindcss';
+
+/* tokens.css owns the light/dark switch via data-theme. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/* `inline` so utilities reference var(--brand) directly rather than copying
+   its value — otherwise the theme switch would not move them. */
+@theme inline {
+  --color-brand: var(--brand);
+  --color-brand-hi: var(--brand-hi);
+  --color-brand-tint: var(--brand-tint);
+  --color-amber: var(--amber);
+  --color-amber-deep: var(--amber-deep);
+  --color-amber-tint: var(--amber-tint);
+  --color-green: var(--green);
+  --color-danger: var(--danger);
+
+  --color-canvas: var(--canvas);
+  --color-card: var(--card);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-on-brand: var(--on-brand);
+
+  --color-band: var(--band);
+  --color-band-ink: var(--band-ink);
+  --color-band-ink-2: var(--band-ink-2);
+  --color-band-track: var(--band-track);
+
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
+
+  --ease-brand: var(--ease);
+}
+
+/* Restored after preflight, which would otherwise undo them. */
+
+/* Below 16px iOS Safari zooms on focus and never zooms back. */
+input,
+textarea,
+select {
+  font-size: 16px;
+}
+
+/* Tailwind v4 dropped this from preflight. */
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@keyframes notice-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+@keyframes sheet-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+
+@keyframes dialog-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent);
+  }
+  50% {
+    opacity: 0.65;
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--amber) 0%, transparent);
+  }
+}
+
+@keyframes drawer-slide {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+}
+
+@keyframes band-flash {
+  0%,
+  100% {
+    transform: none;
+  }
+  25% {
+    transform: translateX(-3px);
+  }
+  55% {
+    transform: translateX(2px);
+  }
+}
+
+@keyframes row-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes jump-pop {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.9);
+  }
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/*
+  Markdown prose. These stay as CSS rather than utilities for two reasons:
+  they target DESCENDANTS the JSX never names (table cells, and the .hljs-*
+  spans lowlight emits at runtime, which Tailwind's scanner cannot see), and
+  the vertical rhythm is em-based so it tracks the prose font size.
+*/
+@layer components {
+  /* A <details> marker cannot be expressed as a utility. */
+  .reasoning-summary {
+    list-style: none;
+    cursor: pointer;
+  }
+  .reasoning-summary::-webkit-details-marker {
+    display: none;
+  }
+  .reasoning-summary::before {
+    content: '▸ ';
+    display: inline-block;
+  }
+  details[open] > .reasoning-summary::before {
+    content: '▾ ';
+  }
+
+  .md-p {
+    margin: 0 0 0.85em;
+  }
+  .md-p:last-child {
+    margin-bottom: 0;
+  }
+
+  .md-h {
+    margin: 1.1em 0 0.5em;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.28;
+  }
+  .md-h:first-child {
+    margin-top: 0;
+  }
+  h1.md-h {
+    font-size: 1.45em;
+  }
+  h2.md-h {
+    font-size: 1.25em;
+  }
+  h3.md-h {
+    font-size: 1.1em;
+  }
+  h4.md-h,
+  h5.md-h,
+  h6.md-h {
+    font-size: 1em;
+  }
+
+  .md-list {
+    margin: 0 0 0.85em;
+    padding-left: 1.4em;
+  }
+  .md-li {
+    margin: 0.2em 0;
+  }
+  /* Or every item grows a blank line under it. */
+  .md-li > .md-p {
+    margin-bottom: 0.2em;
+  }
+
+  .md-quote {
+    margin: 0 0 0.85em;
+    padding: 0.1em 0 0.1em 0.9em;
+    border-left: 3px solid color-mix(in srgb, var(--brand) 45%, var(--line));
+    color: var(--muted);
+  }
+
+  .md-rule {
+    margin: 1.2em 0;
+    border: none;
+    border-top: 1px solid var(--line);
+  }
+
+  .md-code-wrap {
+    margin: 0 0 0.85em;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-md);
+    overflow: hidden;
+    background: color-mix(in srgb, var(--fg) 3.5%, var(--card));
+  }
+
+  .md-pre {
+    margin: 0;
+    padding: 12px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.55;
+    /* Code does NOT wrap: breaking a shell command mid-path makes it
+       uncopyable by eye. */
+    white-space: pre;
+  }
+
+  .md-codespan {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    padding: 0.12em 0.34em;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    /* A long identifier would otherwise force the bubble wider than the
+       screen. */
+    overflow-wrap: anywhere;
+  }
+
+  /* Mapped onto tokens.css rather than imported from a highlight.js theme, so
+     no second colour system enters the page. */
+  .md-pre .hljs-comment,
+  .md-pre .hljs-quote {
+    color: var(--code-comment);
+    font-style: italic;
+  }
+  .md-pre .hljs-keyword,
+  .md-pre .hljs-selector-tag,
+  .md-pre .hljs-literal {
+    color: var(--code-keyword);
+  }
+  .md-pre .hljs-string,
+  .md-pre .hljs-regexp {
+    color: var(--code-string);
+  }
+  .md-pre .hljs-number {
+    color: var(--code-number);
+  }
+  .md-pre .hljs-title,
+  .md-pre .hljs-title.function_,
+  .md-pre .hljs-section {
+    color: var(--code-title);
+  }
+  .md-pre .hljs-type,
+  .md-pre .hljs-class,
+  .md-pre .hljs-attr,
+  .md-pre .hljs-attribute {
+    color: var(--code-type);
+  }
+  .md-pre .hljs-built_in,
+  .md-pre .hljs-builtin-name {
+    color: var(--code-builtin);
+  }
+  .md-pre .hljs-deletion {
+    color: var(--danger);
+  }
+  .md-pre .hljs-addition {
+    color: var(--green);
+  }
+
+  .md-table-wrap {
+    margin: 0 0 0.85em;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-md);
+  }
+  .md-table {
+    border-collapse: collapse;
+    width: 100%;
+    font-family: var(--font-body);
+    font-size: 14px;
+  }
+  .md-table th,
+  .md-table td {
+    padding: 7px 11px;
+    border-bottom: 1px solid var(--line-soft);
+    text-align: left;
+    white-space: nowrap;
+  }
+  .md-table th {
+    font-weight: 600;
+    background: color-mix(in srgb, var(--fg) 3%, transparent);
+  }
+  .md-table tr:last-child td {
+    border-bottom: none;
+  }
+
+  /* A refused scheme: underlined so the model's intent stays legible, but no
+     pointer affordance, because the click does nothing. */
+  .md-dead-link {
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    color: var(--muted);
+    cursor: text;
+  }
+
+  /* MathML inherits the surrounding size, which is slightly large on the
+     serif prose face. */
+  .md-math-inline {
+    font-size: 1.02em;
+  }
+  .md-math-display {
+    display: block;
+    margin: 0.7em 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    text-align: center;
+  }
+}

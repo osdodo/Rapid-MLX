@@ -1,0 +1,167 @@
+/*
+  Design tokens, derived from apps/rapid-mac/Sources/Rapid/UI/RapidTheme.swift
+  so the web surface reads as the same product as the Mac app rather than a
+  lookalike.
+
+    brand      #3A5C86 / #6E96C8  (steel blue)
+    brand-hi   #7EA8FF / #9CBEFF
+    amber      #EFA23A            (CTAs, the "energy" accent)
+    green      #2E7D55 / #5FC7A0  (speed / success only)
+    canvas     #FAFAF9 / #141619  (warm off-white, warm near-black)
+
+  Amber is used sparingly and on purpose: it marks the moment the model is
+  actually producing tokens, which is the one thing worth looking at. Green
+  means Ready and nothing else; red means error or destructive and nothing
+  else. That hierarchy is RapidTheme.swift:281-291 and no surface may invent a
+  fifth meaning for a colour.
+
+  THEMING. The old page had no manual control — it was `prefers-color-scheme`
+  only. Here the palette lives in three blocks:
+
+    :root                        light values (the default)
+    [data-theme='dark']          explicit dark, set by the user
+    @media (prefers-color-scheme: dark) :root:not([data-theme])
+                                 dark when the OS says so AND the user has not
+                                 chosen. The :not() is what makes an explicit
+                                 light choice survive a dark OS.
+
+  The dark values therefore appear twice. That duplication is deliberate:
+  the alternative is a set of second-order variables (--dark-brand etc.)
+  redirected by both selectors, which doubles the indirection on every single
+  token to save repeating a list that changes about once a year.
+*/
+
+:root {
+  --brand: #3a5c86;
+  --brand-hi: #7ea8ff;
+  --brand-tint: #eef2f7;
+  --amber: #efa23a;
+  --amber-deep: #c9821f;
+  --amber-tint: #fbf1e2;
+  --green: #2e7d55;
+  --danger: #b4342a;
+
+  --canvas: #fafaf9;
+  --card: #ffffff;
+  --fg: #1a1d21;
+  --muted: #6b7280;
+  --faint: #9aa0a6;
+  --line: #e5e3df;
+  --line-soft: #efede9;
+
+  /* The user bubble's text. On light it is white on steel blue; on dark the
+     brand token is a LIGHT steel blue, so white loses contrast and the text
+     flips to the canvas colour instead. RapidTheme.swift makes the same call
+     for onBrandPrimary: graphite on amber measures ~9:1, white ~2.0:1. */
+  --on-brand: #ffffff;
+
+  /* Surface for the lifecycle band. Inverted intent, straight from
+     RapidTheme.surfaceBand: near-black in light so it reads as a distinct
+     plane, and *lighter* in dark or it vanishes into the canvas. */
+  --band: #1b1d21;
+  --band-ink: #f4f3f1;
+  --band-ink-2: #a5a8ae;
+  --band-track: #33373d;
+
+  --shadow-sm: 0 1px 2px rgba(26, 29, 33, 0.06);
+  --shadow-md: 0 4px 16px rgba(26, 29, 33, 0.08);
+  --shadow-lg: 0 12px 40px rgba(26, 29, 33, 0.14);
+
+  /*
+    New York (ui-serif) for display, SF Mono for metrics. Both ship with
+    macOS/iOS, which matters: the CSP is `default-src 'self'` and a tunnelled
+    phone may have no route to a font CDN at all. A webfont here would
+    silently fall back to Times.
+  */
+  --font-display: ui-serif, 'New York', Georgia, serif;
+  --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* Syntax-highlighting palette. Mapped onto the tokens above rather than
+     imported from a highlight.js theme, so code blocks read as the same
+     product in both appearances and no second colour system enters. */
+  --code-comment: #8a867e;
+  --code-keyword: #8250a8;
+  --code-string: #2e7d55;
+  --code-number: #b4342a;
+  --code-title: #3a5c86;
+  --code-type: #c9821f;
+  --code-builtin: #0f766e;
+}
+
+[data-theme='dark'] {
+  --brand: #6e96c8;
+  --brand-hi: #9cbeff;
+  --brand-tint: #1e2a3a;
+  --amber: #efa23a;
+  --amber-deep: #efa23a;
+  --amber-tint: #2a2113;
+  --green: #5fc7a0;
+  --danger: #f0857b;
+
+  --canvas: #141619;
+  --card: #1b1e23;
+  --fg: #e8eaed;
+  --muted: #9aa0a6;
+  --faint: #6b7280;
+  --line: #292d34;
+  --line-soft: #22262c;
+
+  --on-brand: #10141a;
+
+  --band: #23262b;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.6);
+
+  --code-comment: #8a9099;
+  --code-keyword: #c792ea;
+  --code-string: #5fc7a0;
+  --code-number: #f0857b;
+  --code-title: #9cbeff;
+  --code-type: #efa23a;
+  --code-builtin: #5eead4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --brand: #6e96c8;
+    --brand-hi: #9cbeff;
+    --brand-tint: #1e2a3a;
+    --amber: #efa23a;
+    --amber-deep: #efa23a;
+    --amber-tint: #2a2113;
+    --green: #5fc7a0;
+    --danger: #f0857b;
+
+    --canvas: #141619;
+    --card: #1b1e23;
+    --fg: #e8eaed;
+    --muted: #9aa0a6;
+    --faint: #6b7280;
+    --line: #292d34;
+    --line-soft: #22262c;
+
+    --on-brand: #10141a;
+
+    --band: #23262b;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.6);
+
+    --code-comment: #8a9099;
+    --code-keyword: #c792ea;
+    --code-string: #5fc7a0;
+    --code-number: #f0857b;
+    --code-title: #9cbeff;
+    --code-type: #efa23a;
+    --code-builtin: #5eead4;
+  }
+}
