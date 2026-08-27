@@ -305,7 +305,7 @@ struct SidebarView: View {
     /// SwiftUI binding — so the golden flow could neither find the field
     /// nor enable Save. A plain sheet exposes the same controls as
     /// ordinary views, where identifiers, value writes, and presses all
-    /// behave (fresh-install drives the consent sheet the same way on the
+    /// behave (fresh-install drives the post-value invitation the same way on the
     /// same runner). The three identifiers are the flow's contract — keep
     /// them stable.
     private var folderPromptSheet: some View {
@@ -1364,7 +1364,13 @@ private struct SidebarRow<Content: View>: View {
 /// `rapid-mlx launch …` command without changing this surface's shape.
 struct LaunchView: View {
     @Bindable var server: ServerManager
-    let alias: String
+    /// The side-channel downloader the inline model picker uses. Always
+    /// supplied by the real ``ContentView``; the dev snapshot harness passes
+    /// its own empty manager so the page renders standalone.
+    @Bindable var downloads: DownloadManager
+    /// The currently-chosen model, bound so the stopped state's inline
+    /// picker can change it and the shared readiness re-derives.
+    @Binding var alias: String
     /// The window's shared readiness value. Optional so the dev snapshot
     /// harness can render the page standalone; when supplied, the page
     /// describes the model lifecycle in exactly the same words the chat
@@ -1377,7 +1383,9 @@ struct LaunchView: View {
             host: "127.0.0.1",
             port: server.activePort,
             bearer: server.activeBearer ?? "",
-            alias: alias,
+            alias: $alias,
+            server: server,
+            downloads: downloads,
             // The sidecar binary this app owns lives off-PATH (see
             // ``ServerLocator``); pass its absolute path so the launch/agent
             // commands this page generates actually run in a terminal.

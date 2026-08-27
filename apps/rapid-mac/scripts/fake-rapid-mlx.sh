@@ -45,6 +45,7 @@ import time
 import wave
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 if sys.argv[1:] == ["launch", "list", "--json"]:
@@ -80,6 +81,17 @@ def _setting(name, default=None):
 
 def _pulled_audio_aliases():
     state_path = _setting("FAKE_AUDIO_PULL_STATE")
+    if not state_path:
+        return set()
+    try:
+        with open(state_path) as stream:
+            return {line.strip() for line in stream if line.strip()}
+    except OSError:
+        return set()
+
+
+def _pulled_model_aliases():
+    state_path = _setting("FAKE_PULL_STATE")
     if not state_path:
         return set()
     try:
@@ -299,6 +311,10 @@ FAKE_IMAGE_REPO = "fake-org/fake-image-repo"
 # ``/v1/models/load`` path instead of the legacy stop/start fallback when the
 # GUI asks for a second model while the sidecar is already running (#1838).
 SERVED_ALIAS = ""
+# Lazy audio engines are process-owned in production. The fixture mirrors
+# that lifecycle: a successful transcription materializes the STT lane, while
+# a sidecar replacement starts a fresh process with no resident audio lanes.
+RESIDENT_AUDIO_LANES = {}
 
 # The engine's own, actionable rejection reason. Kept out of the snapshot so a
 # stock persona never changes residency shape; a flow opts in with
@@ -599,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                 "loads_total": 0,
                 "evictions_total": 0,
                 "models": [],
+                "audio_lanes": [],
             }
         return {
             "memory_limit_bytes": 34359738368,
@@ -620,6 +637,18 @@ class Handler(BaseHTTPRequestHandler):
                 "measured_bytes": None,
                 "idle_seconds": 0.0,
             }],
+            "audio_lanes": [
+                {
+                    "lane": lane,
+                    "model": model,
+                    "state": "resident",
+                    "active_requests": 0,
+                    "loaded_at": 1.0,
+                    "idle_seconds": 0.0,
+                    "last_error": None,
+                }
+                for lane, model in sorted(RESIDENT_AUDIO_LANES.items())
+            ],
         }
 
     def _models_load(self):
@@ -700,7 +729,13 @@ class Handler(BaseHTTPRequestHandler):
         count = raw_count if isinstance(raw_count, int) and raw_count > 0 else 1
         total = max(1, int(_setting("FAKE_IMAGE_STEPS", 8)))
         step_ms = max(0, int(_setting("FAKE_IMAGE_STEP_MS", 300)))
+        step_ms_sequence = []
+        for raw_delay in _setting("FAKE_IMAGE_STEP_MS_SEQUENCE", "").split(","):
+            raw_delay = raw_delay.strip()
+            if raw_delay:
+                step_ms_sequence.append(max(0, int(raw_delay)))
         first_warmup_ack = _setting("FAKE_IMAGE_FIRST_WARMUP_ACK")
+        step_hold_ack = _setting("FAKE_IMAGE_STEP_HOLD_ACK")
         index = RENDERS.begin(total, bool(first_warmup_ack))
         if index is None:
             # A render is already in flight. The real server runs one model in
@@ -740,16 +775,35 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.05)
             RENDERS.finish_warmup()
         cancelled = False
-        for _ in range(total):
-            time.sleep(step_ms / 1000)
+        for step_index in range(total):
+            # Production publishes `step = t + 1` when a denoise step starts.
+            # Advance before sleeping so the fixture has the same wire meaning.
             if RENDERS.advance():
                 cancelled = True
                 break
+            if step_hold_ack and step_index + 1 == 2:
+                deadline = time.monotonic() + 300
+                while not os.path.exists(step_hold_ack):
+                    if time.monotonic() >= deadline:
+                        RENDERS.end()
+                        _event("image_step_hold_timeout", step=2)
+                        self._json(500, {"error": {"code": "fixture_step_hold_timeout"}})
+                        return
+                    time.sleep(0.05)
+            delay_ms = (step_ms_sequence[step_index]
+                        if step_index < len(step_ms_sequence) else step_ms)
+            time.sleep(delay_ms / 1000)
         # Real image engines still perform VAE decode / PNG encoding after the
         # last denoise step. Keep that tail observable for GUI phase coverage.
         finish_ms = max(0, int(_setting("FAKE_IMAGE_FINISH_MS", 0)))
-        time.sleep(finish_ms / 1000)
+        # Production clears `running` when denoising returns, before PNG
+        # encoding. Publish that same finalizing boundary ahead of the tail.
         RENDERS.end()
+        # Cancellation exits denoising without entering the successful
+        # decode/encode tail. Keeping that tail after RENDERS.cancel() would
+        # make the fixture report a stopped render as if it were finalizing.
+        if not cancelled:
+            time.sleep(finish_ms / 1000)
         png = _one_pixel_png(((index * 70) % 256, (index * 130) % 256, (index * 190) % 256))
         encoded = base64.b64encode(png).decode("ascii")
         # The digest is of the BYTES that go on the wire, so a fixture (or an
@@ -769,18 +823,19 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
-        if self.path == "/v1/models/load":
+        path = urlsplit(self.path).path
+        if path == "/v1/models/load":
             self._models_load()
             return
-        if self.path == "/v1/images/generations":
+        if path == "/v1/images/generations":
             self._images_generate()
             return
-        if self.path == "/v1/images/cancel":
+        if path == "/v1/images/cancel":
             RENDERS.cancel()
             _event("image_cancel")
             self._json(200, {"cancelled": True})
             return
-        if self.path == "/v1/images/edits":
+        if path == "/v1/images/edits":
             self._images_generate(editing=True)
             return
         if self.path == "/v1/audio/speech":
@@ -816,6 +871,7 @@ class Handler(BaseHTTPRequestHandler):
             delay_ms = int(_setting("FAKE_AUDIO_TRANSCRIPTION_DELAY_MS", "0") or "0")
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000)
+            RESIDENT_AUDIO_LANES["stt"] = "fake/whisper-small"
             self._json(200, {
                 "text": "Golden transcription result.",
                 "language": "en",
@@ -1020,7 +1076,7 @@ def _emit_catalog(subcommand, alias):
         if "--json" in sys.argv:
             aliases = []
             if _setting("FAKE_INCLUDE_STARTER") == "1":
-                aliases.append("lfm2.5-1b-4bit")
+                aliases.extend(["lfm2.5-2.6b-4bit", "lfm2.5-1b-4bit"])
             if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
                 aliases.extend([f"a-cached-{index}" for index in range(6)])
                 aliases.append("qwen3.5-4b-4bit")
@@ -1058,10 +1114,12 @@ def _emit_catalog(subcommand, alias):
         print("Alias                  Parser           Reasoning        Preset")
         print("---------------------  ---------------  ---------------  --------")
         if _setting("FAKE_INCLUDE_STARTER") == "1":
-            # A production catalog always contains the onboarding starter.
+            # A production catalog contains both the RAM-aware compact starter
+            # and the explicit low-memory alternative.
             # Most flows deliberately keep the compact single-chat-row
             # fixture, but fresh-install must exercise the real default
             # selection contract rather than falling back to fake-alias.
+            print("lfm2.5-2.6b-4bit      hermes           none")
             print("lfm2.5-1b-4bit        hermes           none")
         if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
             for index in range(6):
@@ -1112,6 +1170,11 @@ def _emit_catalog(subcommand, alias):
         print("Cached models")
         print("Alias                  Repo                   Size")
         print("---------------------  ---------------------  ------")
+        pulled_models = _pulled_model_aliases()
+        if "lfm2.5-2.6b-4bit" in pulled_models:
+            print("lfm2.5-2.6b-4bit      fake-org/fake-repo        1.6 GB")
+        if "lfm2.5-1b-4bit" in pulled_models:
+            print("lfm2.5-1b-4bit        fake-org/fake-repo        720 MB")
         if _setting("FAKE_SETTINGS_MTP") != "1":
             if _setting("FAKE_VISION_CHAT") == "1":
                 # This is a behavioural fixture, not a real checkpoint.  Keep
@@ -1225,6 +1288,11 @@ def main():
                 with open(state_path, "a") as stream:
                     stream.write(f"{args.alias}\n")
             sys.exit(0)
+        if args.subcommand == "pull":
+            state_path = _setting("FAKE_PULL_STATE")
+            if state_path:
+                with open(state_path, "a") as stream:
+                    stream.write(f"{args.alias}\n")
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)
 

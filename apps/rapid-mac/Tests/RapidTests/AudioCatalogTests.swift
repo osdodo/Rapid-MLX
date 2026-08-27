@@ -174,6 +174,18 @@ struct AudioCatalogTests {
         #expect(!source.contains("Picker(\"\", selection: $controller.modelAlias)"))
     }
 
+    @Test("enabled dictation exposes automatic hotkey state without a manual arm control")
+    func dictationHotkeyIsAutomatic() throws {
+        let source = try String(contentsOf: Self.dictationViewURL, encoding: .utf8)
+
+        #expect(!source.contains("Arm now"))
+        #expect(!source.contains("Dictation.Arm"))
+        #expect(source.contains("controller.isHotkeyArmed"))
+        #expect(source.contains("Listening — press"))
+        #expect(source.contains("Listening paused — reconnecting the speech model"))
+        #expect(source.contains("Rapid will reconnect the speech model automatically."))
+    }
+
     @Test("parser extracts audio rows and preserves subtype, family, size, and repo")
     func parsesRows() {
         let rows = ModelCatalog.parseAudioRows(Self.sample)
@@ -319,7 +331,11 @@ struct AudioCatalogTests {
         let cacheProof = try #require(source.range(
             of: "guard viewModel.audioModels.first(where: { $0.alias == alias })?.cached == true"
         ))
-        let serve = try #require(source.range(of: "_ = await server.ensureServing(", options: .backwards))
+        // Voice co-loading routes activation through ``ensureVoiceLane`` (reuse
+        // the primary server / fall back to a voice-only one) instead of a raw
+        // ``server.ensureServing`` — the ordering guarantee download-then-serve
+        // is what this pins, not the specific spawning call.
+        let serve = try #require(source.range(of: "_ = await viewModel.ensureVoiceLane(", options: .backwards))
 
         #expect(pull.lowerBound < wait.lowerBound)
         #expect(wait.lowerBound < cacheProof.lowerBound)

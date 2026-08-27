@@ -189,18 +189,23 @@ enum ModelSizing {
     /// a larger Mac, yet loading it with little free RAM pushed unified
     /// memory past the danger line.
     ///
-    /// #324: unified memory past ~85% of total can trip the iBoot
-    /// AMCC async-abort firmware path and **kernel-panic the whole
-    /// machine** rather than raise a userspace OOM — so ``.unsafe`` is
-    /// pinned to that ~85% danger line and is a must-confirm block,
-    /// never a silent proceed.
+    /// The host can legitimately use compression and swap near physical RAM,
+    /// so the guard stays advisory from 95–100%. Explicit confirmation begins
+    /// only when the transition projects beyond physical memory. This also
+    /// keeps every measured RAM-tier recommendation below the blocking line.
     enum MemorySafety: String, Sendable, Equatable {
-        /// Projected use < 75% of total — comfortable.
+        /// Projected use < 95% of total — load normally.
         case safe
-        /// 75-85% — will load but risks swap / stalls; warn.
+        /// 95-100% — may compress or swap, but does not block.
         case tight
-        /// ≥ 85% — at/over the kernel-panic danger line; block + confirm.
+        /// > 100% — requires more memory than the Mac physically has.
         case unsafe
+    }
+
+    /// Only the danger-line verdict parks a load for explicit confirmation.
+    /// Tight is advisory and must continue through the ordinary guarded path.
+    static func requiresMemoryConfirmation(_ safety: MemorySafety) -> Bool {
+        safety == .unsafe
     }
 
     /// Project ``footprint`` onto ``usedBytes`` and bucket the result.
@@ -213,11 +218,28 @@ enum ModelSizing {
         totalBytes: UInt64
     ) -> MemorySafety {
         guard totalBytes > 0, footprint.paramsBillions != nil else { return .safe }
+        return memorySafety(
+            footprintGB: footprint.totalGB,
+            usedBytes: usedBytes,
+            totalBytes: totalBytes
+        )
+    }
+
+    /// Re-evaluate a warning using the exact footprint captured when the
+    /// guarded load was first classified. A warning can outlive catalog or
+    /// custom-path resolution, so refreshes must not derive a second estimate
+    /// from its alias.
+    static func memorySafety(
+        footprintGB: Double,
+        usedBytes: UInt64,
+        totalBytes: UInt64
+    ) -> MemorySafety {
+        guard totalBytes > 0 else { return .safe }
         let gib = Double(1 << 30)
-        let footprintBytes = footprint.totalGB * gib
+        let footprintBytes = footprintGB * gib
         let projected = (Double(usedBytes) + footprintBytes) / Double(totalBytes)
-        if projected >= 0.85 { return .unsafe }
-        if projected >= 0.75 { return .tight }
+        if projected > 1.0 { return .unsafe }
+        if projected >= 0.95 { return .tight }
         return .safe
     }
 
@@ -228,7 +250,7 @@ enum ModelSizing {
     /// Copy lives here (not in a view) so ``ModelSizingTests`` can pin
     /// it without a SwiftUI host — same pattern as the tooBig alert.
     struct MemoryWarning: Equatable, Sendable, Identifiable {
-        let id = UUID()
+        let id: UUID
         let alias: String
         let hfPath: String?
         let isAutoRespawn: Bool
@@ -240,6 +262,31 @@ enum ModelSizing {
         /// Total unified memory. Needed because the guard is based on
         /// projected utilisation, not on footprint-versus-free alone.
         var totalGB: Double = 0
+        /// Resident model memory the selected lifecycle plan will release
+        /// before loading this target.
+        var plannedReleaseGB: Double = 0
+
+        init(
+            id: UUID = UUID(),
+            alias: String,
+            hfPath: String?,
+            isAutoRespawn: Bool,
+            severity: MemorySafety,
+            footprintGB: Double,
+            freeGB: Double,
+            totalGB: Double = 0,
+            plannedReleaseGB: Double = 0
+        ) {
+            self.id = id
+            self.alias = alias
+            self.hfPath = hfPath
+            self.isAutoRespawn = isAutoRespawn
+            self.severity = severity
+            self.footprintGB = footprintGB
+            self.freeGB = freeGB
+            self.totalGB = totalGB
+            self.plannedReleaseGB = plannedReleaseGB
+        }
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.alias == rhs.alias
@@ -249,14 +296,17 @@ enum ModelSizing {
                 && lhs.footprintGB == rhs.footprintGB
                 && lhs.freeGB == rhs.freeGB
                 && lhs.totalGB == rhs.totalGB
+                && lhs.plannedReleaseGB == rhs.plannedReleaseGB
         }
 
         var title: String {
             switch severity {
             case .unsafe:
                 return "\(alias) may crash your Mac right now"
-            case .tight, .safe:
+            case .tight:
                 return "\(alias) is a tight fit right now"
+            case .safe:
+                return "\(alias) is ready to load"
             }
         }
 
@@ -269,21 +319,29 @@ enum ModelSizing {
             }
             let usedGB = max(0, totalGB - freeGB)
             let projectedPercent = Int(((usedGB + footprintGB) / totalGB * 100).rounded())
-            let threshold = severity == .unsafe ? 85.0 : 75.0
+            let threshold = severity == .unsafe ? 100.0 : 95.0
             let toFree = max(0, usedGB + footprintGB - threshold / 100 * totalGB)
             let freeAction = max(1, Int(toFree.rounded(.up)))
-            let facts = "Loading it would put memory use at about \(projectedPercent)% of \(Int(totalGB.rounded())) GB."
+            let release = plannedReleaseGB > 0
+                ? "The switch accounts for about \(max(1, Int(plannedReleaseGB.rounded()))) GB released from the previous model. "
+                : ""
+            let facts = "Loading it would then put memory use at about \(projectedPercent)% of \(Int(totalGB.rounded())) GB."
             switch severity {
             case .unsafe:
-                return facts + " Past about 85%, macOS may freeze or restart. Free about \(freeAction) GB by closing some apps, or pick a smaller model."
-            case .tight, .safe:
-                return facts + " It should load but may stall under longer chats. Consider closing some apps or picking a smaller model."
+                return release + facts + " That is more memory than this Mac has. Free about \(freeAction) GB by closing some apps, or pick a smaller model."
+            case .tight:
+                return release + facts + " It should load but may use memory compression or swap under longer chats."
+            case .safe:
+                return facts + " There is now enough memory to load it normally."
             }
         }
 
         /// The confirm button title — worded to match the risk.
         var confirmTitle: String {
-            severity == .unsafe ? "Load anyway (risky)" : "Load anyway"
+            switch severity {
+            case .unsafe: "Load anyway (risky)"
+            case .tight, .safe: "Load model"
+            }
         }
     }
 

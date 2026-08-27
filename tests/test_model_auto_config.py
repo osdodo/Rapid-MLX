@@ -1,6 +1,7 @@
 """Tests for model auto-config detection."""
 
 import logging
+from unittest import mock
 
 import pytest
 
@@ -958,6 +959,16 @@ class TestVisibility:
         table = format_profile_table("mlx-community/Qwen3.5-35B-A3B-4bit", cfg)
         assert "✗ disabled (hybrid arch)" in table
         assert "✓ 200ms gap" in table
+
+    def test_qwen4_exp_alias_surfaces_experimental_status(self):
+        cfg = detect_model_config("qwen3.8-flash-next-4bit")
+        assert cfg is not None and cfg.experimental is True
+
+        summary = format_profile_summary("qwen3.8-flash-next-4bit", cfg)
+        table = format_profile_table("qwen3.8-flash-next-4bit", cfg)
+
+        assert "experimental" in summary
+        assert "Status           : ⚠ experimental" in table
 
     def test_table_for_pure_attention_shows_supported(self):
         cfg = detect_model_config("mlx-community/Qwen3-0.6B-8bit")
@@ -2356,6 +2367,110 @@ class TestCheckpointMetadataFallback:
         assert config.is_moe is True
         assert config.supports_spec_decode is False
 
+    def test_unknown_linear_attention_checkpoint_is_hybrid(self, monkeypatch):
+        """Architecture metadata, not a family/name rule, owns hybrid truth."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "publisher_novel_architecture",
+                    "text_config": {
+                        "model_type": "publisher_novel_text",
+                        "layer_types": ["linear_attention", "full_attention"],
+                    },
+                },
+                None,
+            ),
+        )
+
+        config = detect_model_config("publisher/opaque-checkpoint")
+
+        assert config is not None
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.supports_spec_decode is False
+
+    def test_qwen4_exp_metadata_marks_local_checkpoint_experimental(self, monkeypatch):
+        """The typed architecture, never a repository label, owns M1 status."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "model_type": "qwen4_exp_text",
+                        "layer_types": ["linear_attention", "full_attention"],
+                    },
+                },
+                None,
+            ),
+        )
+
+        config = detect_model_config("/models/operator-converted-checkpoint")
+
+        assert config is not None
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.is_moe is True
+        assert config.supports_spec_decode is False
+        assert config.experimental is True
+
+    def test_metadata_detection_logs_when_called_directly(self, monkeypatch):
+        log = mock.Mock()
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda _name: self._metadata({"model_type": "qwen3_next"}, None),
+        )
+        monkeypatch.setattr(auto_config_mod, "_log_resolution_once", log)
+
+        config = auto_config_mod._detect_metadata_config("publisher/opaque")
+
+        assert config is not None
+        assert config.is_hybrid is True
+        log.assert_called_once()
+
+    def test_pattern_match_preserves_authoritative_hybrid_metadata(self, monkeypatch):
+        """A family parser fallback must not hide checkpoint architecture."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "qwen3_5_moe"}, None),
+        )
+
+        config = detect_model_config("publisher/Qwen3.5-private-repack")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.is_moe is True
+        assert config.supports_spec_decode is False
+
+    def test_pattern_match_preserves_dense_nonhybrid_safety_pin(self, monkeypatch):
+        """Architecture enrichment must retain the dense recurrent routing pin."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "qwen3_5",
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+                None,
+            ),
+        )
+
+        config = detect_model_config("publisher/Qwen3.5-private-dense-repack")
+
+        assert config is not None
+        assert config.is_hybrid is False
+        assert config.is_hybrid_explicit is True
+        assert config.supports_spec_decode is False
+
     def test_qwen38_local_snapshot_is_not_mislabeled_dense_qwen35(self, monkeypatch):
         """Qwen3.8 reuses qwen3_5 model_type but is a hybrid MTP target."""
         monkeypatch.setattr(
@@ -2379,6 +2494,28 @@ class TestCheckpointMetadataFallback:
         assert config.is_hybrid is True
         assert config.is_hybrid_explicit is True
         assert config.supports_spec_decode is False
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "model_type": "qwen4_exp",
+                        "layer_types": ["linear_attention", "qwen_sparse_attention"],
+                    },
+                },
+                self._XML_TOOLS,
+            ),
+        )
+        flash = detect_model_config("/tmp/models/Qwen3.8-Flash-Next/snapshot")
+        assert flash is not None
+        assert flash.is_hybrid is True
+        assert flash.is_moe is True
+        assert flash.experimental is True
+        assert "experimental" in format_profile_summary("local-flash-next", flash)
+        assert "⚠ experimental" in format_profile_table("local-flash-next", flash)
 
     def test_incomplete_template_is_not_advertised_as_native_tools(self, monkeypatch):
         # The template PARSES successfully (``{% endif %}`` is present), but the
@@ -2723,14 +2860,13 @@ class TestCheckpointMetadataFallback:
         assert config.tool_call_parser == "hermes"
         assert config.reasoning_parser is None
 
-    def test_known_family_has_priority_over_generic_template_fallback(
-        self, monkeypatch
-    ):
-        def unexpected_metadata_read(name):
-            raise AssertionError("known-family detection must not read metadata")
-
+    def test_known_family_parser_has_priority_over_metadata_template(self, monkeypatch):
         monkeypatch.setattr(
-            auto_config_mod, "read_model_metadata", unexpected_metadata_read
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "publisher_full_attention"}, self._XML_TOOLS
+            ),
         )
 
         config = detect_model_config("Qwen/Qwen3-Coder-Next")

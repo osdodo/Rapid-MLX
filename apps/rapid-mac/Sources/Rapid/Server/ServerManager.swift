@@ -5,7 +5,18 @@ import Observation
 /// FIFO state machine for memory-risk confirmations. A request token is
 /// present for ``ensureServing`` callers that must await their own answer;
 /// direct ``start`` calls still queue a prompt but retain no result.
-struct MemoryLoadConfirmationQueue {
+///
+/// Referenced type (``@Observable`` class, not a struct) so that replacing the
+/// head warning's measured facts — e.g. the 3s live memory refresh in
+/// ``ServerManager/refreshPendingMemoryWarning()`` — fires SwiftUI observation
+/// and the "Before loading" verdict re-renders live. With a plain value type,
+/// an in-place mutation of `pending[0].warning` inside a stored, value-typed
+/// property does NOT invalidate the ``@Observable`` owner, so the card kept
+/// showing the original parked snapshot even as free memory changed
+/// (ONBOARD-MEM-LIVE). Mirrors how ``DownloadManager``/``Job`` stay
+/// ``@Observable`` so nested `status`/`progress` mutations re-render.
+@Observable
+final class MemoryLoadConfirmationQueue {
     enum Decision: Equatable {
         case confirmed(sequence: Int)
         case cancelled
@@ -14,10 +25,11 @@ struct MemoryLoadConfirmationQueue {
     private struct Pending: Equatable {
         enum Phase: Equatable {
             case awaitingDecision
+            case checkingDecision
             case launching
         }
 
-        let warning: ModelSizing.MemoryWarning
+        var warning: ModelSizing.MemoryWarning
         var requestID: UUID?
         var phase: Phase = .awaitingDecision
         var launchComplete = false
@@ -31,22 +43,35 @@ struct MemoryLoadConfirmationQueue {
         return pending.first?.warning
     }
 
-    mutating func enqueue(warning: ModelSizing.MemoryWarning, requestID: UUID?) {
+    func enqueue(warning: ModelSizing.MemoryWarning, requestID: UUID?) {
         pending.append(Pending(warning: warning, requestID: requestID))
+    }
+
+    /// Replace the measured facts for the visible decision without changing
+    /// its identity, waiter ownership, or queue position.
+    func refreshCurrentWarning(
+        snapshot: MemoryProbe.Snapshot
+    ) -> (old: ModelSizing.MemoryWarning, new: ModelSizing.MemoryWarning)? {
+        guard pending.first?.phase == .awaitingDecision,
+              let old = pending.first?.warning else { return nil }
+        let refreshed = refreshedWarning(old, snapshot: snapshot)
+        pending[0].warning = refreshed
+        return (old, refreshed)
     }
 
     func isPending(_ requestID: UUID) -> Bool {
         pending.contains {
-            $0.requestID == requestID && $0.phase == .awaitingDecision
+            $0.requestID == requestID && $0.phase != .launching
         }
     }
 
-    mutating func resolveCurrent(
-        warning: ModelSizing.MemoryWarning,
+    func resolveCurrent(
+        warningID: UUID,
         decision: Decision
-    ) -> Bool {
-        guard pending.first?.warning.id == warning.id,
-              pending.first?.phase == .awaitingDecision else { return false }
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .awaitingDecision else { return nil }
+        let currentWarning = pending[0].warning
         if let requestID = pending[0].requestID {
             decisions[requestID] = decision
         }
@@ -56,10 +81,56 @@ struct MemoryLoadConfirmationQueue {
         case .confirmed:
             pending[0].phase = .launching
         }
+        return currentWarning
+    }
+
+    func beginChecking(warningID: UUID) -> Bool {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .awaitingDecision else { return false }
+        pending[0].phase = .checkingDecision
         return true
     }
 
-    mutating func completeConfirmedLaunch(warningID: UUID) {
+    func checkingWarning(
+        warningID: UUID,
+        snapshot: MemoryProbe.Snapshot?
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return nil }
+        if let snapshot, let old = pending.first?.warning {
+            pending[0].warning = refreshedWarning(old, snapshot: snapshot)
+        }
+        return pending[0].warning
+    }
+
+    func restoreAwaiting(warningID: UUID) {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return }
+        pending[0].phase = .awaitingDecision
+    }
+
+    func confirmChecking(
+        warningID: UUID,
+        sequence: Int
+    ) -> ModelSizing.MemoryWarning? {
+        guard pending.first?.warning.id == warningID,
+              pending.first?.phase == .checkingDecision else { return nil }
+        let warning = pending[0].warning
+        if let requestID = pending[0].requestID {
+            decisions[requestID] = .confirmed(sequence: sequence)
+        }
+        pending[0].phase = .launching
+        return warning
+    }
+
+    func resolveCurrent(
+        warning: ModelSizing.MemoryWarning,
+        decision: Decision
+    ) -> Bool {
+        resolveCurrent(warningID: warning.id, decision: decision) != nil
+    }
+
+    func completeConfirmedLaunch(warningID: UUID) {
         guard pending.first?.warning.id == warningID,
               pending.first?.phase == .launching else { return }
         pending[0].launchComplete = true
@@ -70,7 +141,7 @@ struct MemoryLoadConfirmationQueue {
         pending.removeFirst()
     }
 
-    mutating func takeDecision(for requestID: UUID) -> Decision? {
+    func takeDecision(for requestID: UUID) -> Decision? {
         let decision = decisions.removeValue(forKey: requestID)
         if pending.first?.requestID == requestID,
            pending.first?.launchComplete == true {
@@ -79,12 +150,39 @@ struct MemoryLoadConfirmationQueue {
         return decision
     }
 
-    mutating func abandonWaiter(_ requestID: UUID) {
+    func abandonWaiter(_ requestID: UUID) {
         decisions.removeValue(forKey: requestID)
         guard let index = pending.firstIndex(where: { $0.requestID == requestID }) else {
             return
         }
         pending[index].requestID = nil
+    }
+
+    private func refreshedWarning(
+        _ old: ModelSizing.MemoryWarning,
+        snapshot: MemoryProbe.Snapshot
+    ) -> ModelSizing.MemoryWarning {
+        // Replacement admission reaches this queue only after `ensureServing`
+        // has awaited `stop()`. The fresh host sample therefore already
+        // reflects whatever memory macOS has reclaimed from the old process;
+        // subtracting `plannedReleaseGB` again would understate live use. Keep
+        // the value solely to explain which release the initial projection
+        // accounted for.
+        ModelSizing.MemoryWarning(
+            id: old.id,
+            alias: old.alias,
+            hfPath: old.hfPath,
+            isAutoRespawn: old.isAutoRespawn,
+            severity: ModelSizing.memorySafety(
+                footprintGB: old.footprintGB,
+                usedBytes: snapshot.usedBytes,
+                totalBytes: snapshot.totalBytes
+            ),
+            footprintGB: old.footprintGB,
+            freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
+            totalGB: Double(snapshot.totalBytes) / Double(1 << 30),
+            plannedReleaseGB: old.plannedReleaseGB
+        )
     }
 }
 
@@ -130,6 +228,11 @@ enum ServerState: Equatable {
 @MainActor
 @Observable
 final class ServerManager {
+    struct PendingModelSwitch: Identifiable, Equatable, Sendable {
+        let id: UUID
+        let risk: ModelSwitchRisk
+    }
+
     // MARK: - Public state (read by SwiftUI)
 
     /// Current lifecycle phase. Drives all UI state controls.
@@ -138,6 +241,18 @@ final class ServerManager {
     /// Models currently held by the one sidecar process, plus total process
     /// memory against its configured ceiling.
     private(set) var residency: ModelResidencySnapshot = .empty
+
+    /// Alias replacements wait here only when the latest residency snapshot
+    /// reports in-flight requests for the current model. This is presentation
+    /// state for the existing lifecycle choke point, not another lifecycle
+    /// source of truth.
+    private(set) var pendingModelSwitch: PendingModelSwitch?
+
+    @ObservationIgnored
+    private var queuedModelSwitches: [PendingModelSwitch] = []
+
+    @ObservationIgnored
+    private var modelSwitchDecisions: [UUID: Bool] = [:]
 
     @ObservationIgnored
     private var residencyClient = ServerResidencyClient()
@@ -162,8 +277,37 @@ final class ServerManager {
     /// launch auto-start semantics can be verified without depending on the
     /// runner's current pressure.
     @ObservationIgnored
-    internal var memorySnapshotProvider: () -> MemoryProbe.Snapshot? = {
+    internal var memorySnapshotProvider: @Sendable () -> MemoryProbe.Snapshot? = {
         MemoryProbe.snapshot()
+    }
+
+    /// Orders overlapping timer and foreground refreshes. Sampling happens
+    /// off the main actor, so a slower older probe must not overwrite a newer
+    /// decision after actor re-entry.
+    @ObservationIgnored
+    private var memoryWarningRefreshGeneration = 0
+
+    /// Re-sample a parked memory decision while its owning UI is visible.
+    /// Returns a material safety-state transition for accessibility; metric
+    /// ticks within the same state deliberately return nil.
+    func refreshPendingMemoryWarning() async -> (
+        old: ModelSizing.MemorySafety,
+        new: ModelSizing.MemorySafety
+    )? {
+        guard let warningID = pendingMemoryWarning?.id else { return nil }
+        memoryWarningRefreshGeneration += 1
+        let generation = memoryWarningRefreshGeneration
+        let provider = memorySnapshotProvider
+        let snapshot = await Task.detached(priority: .utility) {
+            provider()
+        }.value
+        guard !Task.isCancelled,
+              generation == memoryWarningRefreshGeneration,
+              pendingMemoryWarning?.id == warningID,
+              let snapshot,
+              let transition = memoryConfirmations.refreshCurrentWarning(snapshot: snapshot),
+              transition.old.severity != transition.new.severity else { return nil }
+        return (transition.old.severity, transition.new.severity)
     }
 
     /// Confirmed launches still running, by sequence number. Polled by
@@ -190,6 +334,73 @@ final class ServerManager {
         return nil
     }
 
+    /// True when the app is already serving a model (a chat LLM/VLM) on the
+    /// current server. When true, speech (STT/TTS) requests should target that
+    /// same server's ``/v1/audio/*`` lane so the chosen voice engine lazy-loads
+    /// alongside the chat model — voice and text/vision run in the SAME
+    /// process (see ``serveArguments``'s unconditional ``--enable-audio``).
+    ///
+    /// Auth is required to target the lane (the bearer secret is minted per
+    /// spawn), so both the ready state AND a live bearer are demanded here;
+    /// this keeps ``AudioViewModel`` from needlessly tearing down the chat
+    /// model just to run a transcription.
+    var voiceCoLoadsOnPrimary: Bool {
+        servingAlias != nil && activeBearer != nil
+    }
+
+    /// Whether the selected voice model can receive requests without another
+    /// process transition. An audio-only server is ready when it already owns
+    /// that alias; a conversation server is ready through its mounted lazy
+    /// audio lane. Callers use this capability boundary instead of requiring
+    /// the process-owning alias to equal an auxiliary voice alias.
+    func isVoiceLaneReady(for alias: String) -> Bool {
+        servingAlias == alias || voiceCoLoadsOnPrimary
+    }
+
+    /// Whether the selected voice engine is actually resident, rather than
+    /// merely routable through a chat process that mounted ``/v1/audio/*``.
+    /// Exact catalog provenance keeps this capability check independent of
+    /// alias naming conventions.
+    func isVoiceLaneResident(for alias: String, modelPath: String?) -> Bool {
+        if servingAlias == alias { return true }
+        guard voiceCoLoadsOnPrimary, let modelPath else { return false }
+        return residency.containsResidentAudioLane(modelPath: modelPath)
+    }
+
+    /// Refresh and verify as one contract so a failed request can never make
+    /// a caller treat the previous process's audio snapshot as current.
+    func refreshVoiceLaneResidency(for alias: String, modelPath: String?) async -> Bool {
+        // An audio-only process owns this model at startup; no lazy lane or
+        // prior-process snapshot is involved.
+        if servingAlias == alias { return true }
+        guard await refreshResidency() else { return false }
+        return isVoiceLaneResident(for: alias, modelPath: modelPath)
+    }
+
+    /// Bring up a server for a voice (STT/TTS) request, reusing the primary
+    /// chat LLM/VLM process when one is already up so voice and text/vision
+    /// run side-by-side instead of voice replacing the chat model.
+    ///
+    /// Every spawn carries ``--enable-audio`` (see ``serveArguments``), so the
+    /// current server always has a mountable ``/v1/audio/*`` lane and the
+    /// chosen STT/TTS engine is lazy — it only loads on the first request. That
+    /// means when ``voiceCoLoadsOnPrimary`` is true we can just point audio
+    /// traffic at ``activePort`` and never tear the chat model down. Otherwise
+    /// we fall back to serving the requested voice model as its own process
+    /// (the pre-existing audio-sidecar behaviour), which a caller exercises
+    /// when no primary model is running at all.
+    @discardableResult
+    func ensureVoiceLane(alias: String, hfPath: String?) async -> Bool {
+        if voiceCoLoadsOnPrimary {
+            return true
+        }
+        return await ensureServing(
+            alias: alias,
+            hfPath: hfPath,
+            residencyEligible: false
+        )
+    }
+
     func isModelResident(_ alias: String) -> Bool {
         guard case .ready = state else { return false }
         return residency.contains(alias) || servingAlias == alias
@@ -201,16 +412,84 @@ final class ServerManager {
         isModelResident(alias) ? .ready(alias: alias) : state
     }
 
-    func refreshResidency() async {
+    @discardableResult
+    func refreshResidency() async -> Bool {
         guard case .ready = state else {
             residency = .empty
-            return
+            return false
         }
         guard let snapshot = await residencyClient.fetch(
             port: activePort,
             bearer: activeBearer
-        ) else { return }
+        ) else { return false }
         residency = snapshot
+        return true
+    }
+
+    func confirmPendingModelSwitch(_ request: PendingModelSwitch) {
+        resolvePendingModelSwitch(request, approved: true)
+    }
+
+    func cancelPendingModelSwitch(_ request: PendingModelSwitch) {
+        resolvePendingModelSwitch(request, approved: false)
+    }
+
+    private func resolvePendingModelSwitch(
+        _ request: PendingModelSwitch,
+        approved: Bool
+    ) {
+        guard pendingModelSwitch?.id == request.id else { return }
+        modelSwitchDecisions[request.id] = approved
+        pendingModelSwitch = queuedModelSwitches.isEmpty
+            ? nil
+            : queuedModelSwitches.removeFirst()
+    }
+
+    private func abandonModelSwitchWaiter(_ requestID: UUID) {
+        modelSwitchDecisions.removeValue(forKey: requestID)
+        if pendingModelSwitch?.id == requestID {
+            pendingModelSwitch = queuedModelSwitches.isEmpty
+                ? nil
+                : queuedModelSwitches.removeFirst()
+        } else {
+            queuedModelSwitches.removeAll { $0.id == requestID }
+        }
+    }
+
+    /// Refreshing `/v1/models/residency` is a cheap local request and gives the
+    /// decision the freshest available active-request count. A failed refresh
+    /// preserves the latest successful snapshot. The server offers no atomic
+    /// check-and-switch operation, so this is an advisory guard, not a drain
+    /// policy.
+    private func approveModelSwitchIfNeeded(
+        from currentAlias: String,
+        to targetAlias: String
+    ) async -> ModelSwitchDecision {
+        await refreshResidency()
+        guard let risk = ModelSwitchRisk.evaluate(
+            currentAlias: currentAlias,
+            targetAlias: targetAlias,
+            residency: residency
+        ) else { return .notNeeded }
+
+        let request = PendingModelSwitch(id: UUID(), risk: risk)
+        if pendingModelSwitch == nil {
+            pendingModelSwitch = request
+        } else {
+            queuedModelSwitches.append(request)
+        }
+
+        while modelSwitchDecisions[request.id] == nil {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                abandonModelSwitchWaiter(request.id)
+                return .cancelled
+            }
+        }
+        return modelSwitchDecisions.removeValue(forKey: request.id) == true
+            ? .approved
+            : .cancelled
     }
 
     /// Alias of the child that currently owns the runtime — for BOTH
@@ -396,6 +675,28 @@ final class ServerManager {
     /// Process-wide lane captured at spawn. Nil means there is no live child;
     /// UI capability must observe this value rather than the process handle.
     private(set) var launchedImageInputLane: Bool?
+    /// Exact live `/v1/models/{alias}` profile. Consumers require its id to
+    /// match the current alias, so a profile can never lag one model behind.
+    private(set) var activeModelProfile: ServerModelProfile?
+
+    func clearActiveModelProfile() {
+        activeModelProfile = nil
+    }
+
+    /// Publish or retire one sidecar session as a unit. Model profiles belong
+    /// to the bearer-authenticated process that returned them and must never
+    /// survive a process replacement on the same alias and port.
+    private func setActiveServerSession(bearer: String?) {
+        activeBearer = bearer
+        activeModelProfile = nil
+    }
+
+    func applyActiveModelProfile(_ profile: ServerModelProfile, forAlias alias: String) {
+        guard isModelResident(alias),
+              profile.id.caseInsensitiveCompare(alias) == .orderedSame
+        else { return }
+        activeModelProfile = profile
+    }
 
     func hasAppliedSpeculativeDecoding(forAlias alias: String) -> Bool {
         guard child != nil,
@@ -432,6 +733,14 @@ final class ServerManager {
 
     /// Interval between `/healthz` probes once the child is up.
     private let healthPollInterval: TimeInterval = 0.5
+    /// Persistence destination for lane-owned launch state. Production uses
+    /// standard defaults; lifecycle tests inject an isolated suite while still
+    /// driving the real spawn/health transition.
+    private let sessionDefaults: UserDefaults?
+    /// Catalog provenance supplied by UI start paths. Retained by alias so a
+    /// memory-confirmation re-entry does not lose the proof carried by the
+    /// original Start action when a later catalog subprocess fails.
+    private var catalogProvenStartEntries: [String: ModelEntry] = [:]
 
     /// v0.6 audit P1 (ServerManager — silent-crash detection):
     /// once the child has reported ready, continue polling /healthz
@@ -687,6 +996,7 @@ final class ServerManager {
         self.binaryResolution = resolution
         self.binaryPath = resolution?.binary
         self.state = (resolution == nil) ? .missing : .idle
+        self.sessionDefaults = .standard
     }
 
     /// Wire the app's ``DownloadManager`` so ``start(alias:)`` can
@@ -703,15 +1013,21 @@ final class ServerManager {
     /// child or relying on whatever ``rapid-mlx`` happens to be on
     /// disk. Not part of any production code path; the underscore
     /// prefix mirrors the Swift Standard Library convention for
-    /// "API kept around for testing only."
+    /// "API kept around for testing only." Session persistence is opt-in:
+    /// parallel fake-sidecar tests must not race through ``.standard`` or
+    /// mutate the app's real last-chat selection.
     internal init(
         testingState: ServerState,
         binaryPath: URL? = nil,
-        residency: ModelResidencySnapshot = .empty
+        residency: ModelResidencySnapshot = .empty,
+        activeBearer: String? = nil,
+        sessionDefaults: UserDefaults? = nil
     ) {
         self.state = testingState
+        self.activeBearer = activeBearer
         self.binaryPath = binaryPath
         self.residency = residency
+        self.sessionDefaults = sessionDefaults
         self.binaryResolution = binaryPath.map {
             ServerLocator.Resolution(binary: $0, source: .unknown, version: nil)
         }
@@ -739,6 +1055,37 @@ final class ServerManager {
     /// stop landing mid-loop to pin the state-drift guard.
     internal func _testSetState(_ newState: ServerState) {
         self.state = newState
+    }
+
+    /// Publish the selection consequence of a successful health transition.
+    /// Kept as one lifecycle boundary so tests exercise the same call that the
+    /// real `/healthz` success path uses instead of calling persistence policy
+    /// in isolation.
+    internal func recordReadySelection(
+        alias: String,
+        catalogEntry: ModelEntry?
+    ) {
+        guard let sessionDefaults else { return }
+        SessionModelRestore.persistReadyAlias(
+            alias,
+            catalogEntry: catalogEntry,
+            defaults: sessionDefaults
+        )
+    }
+
+    /// Prefer the start-time probe, but preserve catalog provenance already
+    /// held by the initiating UI when that probe transiently fails. The hint
+    /// is accepted only for the exact alias being launched.
+    internal static func readyCatalogEntry(
+        alias: String,
+        probed: ModelEntry?,
+        hint: ModelEntry?
+    ) -> ModelEntry? {
+        if let probed { return probed }
+        guard let hint,
+              hint.alias.caseInsensitiveCompare(alias) == .orderedSame
+        else { return nil }
+        return hint
     }
 
     /// Issue #1838 test seam — swap in a ``ServerResidencyClient`` whose
@@ -832,13 +1179,15 @@ final class ServerManager {
 
     // MARK: - Persisted "last served" alias (v0.5.3 auto-restart)
 
-    /// UserDefaults key holding the alias of the model the user most
-    /// recently asked us to serve. Written on every transition into
-    /// ``.ready(alias:)`` and cleared on user-initiated ``stop()``.
+    /// UserDefaults key holding the alias of the chat model the user most
+    /// recently asked us to serve. Written only when authoritative catalog
+    /// metadata identifies the ready child as chat-capable; audio/image lane
+    /// process ownership must never replace the user's chat selection.
+    /// Cleared on user-initiated ``stop()``.
     /// ``RapidApp`` reads this on launch to decide whether to
     /// auto-resume the previous session's model (LM Studio shape:
     /// the loaded model survives an app restart).
-    nonisolated fileprivate static let lastServedAliasKey = "rapid.serve.lastAlias"
+    nonisolated fileprivate static let lastServedAliasKey = SessionModelRestore.chatAliasStorageKey
 
     /// Currently persisted last-served alias, if any. ``nil`` after a
     /// user-initiated Stop or a fresh install. Exposed as a static
@@ -911,12 +1260,14 @@ final class ServerManager {
         estimatedMemoryGB: Double?,
         replacementGroup: ResidentModelReplacementGroup? = nil,
         imageMode: ResidentImageMode? = nil,
-        residencyEligible: Bool = true
+        residencyEligible: Bool = true,
+        catalogEntryHint: ModelEntry? = nil
     ) async -> Bool {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let requestedPerformanceFlags = perfLaunchFlagsProvider?(trimmed) ?? []
         var requestedCatalogSupportsImageInput = false
+        var probedCatalogEntry: ModelEntry?
         // Cold start delegates to `start`, which resolves the same metadata
         // authoritatively. This probe is needed only to decide whether an
         // already-running text-lane sidecar can accept a resident load.
@@ -928,12 +1279,18 @@ final class ServerManager {
                 $0.alias.caseInsensitiveCompare(trimmed) == .orderedSame
             }
             if Task.isCancelled || didSignalShutdown { return false }
+            probedCatalogEntry = entry
             requestedCatalogSupportsImageInput = ModelBrandStyle.supportsImageInput(
                 forAlias: trimmed,
                 isBuiltinProfile: entry?.isBuiltinProfile,
                 isTextOnly: entry?.isTextOnly
             )
         }
+        let provenCatalogEntry = Self.readyCatalogEntry(
+            alias: trimmed,
+            probed: probedCatalogEntry,
+            hint: catalogEntryHint
+        )
         let requiresImageLaneRestart = Self.requiresProcessRestartForImageCapability(
             catalogSupportsImageInput: requestedCatalogSupportsImageInput,
             userOverrides: requestedPerformanceFlags,
@@ -955,6 +1312,26 @@ final class ServerManager {
         if replacementGroup == nil, isModelResident(trimmed),
            !speculativeSettingChanged, !requiresImageLaneRestart {
             return true
+        }
+
+        // A replacement-group load can switch the assistant inside the live
+        // process without reaching the legacy stop/start fallback below. Ask
+        // before either destructive route so picker activation and every
+        // other `ensureServing` caller share one guard.
+        var validatedStopAlias: String?
+        var destructiveModelSwitchApproved = false
+        if replacementGroup != nil,
+           let currentAlias = launchedChildAlias,
+           currentAlias != trimmed {
+            let decision = await approveModelSwitchIfNeeded(
+                from: currentAlias,
+                to: trimmed
+            )
+            guard decision != .cancelled else { return false }
+            validatedStopAlias = currentAlias
+            if decision.requiresProcessRestart {
+                destructiveModelSwitchApproved = true
+            }
         }
 
         // Any fresh load attempt — resident, cold start, or the legacy
@@ -982,9 +1359,15 @@ final class ServerManager {
         // surface as a hard failure instead of the process swap they actually
         // need — audio runs as its own ``serve <alias>`` (audio-mode) process.
         let readyWithChild: Bool = { if case .ready = state, child != nil { return true }; return false }()
+        // The resident loader deliberately refuses to replace a busy model.
+        // Once the user approves the destructive action, bypass that route and
+        // use the existing process stop/start fallback so "Switch" performs
+        // the interruption it just disclosed instead of returning a busy
+        // rejection.
         if Self.residencyLoadApplies(
             residencyEligible: residencyEligible && !speculativeRequested
-                && !speculativeSettingChanged && !requiresImageLaneRestart,
+                && !speculativeSettingChanged && !requiresImageLaneRestart
+                && !destructiveModelSwitchApproved,
             readyWithChild: readyWithChild
         ) {
             // Publish before crossing the network await so SwiftUI replaces
@@ -1006,6 +1389,7 @@ final class ServerManager {
                 hfPath: hfPath,
                 estimatedSizeGB: estimate,
                 replaceGroup: replacementGroup,
+                memoryPolicy: replacementGroup == .assistant ? .evictFirstIfNeeded : nil,
                 imageMode: imageMode,
                 performance: perfConfigProvider?(trimmed),
                 port: activePort,
@@ -1027,6 +1411,12 @@ final class ServerManager {
                 await refreshResidency()
                 if replacementGroup != nil {
                     state = .ready(alias: trimmed)
+                }
+                if replacementGroup == .assistant {
+                    recordReadySelection(
+                        alias: trimmed,
+                        catalogEntry: provenCatalogEntry
+                    )
                 }
                 // A successful in-process load confirms the model is fine, so
                 // drop any (possibly concurrent) rejection recorded for it —
@@ -1071,11 +1461,59 @@ final class ServerManager {
         // mid-``.starting``). ``stop()`` is a noop if child is nil, so
         // the idle/stopped/missing cases just fall through to
         // ``start(alias:)``.
+        var replacementMemoryAdmission: MemoryAdmissionContext?
         if child != nil {
+            // `ensureServing` can re-enter while a dialog or residency refresh
+            // is awaiting. Repeat until the alias we validated is still the
+            // live child; a stale A→C answer must never authorize stopping B.
+            while let currentAlias = launchedChildAlias,
+                  currentAlias != trimmed,
+                  ModelSwitchDecision.requiresRevalidation(
+                      validatedAlias: validatedStopAlias,
+                      liveAlias: currentAlias
+                  ) {
+                let decision = await approveModelSwitchIfNeeded(
+                    from: currentAlias,
+                    to: trimmed
+                )
+                guard decision != .cancelled else { return false }
+                validatedStopAlias = currentAlias
+            }
+            if let currentAlias = launchedChildAlias,
+               !ModelSwitchDecision.requiresStop(
+                   liveAlias: currentAlias,
+                   targetAlias: trimmed
+               ) {
+                if case .starting(let alias) = state, alias == trimmed {
+                    await awaitStartupSettled(alias: trimmed)
+                }
+                return isServing(trimmed)
+            }
+            // The process-replacement path releases the current assistant
+            // before loading its successor. Admission must therefore project
+            // the successor on top of memory *after* that release, not stack
+            // both chat models as if they would coexist. Capture this before
+            // stopping while the residency row and host sample describe the
+            // same live process. Because this branch replaces the whole
+            // sidecar, every resident model row belongs to the release plan;
+            // in-process multi-model loads never receive this credit.
+            replacementMemoryAdmission = memorySnapshotProvider().flatMap {
+                Self.memoryAdmissionForTransition(
+                    host: $0,
+                    residency: residency,
+                    plan: .releaseResidentModels
+                )
+            }
             await stop(preservingLastServedAlias: true)
         }
         let memoryRequestID = UUID()
-        await start(alias: trimmed, hfPath: hfPath, memoryRequestID: memoryRequestID)
+        await start(
+            alias: trimmed,
+            hfPath: hfPath,
+            memoryRequestID: memoryRequestID,
+            memoryAdmission: replacementMemoryAdmission,
+            catalogEntryHint: provenCatalogEntry
+        )
         // ``start`` also returns without spawning when the pre-load
         // memory guard parks the load on a confirmation prompt. Reading
         // ``isServing`` now would report "couldn't start the model"
@@ -1102,6 +1540,68 @@ final class ServerManager {
             await awaitStartupSettled(alias: trimmed)
         }
         return isServing(trimmed)
+    }
+
+    enum MemoryResidencyPlan: Sendable, Equatable {
+        case keepResidentModels
+        case releaseResidentModels
+    }
+
+    struct MemoryAdmissionContext: Sendable, Equatable {
+        let snapshot: MemoryProbe.Snapshot
+        let plannedReleaseBytes: UInt64
+    }
+
+    /// Resolve one process-replacement admission against post-stop host truth.
+    /// The projected pre-stop sample knows which model bytes the transition
+    /// releases; the live sample catches memory another process consumed while
+    /// `stop()` was awaiting termination. The larger used value is the safe
+    /// answer. If either probe is unavailable, retain the evidence we do have.
+    nonisolated static func memorySnapshotForAdmission(
+        planned: MemoryAdmissionContext?,
+        live: MemoryProbe.Snapshot?
+    ) -> MemoryProbe.Snapshot? {
+        guard let planned else { return live }
+        guard let live else { return planned.snapshot }
+        return MemoryProbe.Snapshot(
+            totalBytes: live.totalBytes,
+            usedBytes: min(
+                live.totalBytes,
+                max(live.usedBytes, planned.snapshot.usedBytes)
+            )
+        )
+    }
+
+    /// One-shot host-memory view for the transition the lifecycle will run.
+    ///
+    /// A process replacement releases every resident engine before spawning
+    /// the target, regardless of whether the outgoing lane is chat, image, or
+    /// audio. An in-process load keeps its residents and therefore receives no
+    /// credit here; the residency loader owns its own admission/eviction plan.
+    /// Returning `nil` for a release with no trustworthy residency evidence
+    /// deliberately preserves the ordinary post-stop live probe.
+    nonisolated static func memoryAdmissionForTransition(
+        host: MemoryProbe.Snapshot,
+        residency: ModelResidencySnapshot,
+        plan: MemoryResidencyPlan
+    ) -> MemoryAdmissionContext? {
+        guard plan == .releaseResidentModels else {
+            return MemoryAdmissionContext(snapshot: host, plannedReleaseBytes: 0)
+        }
+        var reclaimableBytes: UInt64 = 0
+        for resident in residency.models where resident.state != "evicting" {
+            let bytes = resident.displayBytes
+            reclaimableBytes += min(bytes, host.usedBytes - reclaimableBytes)
+            if reclaimableBytes == host.usedBytes { break }
+        }
+        guard reclaimableBytes > 0 else { return nil }
+        return MemoryAdmissionContext(
+            snapshot: MemoryProbe.Snapshot(
+                totalBytes: host.totalBytes,
+                usedBytes: host.usedBytes - reclaimableBytes
+            ),
+            plannedReleaseBytes: reclaimableBytes
+        )
     }
 
     /// Rebuild only the named resident engine with its current performance
@@ -1326,37 +1826,67 @@ final class ServerManager {
     /// transition (the bug Bug A removed), which incidentally also
     /// covered manual restarts. The default is ``false`` to make the
     /// behavior obvious at every public call site.
-    /// The user acknowledged the memory warning and wants to load
-    /// anyway. Takes the ``warning`` by value (not off ``pendingMemory-
-    /// Warning``) because the alert's dismissal clears that property on
-    /// the same run-loop turn the button fires — reading it here would
-    /// race to nil and silently drop the load. Re-enters ``start`` with
-    /// the guard bypassed.
+    /// Resolve the rendered action by stable warning identity, then launch
+    /// from the queue's latest measured facts. The captured severity records
+    /// whether the user actually chose the unsafe override; a stale ordinary
+    /// Load action can therefore never become a bypass after pressure rises.
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
-        memoryConfirmSeq += 1
-        let seq = memoryConfirmSeq
-        memoryConfirmRunning.insert(seq)
-        guard memoryConfirmations.resolveCurrent(
-            warning: warning,
-            decision: .confirmed(sequence: seq)
-        ) else {
-            memoryConfirmRunning.remove(seq)
+        // Claim synchronously before SwiftUI dismisses its alert. The binding
+        // writes `false` on the same run-loop turn and treats an unclaimed
+        // warning as Cancel; `.checkingDecision` makes that dismissal a no-op
+        // while the activation probe runs off the main actor.
+        guard memoryConfirmations.beginChecking(warningID: warning.id) else { return }
+        // The activation probe now owns the warning's measured facts. Any
+        // periodic sample that began before this click must not apply after a
+        // newly-unsafe activation restores the warning to awaitingDecision.
+        memoryWarningRefreshGeneration += 1
+        Task { [weak self] in
+            await self?.activatePendingMemoryLoad(warning)
+        }
+    }
+
+    private func activatePendingMemoryLoad(
+        _ warning: ModelSizing.MemoryWarning
+    ) async {
+        let provider = memorySnapshotProvider
+        let snapshot = await Task.detached(priority: .utility) {
+            provider()
+        }.value
+        guard let latestWarning = memoryConfirmations.checkingWarning(
+            warningID: warning.id,
+            snapshot: snapshot
+        ) else { return }
+
+        // Only the explicit unsafe action is a waiver. An ordinary Load that
+        // became unsafe during this activation remains parked on the same
+        // queue entry, preserving its waiter and presenting the new facts.
+        let requestedUnsafeOverride = warning.severity == .unsafe
+        guard requestedUnsafeOverride || latestWarning.severity != .unsafe else {
+            memoryConfirmations.restoreAwaiting(warningID: warning.id)
             return
         }
-        Task { [weak self] in
-            guard let self else { return }
-            if self.child != nil {
-                await self.stop()
-            }
-            await self.start(
-                alias: warning.alias,
-                hfPath: warning.hfPath,
-                isAutoRespawn: warning.isAutoRespawn,
-                bypassMemoryGuard: true
-            )
-            self.memoryConfirmRunning.remove(seq)
-            self.memoryConfirmations.completeConfirmedLaunch(warningID: warning.id)
+
+        memoryConfirmSeq += 1
+        let seq = memoryConfirmSeq
+        guard let currentWarning = memoryConfirmations.confirmChecking(
+            warningID: warning.id,
+            sequence: seq
+        ) else { return }
+        memoryConfirmRunning.insert(seq)
+        if child != nil {
+            await stop()
         }
+        // The activation sample above is the guard for this exact click.
+        // Avoid a second sample after the queue has entered `.launching`,
+        // which could otherwise park a duplicate warning behind its owner.
+        await start(
+            alias: currentWarning.alias,
+            hfPath: currentWarning.hfPath,
+            isAutoRespawn: currentWarning.isAutoRespawn,
+            bypassMemoryGuard: true
+        )
+        memoryConfirmRunning.remove(seq)
+        memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
     }
 
     /// The user backed out of a memory-risky load. Just drops the
@@ -1368,7 +1898,7 @@ final class ServerManager {
         // to an EARLIER confirmation and its waiter must not be told it
         // finished.
         _ = memoryConfirmations.resolveCurrent(
-            warning: warning,
+            warningID: warning.id,
             decision: .cancelled
         )
     }
@@ -1379,7 +1909,9 @@ final class ServerManager {
         isAutoRespawn: Bool = false,
         bypassMemoryGuard: Bool = false,
         memoryRequestID: UUID? = nil,
-        isLaunchAutoStart: Bool = false
+        isLaunchAutoStart: Bool = false,
+        memoryAdmission: MemoryAdmissionContext? = nil,
+        catalogEntryHint: ModelEntry? = nil
     ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
@@ -1415,11 +1947,17 @@ final class ServerManager {
             )
             return
         }
+        if let hintedEntry = Self.readyCatalogEntry(
+            alias: trimmedAlias,
+            probed: nil,
+            hint: catalogEntryHint
+        ) {
+            catalogProvenStartEntries[trimmedAlias.lowercased()] = hintedEntry
+        }
 
         // Pre-load memory guard (#324). Loading a model whose footprint,
-        // stacked on top of what is ALREADY resident, would push unified
-        // memory past ~85% of total can freeze or kernel-panic the whole
-        // Mac — a far worse outcome than declining to load. This is the
+        // stacked on top of what is ALREADY resident, would require more than
+        // physical unified memory is held for explicit confirmation. This is the
         // single choke point every start path funnels through (picker,
         // first message, auto-restart, quickstart), so the check + the
         // confirmation prompt live here once instead of at each call site.
@@ -1437,22 +1975,26 @@ final class ServerManager {
         // Respawn is also recovering a model that ALREADY fit when it first
         // started; a genuine free-RAM drop is bounded by the respawn-attempt
         // budget, and the user's manual restart still routes through the guard.
-        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = memorySnapshotProvider() {
+        if !bypassMemoryGuard, !isAutoRespawn,
+           let snapshot = Self.memorySnapshotForAdmission(
+               planned: memoryAdmission,
+               live: memorySnapshotProvider()
+           ) {
             let footprint = ModelSizing.estimate(alias: trimmedAlias)
             let safety = ModelSizing.memorySafety(
                 footprint: footprint,
                 usedBytes: snapshot.usedBytes,
                 totalBytes: snapshot.totalBytes
             )
-            // Only ``.unsafe`` (>= 85%, the panic line) blocks. ``.tight``
-            // is defined as "will load but risks swap / stalls" — holding
+            // Only ``.unsafe`` (> 100%, beyond physical RAM) blocks. ``.tight``
+            // is defined as "will load but may compress / swap" — holding
             // it behind a modal would fire on ordinary loads (13 GiB used
             // on a 32 GiB Mac + an 11.8 GiB model projects to 77.5%) and
             // train the user to click through the one prompt that matters.
             // Every mature local-model app draws the same line: refuse
             // only what is genuinely dangerous, and surface "tight"
             // passively — the picker's static sizing bands already do.
-            if safety == .unsafe {
+            if ModelSizing.requiresMemoryConfirmation(safety) {
                 // A launch auto-start must never greet the user with a scary
                 // modal they did not ask for. Opening the app is not "I want to
                 // chat now" — they may be heading to Audio/Images, or just
@@ -1472,7 +2014,9 @@ final class ServerManager {
                     severity: safety,
                     footprintGB: footprint.totalGB,
                     freeGB: Double(snapshot.freeBytes) / Double(1 << 30),
-                    totalGB: Double(snapshot.totalBytes) / Double(1 << 30)
+                    totalGB: Double(snapshot.totalBytes) / Double(1 << 30),
+                    plannedReleaseGB: Double(memoryAdmission?.plannedReleaseBytes ?? 0)
+                        / Double(1 << 30)
                 )
                 memoryConfirmations.enqueue(
                     warning: warning,
@@ -1548,12 +2092,18 @@ final class ServerManager {
         // launch a visual checkpoint in its text lane. Keeping this await
         // before `isOperating = true` preserves the cancellable startup
         // contract; re-check every entry guard after actor reentrancy.
-        let catalogEntry = await ModelCatalogCache.shared.entries(
+        let probedCatalogEntry = await ModelCatalogCache.shared.entries(
             binary: binary,
             generation: downloads?.cacheGeneration ?? 0
         ).first {
             $0.alias.caseInsensitiveCompare(trimmedAlias) == .orderedSame
         }
+        let catalogEntry = Self.readyCatalogEntry(
+            alias: trimmedAlias,
+            probed: probedCatalogEntry,
+            hint: catalogEntryHint
+                ?? catalogProvenStartEntries[trimmedAlias.lowercased()]
+        )
         if Task.isCancelled || didSignalShutdown { return }
         guard !isOperating, child == nil else { return }
         let catalogSupportsImageInput = ModelBrandStyle.supportsImageInput(
@@ -1894,7 +2444,7 @@ final class ServerManager {
         self.launchedPerformanceFlags = performanceFlags
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
-        self.activeBearer = bearer
+        setActiveServerSession(bearer: bearer)
         self.stdoutPipe = stdoutPipe
         self.stderrPipe = stderrPipe
         // #20: persist ownership before startMonitor() so a crash
@@ -2010,7 +2560,7 @@ final class ServerManager {
                 // overwrite the previous good-known value, so a
                 // crashed launch attempt doesn't strand the resume
                 // logic on a model the user can't actually load.
-                UserDefaults.standard.set(trimmedAlias, forKey: Self.lastServedAliasKey)
+                recordReadySelection(alias: trimmedAlias, catalogEntry: catalogEntry)
                 await refreshResidency()
                 // v0.6 audit P1 (silent-crash detection): now that
                 // the child is ready, start the runtime health
@@ -2161,7 +2711,7 @@ final class ServerManager {
         // post-stop chat request can't slip through with a stale
         // secret targeting whatever happens to bind the port next.
         // (#1035: the nil transition evicts cached MCP tools via didSet.)
-        activeBearer = nil
+        setActiveServerSession(bearer: nil)
         // Issue #278: honour the "readyAt cleared on every child
         // exit" invariant in shutdownSync too (parallel to the
         // terminateChild defensive teardown). App-termination only,
@@ -2248,7 +2798,7 @@ final class ServerManager {
             launchedImageInputLane = nil
             // #17: see shutdownSync — bearer is dead the moment the
             // child is.
-            activeBearer = nil
+            setActiveServerSession(bearer: nil)
             startedAt = nil
             // Issue #278: defensive teardown also has to honour the
             // "readyAt cleared on every child exit" invariant in
@@ -2319,7 +2869,7 @@ final class ServerManager {
         launchedImageInputLane = nil
         // #17: the child owns the secret; the secret is meaningless
         // (and a leak vector) once the child is gone.
-        activeBearer = nil
+        setActiveServerSession(bearer: nil)
         startedAt = nil
         // Issue #278: snapshot + window-gate the auto-respawn budget
         // reset, then clear ``readyAt``. The wasExpected-stop branch
@@ -3015,16 +3565,33 @@ final class ServerManager {
         forAlias alias: String,
         catalogSupportsImageInput: Bool? = nil
     ) -> Bool {
+        imageInputAvailability(
+            forAlias: alias,
+            catalogSupportsImageInput: catalogSupportsImageInput
+        ).isAvailable
+    }
+
+    internal func imageInputAvailability(
+        forAlias alias: String,
+        catalogSupportsImageInput: Bool? = nil
+    ) -> ImageInputAvailability {
         let catalogCapability = catalogSupportsImageInput
             ?? ModelCatalogCache.supportsImageInput(forAlias: alias, binary: binaryPath)
         let safeOverrides = Self.imageSafePerformanceOverrides(
             catalogSupportsImageInput: catalogCapability,
             userOverrides: perfLaunchFlagsProvider?(alias) ?? []
         )
-        return Self.effectiveRunningImageCapability(
+        let fallback = Self.effectiveRunningImageCapability(
             catalogSupportsImageInput: catalogCapability,
             userOverrides: safeOverrides,
             processLaunchFlags: launchedImageInputLane.map { $0 ? ["--mllm"] : [] }
+        )
+        let profile = activeModelProfile.flatMap {
+            $0.id.caseInsensitiveCompare(alias) == .orderedSame ? $0 : nil
+        }
+        return ImageInputAvailability.resolve(
+            fallbackSupportsImageInput: fallback,
+            profile: profile
         )
     }
 
@@ -3095,6 +3662,16 @@ final class ServerManager {
             alias,
             "--host", host,
             "--port", String(port),
+            // Voice co-loading: mount the ``/v1/audio/*`` lane on EVERY spawned
+            // server so speech (STT/TTS) can run side-by-side with the primary
+            // LLM/VLM in the same process. ``--enable-audio`` tells a text-mode
+            // boot to attach the audio router; the STT/TTS engines stay lazy —
+            // they only load on the first ``/v1/audio/*`` request, so a pure
+            // LLM/VLM user pays no memory for a voice engine they never use. It
+            // is unconditional (not a user opt-in) because the mount is
+            // near-free and the engine is on-demand; ``voiceCoLoadsOnPrimary``
+            // drives the client side of reusing this same server for voice.
+            "--enable-audio",
             // Issue #306: pin an explicit loopback-only CORS allowlist
             // so a future rapid-mlx bundle bump that wires the CORS
             // middleware can't silently re-enable wildcard

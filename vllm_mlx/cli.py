@@ -22,6 +22,7 @@ import sys
 from collections.abc import Callable
 
 from vllm_mlx._completion import alias_completer
+from vllm_mlx.model_profile import ModelProfile
 
 # Project-default mirror for ``RAPID_MLX_MODEL_MIRROR`` (consumed by
 # ``_try_mirror_prefetch``). Public Cloudflare Worker → R2 bucket, with
@@ -1597,6 +1598,8 @@ class _StatusSpinner:
 def _try_mirror_prefetch(
     model_name: str,
     on_pull_start: Callable[[], None] | None = None,
+    *,
+    out: dict | None = None,
 ) -> bool:
     """Pre-fetch a HuggingFace repo via R2-first / HF-fallback (per file).
 
@@ -1619,23 +1622,83 @@ def _try_mirror_prefetch(
     bugs in the mirror module surface as real stack traces instead of
     silently routing to ``snapshot_download``.
     """
-    from vllm_mlx.model_aliases import resolve_subfolder
+    from vllm_mlx.model_aliases import subfolder_allow_patterns
 
-    # The mirror mirrors whole repos; it has no notion of "just this
-    # folder". For a repo that ships one checkpoint per quantization that
-    # would hydrate every quant, so decline and let the HF path run with
-    # ``allow_patterns``. None of these repos is mirrored today — this is
-    # here so that mirroring one later can't silently turn a 1.6 GB pull
-    # into a 20 GB one.
-    if resolve_subfolder(model_name):
-        return False
+    # A subfolder-per-quant repo ships several quants side by side, so the
+    # mirror holds ONE quant's directory (uploaded via
+    # ``mirror_to_r2.py --subfolder <quant>``) and we hand the same
+    # ``allow_patterns`` down so the R2 pull fetches only that directory —
+    # never the whole ~20 GB quant matrix. ``None`` for the ordinary
+    # one-quant-per-repo layout leaves the mirror serving the full repo.
+    # (This used to hard-decline the mirror for every subfolder repo on the
+    # assumption that none were mirrored; ``lfm2.5-2.6b-4bit`` is, and the
+    # decline stranded its R2 copy while the HF path could hang the desktop
+    # at "Starting…".)
+    allow_patterns = subfolder_allow_patterns(model_name)
     try:
         from vllm_mlx._mirror import download_with_mirror_fallback
     except ImportError:
         # Mirror module not available (minimal-deps install or
         # deliberately removed). Use the legacy HF path.
         return False
-    return download_with_mirror_fallback(model_name, on_pull_start=on_pull_start)
+    return download_with_mirror_fallback(
+        model_name,
+        on_pull_start=on_pull_start,
+        allow_patterns=allow_patterns,
+        out=out,
+    )
+
+
+def _env_flag_active(raw: str | None) -> bool:
+    """True when an HF/transformers offline-style env flag is enabled.
+
+    Bounded local truth-value predicate reproducing huggingface_hub's
+    ``_is_true`` semantics exactly (only ``1``/``ON``/``YES``/``TRUE`` count;
+    ``0``/``false``/empty leave it off) without depending on the library's
+    private ``constants._is_true`` helper, whose return type is untyped.
+    """
+    return raw is not None and str(raw).lower() in {"1", "on", "yes", "true"}
+
+
+def _offline_hub_mode_active() -> bool:
+    """True when the HF/transformers offline switches pin hub access local-only.
+
+    Reads both offline switches live (so tests monkeypatching them stay
+    truthful) and treats each **independently** before OR-ing: folding them
+    with ``os.environ.get(...) or os.environ.get(...)`` into one string lets a
+    ``HF_HUB_OFFLINE=0`` mask ``TRANSFORMERS_OFFLINE=1`` (or vice-versa), which
+    the download layer does not do.
+    """
+    return _env_flag_active(os.environ.get("HF_HUB_OFFLINE")) or _env_flag_active(
+        os.environ.get("TRANSFORMERS_OFFLINE")
+    )
+
+
+def _offline_uncached_error(model_name: str) -> str:
+    """Render the offline + uncached refusal body (one actionable message).
+
+    Reused verbatim by the ``main()`` confirmation gate (so the refusal fires
+    BEFORE any "About to download" notice) and by ``_ensure_model_downloaded``
+    (the belt-and-suspenders defense). A lane override is never recommended:
+    no ``--mllm``/``--no-mllm`` flag can supply a checkpoint that is simply
+    absent from the cache.
+    """
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    return (
+        f"\n  Error: {model_name} is not cached and the network is "
+        "unavailable (offline mode is enabled).\n"
+        f"  After connectivity is restored, disable offline mode "
+        f"(unset HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE) and run "
+        f"`rapid-mlx pull {model_name}`, then serve again.\n"
+        f"  Expected cache location: {HF_HUB_CACHE}\n"
+    )
+
+
+def _refuse_offline_uncached(model_name: str) -> None:
+    """Print the offline + uncached refusal and exit(1)."""
+    print(_offline_uncached_error(model_name), file=sys.stderr)
+    sys.exit(1)
 
 
 def _ensure_model_downloaded(
@@ -1656,33 +1719,39 @@ def _ensure_model_downloaded(
     """
     if os.path.exists(model_name):
         return
-    # Reuse the same weight-file-presence probe as ``is_repo_cached``:
-    # the older ``try_to_load_from_cache('config.json')`` check
-    # short-circuits on a partial cache (metadata downloaded, weight
-    # shards still in flight), letting the spawned ``serve`` quietly
-    # finish the download inside its logfile. Codex round-3 BLOCKING #2.
-    try:
-        from vllm_mlx._download_gate import is_repo_cached, mflux_missing_weights
+    # Reuse the cache inventory's single runnability probe core
+    # (``_cache_runnability``, the same source ``models --cached`` uses) so
+    # what counts as "already cached" is identical everywhere and spans every
+    # modality: text ``model*.safetensors`` (``is_repo_cached``), mflux
+    # component weights, component-split video, and family-scoped Whisper
+    # ``weights.npz``. A text-only ``is_repo_cached`` check would wrongly read
+    # a fully-downloaded mflux / split-video model as uncached and re-download
+    # on every start — a slow start at best, a hung one (SYN_SENT against a
+    # poisoned address) on a hostile DNS path (codex round-3 BLOCKING #2).
+    #
+    # Keep the tri-state result here, not the boolean wrapper: only a
+    # definitively-runnable result short-circuits the download, and only a
+    # definitively-not-runnable result triggers the offline refusal. A probe
+    # fault (``None``) must neither skip the download (never assume usable
+    # weights we couldn't verify) nor refuse offline (never assert uncached we
+    # couldn't establish) — it falls through to the normal online path.
+    cachedness = _cache_runnability(model_name)
+    if cachedness is True:
+        return
 
-        if is_repo_cached(model_name):
-            return
-        # ``is_repo_cached`` probes for root ``model*.safetensors``, which an
-        # mflux checkpoint never has — its weights live under ``transformer/``,
-        # ``text_encoder/`` and ``vae/``. So a fully-downloaded image model
-        # always failed that probe and fell through to the disk-space gate and
-        # the mirror below, i.e. every single start of an image model needed
-        # the network. On a hostile DNS path that is not a slow start but a
-        # hung one: the socket sits in SYN_SENT against a poisoned address
-        # while the UI shows "Starting" forever. Verified-complete component
-        # weights are just as cached as a verified-complete root checkpoint.
-        if mflux_missing_weights(model_name) == []:
-            return
-    except Exception:
-        # Probe failed (filesystem permission error, unexpected layout) —
-        # fall through to the heavy snapshot_download path; HF will
-        # short-circuit on its own cache check if the repo really is
-        # fully present.
-        pass
+    # Offline + uncached refusal (#2357): reaching this point means the model is
+    # NOT cached (the probes above returned on every cached/complete shape) and
+    # it is not a local path. Refuse ONLY when uncachedness is actually
+    # established (``is False``) — a probe fault is inconclusive and must not
+    # be refused. If the hub is pinned to offline mode, a download is
+    # impossible, so refuse NOW with one actionable message instead of falling
+    # through to the network attempts that each fail and let the serve
+    # subprocess re-download — which duplicates "First-time download" /
+    # "Pre-download skipped" and eventually ends in misleading --mllm/--no-mllm
+    # lane advice when the checkpoint is simply absent. This mirrors the
+    # TimeoutError / disk-space exits: refuse before server initialization.
+    if _offline_hub_mode_active() and cachedness is False:
+        _refuse_offline_uncached(model_name)
 
     # Disk-space gate + mirror pull. Both the disk probe (HF ``model_info``)
     # and the mirror's own metadata + ``/api/models`` catalog round-trips run
@@ -2500,6 +2569,7 @@ def _resolve_hybrid_cache_entries(
     explicit_value: int,
     user_set_explicit: bool,
     model_name: str,
+    model_config: ModelProfile | None = None,
 ) -> int:
     """Return the effective ``hybrid_cache_entries`` value.
 
@@ -2513,7 +2583,9 @@ def _resolve_hybrid_cache_entries(
     if not enable_prefix_cache or explicit_value != 0 or user_set_explicit:
         return explicit_value
 
-    needs_bounded_reuse = _needs_bounded_trim_free_reuse(model_name)
+    needs_bounded_reuse = _needs_bounded_trim_free_reuse(
+        model_name, model_config=model_config
+    )
     if needs_bounded_reuse:
         _logging.getLogger(__name__).info(
             "Non-trimmable model cache detected with --enable-prefix-cache: "
@@ -2615,28 +2687,9 @@ def _config_declares_linear_attention(config: dict | None) -> bool:
     variant accepts an already-resolved config so aliases and bare local paths
     can share the serve prefill policy without another metadata lookup.
     """
-    if not isinstance(config, dict):
-        return False
+    from .model_auto_config import config_declares_linear_attention
 
-    text_config = config.get("text_config")
-    language_config = text_config if isinstance(text_config, dict) else config
-    layer_types = language_config.get("layer_types") or []
-    if any(
-        isinstance(layer_type, str)
-        and any(
-            marker in layer_type.lower() for marker in ("linear", "mamba", "recurrent")
-        )
-        for layer_type in layer_types
-    ):
-        return True
-    return any(
-        isinstance(model_type, str)
-        and any(
-            marker in model_type.lower()
-            for marker in ("mamba", "recurrent", "qwen3_next")
-        )
-        for model_type in (language_config.get("model_type"), config.get("model_type"))
-    )
+    return config_declares_linear_attention(config)
 
 
 def _prefers_recurrent_prefill_chunks(model_name: str) -> bool:
@@ -2693,12 +2746,14 @@ def _resolve_vision_prefill_token_budget(
     return max(prefill_step_size, mllm_default)
 
 
-def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
+def _needs_bounded_trim_free_reuse(
+    model_name: str, *, model_config: ModelProfile | None = None
+) -> bool:
     """Whether this model's cache can reuse prefixes but not trim exact hits."""
     from .model_aliases import resolve_profile as _resolve_alias
     from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
 
-    profile = _resolve_alias(model_name)
+    profile = model_config if model_config is not None else _resolve_alias(model_name)
     if profile is not None:
         if profile.is_hybrid:
             return True
@@ -3030,6 +3085,19 @@ def serve_command(args):
         # routes still accept both forms because the registry's
         # reverse HF-id index covers full ids too.
         args.model = audio_entry.hf_id
+        # Offline + uncached audio (#2357): refuse BEFORE the audio-mode
+        # fork. The main() B2 gate only fires for ids containing '/', so a
+        # short audio alias (``serve whisper``) never reaches it — and
+        # ``_serve_audio_mode`` loads weights lazily on first request, so
+        # without this the server would boot and only fail mid-request.
+        # Judge runnability with the SAME probe core (which family-scopes the
+        # Whisper ``weights.npz`` probe). The offline-refusal decision uses the
+        # tri-state ``is False`` so a probe fault (``None``) does not refuse.
+        if (
+            _offline_hub_mode_active()
+            and _cache_runnability(audio_entry.hf_id) is False
+        ):
+            _refuse_offline_uncached(audio_entry.hf_id)
         _serve_audio_mode(args, audio_entry)
         return
 
@@ -3203,6 +3271,33 @@ def serve_command(args):
         validate_model_support,
     )
 
+    # Lazily resolve checkpoint/profile metadata at most once for the serve-time
+    # defaults below. Fully explicit startup must not inspect metadata at all.
+    # PFlash/TurboQuant historically propagate inspection failures (while a
+    # missing import degrades to no default); parser/cache detection is
+    # non-fatal. The first consumer keeps its established error policy.
+    auto_config = None
+    auto_config_resolved = False
+
+    def resolve_auto_config(*, non_fatal: bool):
+        nonlocal auto_config, auto_config_resolved
+        if auto_config_resolved:  # pragma: no cover - callers guard resolved state
+            return auto_config
+        try:
+            from .model_auto_config import detect_model_config
+        except ImportError:
+            auto_config_resolved = True
+            return None
+        try:
+            auto_config = detect_model_config(args.model)
+        except Exception as e:
+            if not non_fatal:
+                raise
+            logger.debug(f"Auto-detection failed (non-fatal): {e}")
+            return None
+        auto_config_resolved = True
+        return auto_config
+
     # Resolve the FINAL serving lane ONCE (the model is already downloaded by
     # ``_ensure_model_downloaded`` above, so the offline probes have real
     # evidence). PFlash defaulting and ``validate_model_support`` must both see
@@ -3219,8 +3314,16 @@ def serve_command(args):
         # bonsai-27b-2bit → always @ 0.50) and build the config in one shared
         # helper; an explicit --pflash / --pflash-keep-ratio still wins inside.
         try:
+            pflash_detection = {}
+            if args.pflash is None or args.pflash_keep_ratio is None:
+                pflash_detection["_detected_config"] = resolve_auto_config(
+                    non_fatal=False
+                )
             pflash_config = resolve_pflash_config(
-                args, model_name=args.model, is_multimodal=_serve_is_mllm
+                args,
+                model_name=args.model,
+                is_multimodal=_serve_is_mllm,
+                **pflash_detection,
             )
             validate_model_support(
                 pflash_config,
@@ -3262,34 +3365,31 @@ def serve_command(args):
     # warning grounded in user intent even if a helper-side regression
     # ever started flagging in-spec cases.)
     _user_explicit_tool_call_parser = bool(args.tool_call_parser)
-    if not args.tool_call_parser or not args.reasoning_parser:
-        try:
-            from .model_auto_config import detect_model_config
-
-            auto_config = detect_model_config(args.model)
-            if auto_config:
-                if (
-                    not args.tool_call_parser
-                    and not _opt_out_tool
-                    and auto_config.tool_call_parser
-                ):
-                    args.tool_call_parser = auto_config.tool_call_parser
-                    args.enable_auto_tool_choice = True
-                    logger.info(
-                        f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
-                    )
-                if (
-                    not args.reasoning_parser
-                    and not _opt_out_reasoning
-                    and not args.no_thinking
-                    and auto_config.reasoning_parser
-                ):
-                    args.reasoning_parser = auto_config.reasoning_parser
-                    logger.info(
-                        f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
-                    )
-        except Exception as e:
-            logger.debug(f"Auto-detection failed (non-fatal): {e}")
+    if not auto_config_resolved and (
+        not args.tool_call_parser or not args.reasoning_parser
+    ):
+        resolve_auto_config(non_fatal=True)
+    if auto_config:
+        if (
+            not args.tool_call_parser
+            and not _opt_out_tool
+            and auto_config.tool_call_parser
+        ):
+            args.tool_call_parser = auto_config.tool_call_parser
+            args.enable_auto_tool_choice = True
+            logger.info(
+                f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
+            )
+        if (
+            not args.reasoning_parser
+            and not _opt_out_reasoning
+            and not args.no_thinking
+            and auto_config.reasoning_parser
+        ):
+            args.reasoning_parser = auto_config.reasoning_parser
+            logger.info(
+                f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
+            )
     if _opt_out_tool:
         logger.info(
             "Tool-call parser auto-detection disabled via --no-tool-call-parser"
@@ -3788,8 +3888,15 @@ def serve_command(args):
         turboquant_scheduler_kwargs as _turboquant_scheduler_kwargs,
     )
 
+    turboquant_detection = {}
+    if auto_config_resolved:
+        turboquant_detection["_detected_config"] = auto_config
+    elif getattr(args, "kv_cache_turboquant", None) is None and not getattr(
+        args, "kv_cache_quantization", False
+    ):
+        turboquant_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
     args.kv_cache_turboquant = resolve_turboquant_mode_default(
-        args, model_name=args.model
+        args, model_name=args.model, **turboquant_detection
     )
 
     # Reject conflicting KV-cache flag combinations before anything else in
@@ -3890,12 +3997,23 @@ def serve_command(args):
     # #1122: when prefix cache is enabled for a hybrid model and the user
     # did NOT explicitly pass --hybrid-cache-entries, auto-default to 8 so
     # the cache actually stores entries instead of silently dropping them.
+    hybrid_cache_user_explicit = "--hybrid-cache-entries" in sys.argv or any(
+        a.startswith("--hybrid-cache-entries=") for a in sys.argv
+    )
+    hybrid_cache_explicit_value = getattr(args, "hybrid_cache_entries", 0)
+    if (
+        not auto_config_resolved
+        and enable_prefix_cache
+        and hybrid_cache_explicit_value == 0
+        and not hybrid_cache_user_explicit
+    ):
+        resolve_auto_config(non_fatal=True)
     _hybrid_cache_entries = _resolve_hybrid_cache_entries(
         enable_prefix_cache=enable_prefix_cache,
-        explicit_value=getattr(args, "hybrid_cache_entries", 0),
-        user_set_explicit="--hybrid-cache-entries" in sys.argv
-        or any(a.startswith("--hybrid-cache-entries=") for a in sys.argv),
+        explicit_value=hybrid_cache_explicit_value,
+        user_set_explicit=hybrid_cache_user_explicit,
         model_name=getattr(args, "_original_alias", None) or args.model,
+        model_config=auto_config,
     )
     _prefill_user_set_explicit = "--prefill-step-size" in sys.argv or any(
         a.startswith("--prefill-step-size=") for a in sys.argv
@@ -3955,7 +4073,8 @@ def serve_command(args):
         non_trimmable_exact_prefix_reuse=(
             _hybrid_cache_entries > 0
             and _needs_bounded_trim_free_reuse(
-                getattr(args, "_original_alias", None) or args.model
+                getattr(args, "_original_alias", None) or args.model,
+                model_config=auto_config,
             )
         ),
         # Opt-in prompt-deterministic response cache (exact-match short-circuit).
@@ -5604,6 +5723,59 @@ def _scan_external_model_dirs(
     return out
 
 
+def _cache_runnability(repo: str) -> bool | None:
+    """Tri-state cache runnability: ``True`` runnable, ``False`` definitively
+    not, ``None`` = inconclusive (a probe fault masked a real verdict).
+
+    This is the probe-level core. A probe fault — cache-dir permission,
+    malformed index/header — does NOT tell us whether the checkpoint is
+    cached (it may well be). Callers must decide what ``None`` means:
+
+      * Skip-download / inventory callers (``_ensure_model_downloaded``,
+        ``models --cached``) treat ``None`` as **not runnable** (via
+        :func:`_cache_entry_is_runnable`, which collapses ``None`` to
+        ``False``) — they must never skip a download or show a checkmark on
+        a checkpoint whose cachedness could not be verified.
+      * Offline-refusal callers treat ``None`` as **do not refuse** (they
+        compare ``is False`` directly) — offline refuses only when
+        uncachedness is actually established, never on a probe fault.
+
+    Unexpected exceptions are genuine bugs and still propagate.
+    """
+    try:
+        from vllm_mlx._download_gate import (
+            _snapshot_is_complete_audio_model,
+            _snapshot_is_complete_mflux_model,
+            _snapshot_is_complete_split_model,
+            is_repo_cached,
+        )
+        from vllm_mlx.audio.registry import resolve_audio_alias
+        from vllm_mlx.model_metadata import resolve_unreferenced_cached_snapshot
+
+        audio_entry = resolve_audio_alias(repo)
+        if audio_entry is not None and audio_entry.family in ("whisper", "kokoro"):
+            # Audio repos don't share the text ``model*.safetensors`` layout;
+            # judge whisper/kokoro by their family-appropriate VERIFIED weight
+            # file (Whisper ``weights.npz``/``weights.safetensors``, Kokoro
+            # ``kokoro-v1_0.safetensors``) just like a text cache. Other audio
+            # families fall through to the generic cache probes below — their
+            # layout is not pinned here, so never claim them non-runnable.
+            return _snapshot_is_complete_audio_model(repo, audio_entry.family)
+        return (
+            is_repo_cached(repo)
+            or _snapshot_is_complete_split_model(repo)
+            or _snapshot_is_complete_mflux_model(repo)
+            or resolve_unreferenced_cached_snapshot(repo) is not None
+        )
+    except (OSError, KeyError, ValueError) as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not probe cachedness of %r: %s", repo, exc
+        )
+        return None
+
+
 def _cache_entry_is_runnable(repo: str) -> bool:
     """Whether a cache directory contains a complete runnable snapshot.
 
@@ -5612,26 +5784,21 @@ def _cache_entry_is_runnable(repo: str) -> bool:
     downloads (config/tokenizer only, no weights) look ready in ``ls`` and in
     the desktop model picker. Reuse the serve download gate's authoritative
     completeness checks for both text and component-split video layouts.
-    """
-    try:
-        from vllm_mlx._download_gate import (
-            _snapshot_is_complete_mflux_model,
-            _snapshot_is_complete_split_model,
-            _snapshot_is_complete_whisper_model,
-            is_repo_cached,
-        )
-        from vllm_mlx.audio.registry import resolve_audio_alias
 
-        audio_entry = resolve_audio_alias(repo)
-        if audio_entry is not None and audio_entry.family == "whisper":
-            return _snapshot_is_complete_whisper_model(repo)
-        return (
-            is_repo_cached(repo)
-            or _snapshot_is_complete_split_model(repo)
-            or _snapshot_is_complete_mflux_model(repo)
-        )
-    except Exception:
-        return False
+    ``resolve_unreferenced_cached_snapshot`` closes the #2351 gap: a complete,
+    unambiguous SINGLE snapshot with no ``refs/main`` (a commit-pinned
+    ``snapshot_download`` / manual pull) is loadable by the routing & loader
+    contract — the inventory must report it available, not ``(incomplete)``,
+    so ``models --cached`` and the serve gate agree with the loader. Multiple
+    snapshots are ambiguous and stay unresolved there.
+
+    A probe fault (see :func:`_cache_runnability`) collapses to ``False``
+    here: skip-download and inventory callers must not treat a checkpoint
+    whose cachedness could not be established as runnable. The offline-refusal
+    callers use the tri-state core directly (``is False``) so that a probe
+    fault does not make them refuse.
+    """
+    return _cache_runnability(repo) is True
 
 
 def _print_cached_models() -> None:
@@ -6366,25 +6533,133 @@ def _external_tree_size_bytes(path: str) -> int:
     return total
 
 
-def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
-    """Emit the one-line ``Downloaded ... — <size> in <duration>`` summary."""
+def _narrow_to_subfolder(repo_id: str, snapshot_dir):
+    """Narrow a snapshot root to the catalog subfolder a filtered pull serves.
+
+    A repo that ships one folder per quantization holds far more on disk than
+    any single alias needs; sizing or fingerprinting the ROOT would include
+    sibling quant folders left by earlier pulls. Returns the subfolder path
+    when ``repo_id`` is a catalog alias with one, else the root unchanged.
+    Shared by the transfer account and the pull summary so both key on the
+    same directory.
+    """
     import os as _os
 
     from vllm_mlx.model_aliases import resolve_subfolder
 
-    # A filtered pull fetched one folder, but the snapshot root may also
-    # hold quant folders left by earlier pulls of a sibling alias. Sizing
-    # the root would report those as part of THIS download.
     _sub = resolve_subfolder(repo_id)
     if _sub:
         _candidate = _os.path.join(str(snapshot_dir), _sub)
         if _os.path.isdir(_candidate):
-            snapshot_dir = _candidate
+            return _candidate
+    return snapshot_dir
+
+
+def _hf_cache_root(repo_id: str):
+    """HF cache ``models--<id>`` dir for ``repo_id``, or None.
+
+    Pure path computation from the hub cache (no network). Handles BOTH
+    ``owner/repo`` and single-component repo ids (Codex #2392 #2): ``owner/repo``
+    maps to ``models--owner--repo``; a bare ``repo`` (no ``/``) maps to
+    ``models--repo`` — HF's real layout. Prefers HF's own ``repo_name_to_id``
+    when the installed version exposes it, else reconstructs locally.
+    """
+    from pathlib import Path
+
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception:
+        return None
+    try:
+        from huggingface_hub.utils import repo_name_to_id  # type: ignore[attr-defined]
+
+        _cache_id = repo_name_to_id(repo_id)
+    except Exception:
+        _cache_id = repo_id.replace("/", "--")
+    return Path(HF_HUB_CACHE) / f"models--{_cache_id}"
+
+
+def _blob_identifier(repo_root) -> tuple[tuple[str, int, int], ...]:
+    """Sorted ``(name, size, mtime_ns)`` for every real blob under ``blobs/``.
+
+    The stable transfer signal for the pull account (Codex #2392): a NEW or
+    MODIFIED blob is the only thing that means bytes crossed the wire. A warm
+    pull that merely re-links snapshot symlinks to already-present blobs
+    leaves ``blobs/`` untouched (identical fingerprint => cached); a genuine
+    fetch creates a new blob (changed); a repair of a corrupt/truncated blob
+    changes its size/mtime (changed). This is robust to ``main`` moving to a
+    snapshot assembled entirely from blobs already present locally — which
+    transfers NOTHING and must be reported cached, whereas comparing the
+    snapshot TREE (changed paths) would falsely report a download (Codex #2392).
+
+    ``.incomplete*`` scratch files are excluded — HF prunes/creates them as
+    churn that has nothing to do with this pull's outcome. ``repo_root`` may
+    be None (no cache entry yet) -> empty fingerprint.
+    """
+    import os as _os
+
+    if not repo_root:
+        return ()
+    blob_dir = repo_root / "blobs"
+    if not blob_dir.is_dir():
+        return ()
+    rows: list[tuple[str, int, int]] = []
+    try:
+        names = _os.listdir(blob_dir)
+    except OSError:
+        return ()
+    for name in names:
+        if name.startswith(".incomplete"):
+            continue
+        p = blob_dir / name
+        try:
+            if p.is_file():
+                st = p.stat()
+                rows.append((name, st.st_size, st.st_mtime_ns))
+        except OSError:
+            continue
+    return tuple(sorted(rows))
+
+
+def _print_pull_summary(
+    repo_id: str,
+    snapshot_dir,
+    elapsed: float,
+    *,
+    was_cached: bool | None = None,
+) -> None:
+    """Emit the one-line ``Downloaded ... — <size> in <duration>`` summary.
+
+    ``was_cached`` is the downloader's authoritative "nothing was transferred
+    this pull" verdict (issue #2349):
+    * ``True``  — the mirror/HF transfer account proves zero bytes were
+      fetched -> "Already cached ... verified (nothing to download)".
+    * ``False`` — the downloader reports it fetched bytes -> "Downloaded".
+    * ``None``  — unknown (e.g. the HF-fallback's downloader could not prove
+      either way) -> "Downloaded", never a false cache claim.
+    For the HF-fallback path the account is the on-disk snapshot file
+    inventory before vs after the pull (a stable seam, Codex #2392) — never
+    huggingface_hub's tqdm progress internals. A moved ``main`` that fetches
+    new blobs changes the inventory and reports a real download.
+    """
+    # A filtered pull fetched one folder, but the snapshot root may also
+    # hold quant folders left by earlier pulls of a sibling alias. Sizing
+    # the root would report those as part of THIS download.
+    snapshot_dir = _narrow_to_subfolder(repo_id, snapshot_dir)
     size = _snapshot_size_bytes(snapshot_dir)
-    print(
-        f"  Downloaded {repo_id} — {_format_bytes(size)} in "
-        f"{_format_pull_duration(elapsed)}"
-    )
+    # "Already cached" only on a proven no-transfer (``was_cached is True``);
+    # ``None`` (unknown) falls through to "Downloaded" rather than a false
+    # cache claim.
+    if was_cached is True:
+        print(
+            f"  Already cached {repo_id} — {_format_bytes(size)} verified "
+            f"(nothing to download)"
+        )
+    else:
+        print(
+            f"  Downloaded {repo_id} — {_format_bytes(size)} in "
+            f"{_format_pull_duration(elapsed)}"
+        )
 
     # Activation funnel (docs/telemetry-activation.md): a successful pull is
     # the ``model_pull`` milestone (an activation, NOT inference-engaged).
@@ -6400,6 +6675,85 @@ def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
     )
 
 
+def _escape_glob_literal(name: str) -> str:
+    """Make ``name`` match literally in a fnmatch ``allow_patterns`` string.
+
+    ``snapshot_download``'s ``allow_patterns`` are fnmatch-style globs, so a
+    folder whose name happens to contain a glob metacharacter (``[``, ``]``,
+    ``*``, ``?``) would otherwise broaden the match to other folders. Wrapping
+    each metacharacter in a one-character character class (``[[]`` matches a
+    literal ``[``) pins the pattern to exactly that folder. Real quant names
+    (``4bit``, ``mxfp4``) never hit this, but the selector claims to handle
+    arbitrary multi-variant repos, so it must not corrupt their folder names.
+    """
+    out: list[str] = []
+    for ch in name:
+        out.append(f"[{ch}]" if ch in "[]*?" else ch)
+    return "".join(out)
+
+
+def _resolve_variant_allow_patterns(
+    repo_id: str, bits: str | None, fmt: str | None
+) -> list[str] | None:
+    """Map ``--bits``/``--format`` to ``snapshot_download`` patterns.
+
+    A multi-variant repo ships every quantization side by side as TOP-LEVEL
+    folders (``LiquidAI/LFM2.5-2.6B-MLX`` holds ``4bit/ 5bit/ 6bit/ 8bit/
+    bf16/ mxfp4/ mxfp8/ nvfp4/``). ``--bits N`` or ``--format F`` selects the
+    ``<N>bit`` / ``<F>`` folder so a constrained Mac fetches only that
+    variant instead of all of them (~20 GB in the LFM case).
+
+    Returns ``[f"{folder}/*"]`` for the requested variant, or ``None`` when no
+    selector was given (caller keeps the existing catalog-driven narrowing).
+    Raises ``VariantNotFoundError`` with the available folders when the
+    requested variant does not exist — so we fail clearly and cheaply (a file
+    listing, not a download) before touching any weights. The enumeration uses
+    the same top-level ``list_repo_tree`` read the mirror/catalog already rely
+    on; only folder names are inspected, never file bytes.
+
+    ``--bits`` and ``--format`` select the SAME dimension (a single variant
+    folder), so the CLI exposes them as a mutually exclusive group; this helper
+    rejects both being set as a defensive guard for programmatic callers.
+    """
+    if bits is None and fmt is None:
+        return None
+    if bits and fmt:
+        raise ValueError("--bits and --format are mutually exclusive; pick one")
+    # An explicit-but-empty selector (e.g. ``--format ""``) is a user error, not
+    # "no selector" — reject it instead of silently doing an unrestricted pull.
+    if bits == "" or fmt == "":
+        raise ValueError(
+            "--bits/--format was supplied but is empty; pass a value or drop the flag"
+        )
+    from huggingface_hub import HfApi, RepoFolder
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    # At this point exactly one of bits/fmt is a truthy non-empty value (the
+    # None/empty/both cases all returned or raised above), so ``requested`` is
+    # a real folder name string.
+    requested = f"{bits}bit" if bits else (fmt or "")
+    try:
+        tree = list(HfApi().list_repo_tree(repo_id, recursive=False))
+    except RepositoryNotFoundError:
+        raise
+    folders = sorted(e.path for e in tree if isinstance(e, RepoFolder))
+    if requested not in folders:
+        raise VariantNotFoundError(repo_id, requested, available=folders)
+    # The folder is validated to exist literally; escape glob metacharacters so
+    # a weird folder name can't broaden the match to other siblings.
+    return [f"{_escape_glob_literal(requested)}/*"]
+
+
+class VariantNotFoundError(Exception):
+    """The user asked for a variant a multi-variant repo does not ship."""
+
+    def __init__(self, repo_id: str, requested: str, available: list[str]):
+        self.repo_id = repo_id
+        self.requested = requested
+        self.available = available
+        super().__init__(f"no '{requested}' variant in {repo_id}")
+
+
 def pull_command(args):
     """Download a model to the HuggingFace cache without serving."""
     import time
@@ -6410,6 +6764,37 @@ def pull_command(args):
 
     repo_id = args.model  # already alias-resolved by main()
     t0 = time.monotonic()
+
+    # #2145: resolve an explicit ``--bits``/``--format`` variant up front via a
+    # cheap file listing (no weight download). A requested variant that the
+    # repo does not ship fails here with the available folders listed, before
+    # any weights are touched.
+    _bits = getattr(args, "bits", None)
+    _fmt = getattr(args, "format", None)
+    try:
+        variant_allow = _resolve_variant_allow_patterns(repo_id, _bits, _fmt)
+    except ValueError as e:
+        print(f"\n  Error: {e}")
+        sys.exit(1)
+    except VariantNotFoundError as e:
+        shown = getattr(args, "_original_alias", repo_id)
+        print(f"\n  Error: '{shown}' has no '{e.requested}' variant.")
+        if e.available:
+            print("  Available variant folder(s): " + ", ".join(e.available) + ".")
+        else:
+            print(
+                "  The repo exposes no variant folders — it is a single-variant repo."
+            )
+        print(
+            "  Pick one with --bits <N> or --format <name>, or pull the repo without a selector."
+        )
+        sys.exit(1)
+
+    # The pull summary says "already cached / nothing to download" only from
+    # the DOWNLOADER's own transfer account (mirror/HF bytes fetched), never
+    # from a filesystem guess. ``_was_cached`` is threaded to the summary.
+    _was_cached: bool | None = None
+    _mirror_out: dict = {}
 
     # Reclaim scratch files stranded by earlier interrupted pulls of THIS repo
     # before adding more. huggingface_hub gives each attempt a uniquely-named
@@ -6432,7 +6817,18 @@ def pull_command(args):
     # R2-first / HuggingFace-fallback per file. Default mirror is
     # ``https://models.rapidmlx.com``; set ``RAPID_MLX_MODEL_MIRROR=""``
     # to force HF only. The function prints its own progress + summary.
-    if _try_mirror_prefetch(repo_id):
+    # #2145: when the user explicitly selected a variant (--bits/--format), the
+    # mirror prefetch has no narrow-to-variant mode yet (Vector's #2279 adds
+    # allow_patterns there, unlanded) — it would pull the WHOLE (or catalog
+    # subfolder) repo and defeat the selection. So a requested variant bypasses
+    # the mirror and goes straight to the narrowed HF snapshot_download below.
+    # Revisit once #2279 lands allow_patterns in the mirror path.
+    if variant_allow is not None:
+        print(
+            "  R2 mirror skipped: a --bits/--format variant was requested "
+            "(the mirror cannot narrow to one variant yet)."
+        )
+    if variant_allow is None and _try_mirror_prefetch(repo_id, out=_mirror_out):
         from pathlib import Path
 
         try:
@@ -6450,7 +6846,15 @@ def pull_command(args):
         except OSError:
             snapshot_dir = repo_root
             print(f"  Cached at: {repo_root}")
-        _print_pull_summary(repo_id, snapshot_dir, time.monotonic() - t0)
+        # ``network_fetch`` is the mirror's authoritative "any bytes fetched
+        # this pull" verdict (covers a fetched zero-byte file, codex #4).
+        _was_cached = not _mirror_out.get("network_fetch", True)
+        _print_pull_summary(
+            repo_id,
+            snapshot_dir,
+            time.monotonic() - t0,
+            was_cached=_was_cached,
+        )
         return
     # Mirror returned False — fall through to plain snapshot_download.
     # Either the catalog was unreachable, the alias isn't catalog-listed,
@@ -6483,18 +6887,65 @@ def pull_command(args):
         # checkpoints on disk that nothing can serve. It is announced
         # rather than silent so ``pull <repo-id>`` never quietly does
         # something narrower than it was asked.
-        _subfolder = resolve_subfolder(repo_id)
-        if _subfolder:
+        # An explicit --bits/--format selection (variant_allow) always wins over
+        # the catalog-driven subfolder narrowing; otherwise fall back to the
+        # catalog subfolder (one checkpoint per quantization).
+        if variant_allow is not None:
+            _allow = variant_allow
+            # Literal folder name the user asked for (e.g. "4bit"). Derived
+            # from the raw selectors, NOT from the (glob-escaped) pattern, so
+            # user-facing messages and catalog comparison show the real name
+            # even when it contains glob metacharacters.
+            _variant_name = f"{_bits}bit" if _bits else (_fmt or "")
+            # The explicit --bits/--format selection wins over any catalog
+            # alias narrowing (resolve_subfolder); say so so the override is
+            # visible rather than silent.
+            _alias_subfolder = resolve_subfolder(repo_id)
+            if _alias_subfolder and _alias_subfolder != _variant_name:
+                print(
+                    f"  User --bits/--format '{_variant_name}' overrides the "
+                    f"catalog's '{_alias_subfolder}/' alias narrowing."
+                )
             print(
-                f"  This repo ships one checkpoint per quantization; "
-                f"fetching only {_subfolder}/ (the folder rapid-mlx serves)."
+                f"  Fetching only the {_variant_name}/ variant "
+                f"(selected with --bits/--format)."
             )
-        _allow = [f"{_subfolder}/*"] if _subfolder else None
+        else:
+            _subfolder = resolve_subfolder(repo_id)
+            if _subfolder:
+                print(
+                    f"  This repo ships one checkpoint per quantization; "
+                    f"fetching only {_subfolder}/ (the folder rapid-mlx serves)."
+                )
+            _allow = [f"{_subfolder}/*"] if _subfolder else None
+        # HF-fallback runs only after a mirror miss — but a cached HF no-op is
+        # still possible and must be labelled "Already cached", so account the
+        # TRANSFER from the BLOB store (Codex #2392), never huggingface_hub's
+        # tqdm progress internals and never the snapshot tree: a NEW/MODIFIED
+        # blob is the only thing meaning bytes crossed the wire. Capture the
+        # repo's ``blobs/`` inventory BEFORE the pull then AFTER. Identical =>
+        # zero bytes crossed this pull (cache hit) — even if ``main`` moved to
+        # a snapshot assembled from blobs already present locally, or a warm
+        # re-link recreated snapshot symlinks; any changed blob (new file, or
+        # a repaired corrupt/truncated blob whose size/mtime changed) => a real
+        # download. ``_hf_cache_root`` resolves the cache entry (no network).
+        # The mirror may have ALREADY fetched some blobs before it returned
+        # False (a partial/failed attempt). Those bytes must still count: honor
+        # whatever the mirror reported on ANY exit path (Codex #2353). The R5
+        # per-file aggregation sets ``_mirror_out["network_fetch"]`` on the
+        # mirror's success AND partial-miss returns, so a partial mirror
+        # transfer forces "Downloaded" even when the snapshot_download that
+        # follows is a no-op.
+        _mirror_fetched = _mirror_out.get("network_fetch", False)
+        _cache_root = _hf_cache_root(repo_id)
+        _before = _blob_identifier(_cache_root)
         path = (
             snapshot_download(repo_id, allow_patterns=_allow)
             if _allow
             else snapshot_download(repo_id)
         )
+        _after = _blob_identifier(_cache_root)
+        _was_cached = (_before == _after and _before != ()) and not _mirror_fetched
     except HFValidationError:
         # Malformed HF repo id (e.g. ``foo/bar/baz``) — surface the same
         # friendly "unknown model" hint the alias path uses instead of a
@@ -6521,7 +6972,12 @@ def pull_command(args):
             sys.exit(1)
         raise
     print(f"  Cached at: {path}")
-    _print_pull_summary(repo_id, path, time.monotonic() - t0)
+    _print_pull_summary(
+        repo_id,
+        path,
+        time.monotonic() - t0,
+        was_cached=_was_cached,
+    )
 
 
 def rm_command(args):
@@ -6668,6 +7124,7 @@ def ps_command(_args):
         }
         model = "(unknown)"
         port = "8000"  # serve's default
+        served = None  # --served-model-name value, if any (issue #2353)
         try:
             i = cmd.index("serve") + 1
             # Pre-PR this loop ``break``ed on the first positional, so a
@@ -6683,10 +7140,14 @@ def ps_command(_args):
                         key, val = tok.split("=", 1)
                         if key == "--port":
                             port = val
+                        elif key == "--served-model-name":
+                            served = val
                         i += 1
                     elif tok in VALUE_FLAGS:
                         if tok == "--port" and i + 1 < len(cmd):
                             port = cmd[i + 1]
+                        elif tok == "--served-model-name" and i + 1 < len(cmd):
+                            served = cmd[i + 1]
                         i += 2
                     else:
                         i += 1
@@ -6697,6 +7158,12 @@ def ps_command(_args):
                     i += 1
         except ValueError:
             pass
+
+        # #2353: a user sets --served-model-name to choose the API model
+        # identity; the process surface should lead with that identity and
+        # may show the requested alias/checkpoint in parentheses after it.
+        if served and served != model:
+            model = f"{served} ({model})"
 
         uptime_s = max(0, int(time.time() - proc.info["create_time"]))
         h, m = uptime_s // 3600, (uptime_s % 3600) // 60
@@ -8012,15 +8479,29 @@ def chat_command(args):
             if not _auto_yes and _interactive:
                 from vllm_mlx._download_gate import (
                     confirm_or_abort,
-                    estimate_repo_size_bytes,
+                    estimate_download_size_bytes,
                     is_repo_cached,
                 )
 
                 if not is_repo_cached(resolved):
+                    # Offline + uncached (/model swap): refuse BEFORE the size
+                    # estimate + confirm, so the user sees the one actionable
+                    # offline reason instead of an "About to download" notice
+                    # or a confirm they can cancel without learning why
+                    # (#2357). Mirrors the main() serve gate; the Wan dir
+                    # override exemption is likewise scoped to video-gen.
+                    # Only print + return (stay in the REPL), not sys.exit —
+                    # a failed /model must never kill the chat session.
+                    if (
+                        _offline_hub_mode_active()
+                        and _cache_runnability(resolved) is False
+                    ):
+                        print(_offline_uncached_error(resolved), file=sys.stderr)
+                        return
                     try:
                         confirm_or_abort(
                             resolved,
-                            estimate_repo_size_bytes(resolved),
+                            estimate_download_size_bytes(resolved),
                         )
                     except SystemExit:
                         # User said no — keep the current server up.
@@ -8030,16 +8511,21 @@ def chat_command(args):
                         )
                         return
 
-        # 1. Pre-download the new model (this also runs the disk-space
-        #    gate). The current server keeps running while we do this so
-        #    a download failure leaves the user where they were.
+        # 1. Pre-download the new model (this also runs the disk-space gate
+        #    and the offline+uncached refusal). The current server keeps
+        #    running while we do this so a download failure leaves the user
+        #    where they were.
         try:
             _ensure_model_downloaded(resolved)
         except SystemExit:
-            # Disk gate aborted via sys.exit(1); old server is untouched.
+            # A fatal pre-download condition aborted via sys.exit(1) — disk
+            # gate, offline+uncached, or resolve timeout. Each path printed
+            # its own specific reason to stderr, so this summary deliberately
+            # does NOT re-attribute it as the disk gate (#2357). Old server
+            # is untouched.
             print(
                 f"  {RED}Model switch aborted{RESET} "
-                f"{DIM}(disk gate); previous server still running.{RESET}\n"
+                f"{DIM}(reason above); previous server still running.{RESET}\n"
             )
             return
         except RuntimeError as exc:
@@ -8830,9 +9316,35 @@ def connect_command(args):
     lifespan banner uses — so ``ready``/``openai``/``anthropic`` and the
     machine form can never drift from what a running server prints.
     """
-    from vllm_mlx.connect import probe_server_alive, render_banner, resolve_endpoints
+    from vllm_mlx.connect import (
+        _parse_base_url,
+        probe_server_alive,
+        render_banner,
+        resolve_endpoints,
+    )
 
-    eps = resolve_endpoints(host=args.host, port=args.port, model=args.model)
+    # ``--base-url`` is the explicit way to pass the *live* server instance
+    # context across process boundaries (#2348): the serve banner advertises
+    # ``connect openai-python --base-url <url>`` pointing at the real server,
+    # and a standalone ``connect`` derives host/port from it instead of falling
+    # back to the localhost:8000 default. Parse the base URL first, then let an
+    # explicit ``--host``/``--port`` override its respective coordinate only
+    # when that flag is actually supplied (independent overrides, codex #2348).
+    host = args.host
+    port = args.port
+    base_url = getattr(args, "base_url", None)
+    if base_url is not None:
+        try:
+            base_host, base_port = _parse_base_url(base_url)
+        except ValueError:
+            print(f"  connect: invalid --base-url: {base_url}")
+            sys.exit(1)
+        if args.host is None:
+            host = base_host
+        if args.port is None:
+            port = base_port
+
+    eps = resolve_endpoints(host=host, port=port, model=args.model)
 
     # Per-target "how to connect" cheat sheet.
     if args.target:
@@ -10683,6 +11195,30 @@ Examples:
     pull_parser.add_argument(
         "model", help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (org/name)"
     ).completer = alias_completer
+    # #2145: a multi-variant repo ships every quantization side by side as
+    # top-level folders (e.g. LiquidAI/LFM2.5-2.6B-MLX holds 4bit/ 5bit/ 6bit/
+    # 8bit/ mxfp4/...). Without selection, `pull <repo>` fetches ALL of them.
+    # These flags let a constrained Mac fetch only the variant it can serve.
+    # They select the SAME dimension (one variant folder), so --bits and
+    # --format are mutually exclusive — passing both would be ambiguous about
+    # which single variant the caller wants.
+    _variant_group = pull_parser.add_mutually_exclusive_group()
+    _variant_group.add_argument(
+        "--bits",
+        metavar="N",
+        help=(
+            "Pull only the <N>bit variant of a multi-variant repo "
+            "(e.g. --bits 4 fetches only 4bit/; any N the repo ships works)."
+        ),
+    )
+    _variant_group.add_argument(
+        "--format",
+        metavar="name",
+        help=(
+            "Pull only the named format variant of a multi-variant repo "
+            "(e.g. --format mxfp4 or --format gguf, when the repo ships one)."
+        ),
+    )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
     )
@@ -10965,6 +11501,17 @@ Examples:
         default=None,
         help="Model name to advertise (default: auto-detect from server)",
     ).completer = alias_completer
+    connect_parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help=(
+            "Explicit OpenAI-style base URL of the running server "
+            "(e.g. http://localhost:8123/v1) — the banner's pasted commands "
+            "carry this so the snippet targets the live host/port, not the "
+            "default. Overrides --host/--port only when those are unset."
+        ),
+    )
 
     # Doctor command — pure env-health probe (≤5 s, no model load, no server).
     # Model-validation tiers (smoke/check/full/benchmark) moved to
@@ -11453,6 +12000,15 @@ def main():
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
     _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
+    # Attached client (chat/bench pointed at an existing server via
+    # --base-url/--port): the named model lives remotely and is NOT meant to
+    # be downloaded into the local HF cache, so neither the confirm gate nor
+    # the offline+uncached refusal applies (codex #2357-P1). --port on a
+    # top-level serve means "bind here", not "attach", so only the
+    # client-capable commands are exempted.
+    _attached_remote = getattr(args, "command", None) in {"chat", "run", "bench"} and (
+        getattr(args, "base_url", None) or getattr(args, "port", None) is not None
+    )
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")
@@ -11460,6 +12016,7 @@ def main():
         and "/" in args.model  # only HF-style repo ids; local paths skip
         and not os.path.exists(args.model)
         and not _chat_spawn_child
+        and not _attached_remote
     ):
         # Cheap checks first: env override and non-TTY both short-circuit
         # without touching the HF API. ``confirm_or_abort`` re-checks
@@ -11471,11 +12028,45 @@ def main():
         if not _auto_yes and _interactive:
             from vllm_mlx._download_gate import (
                 confirm_or_abort,
-                estimate_repo_size_bytes,
+                estimate_download_size_bytes,
                 is_repo_cached,
             )
 
             if not is_repo_cached(args.model):
+                # Offline + uncached (#2357): short-circuit BEFORE the size
+                # estimate + ``confirm_or_abort``. ``estimate_repo_size_bytes``
+                # makes a silent HF ``model_info`` round-trip that returns None
+                # under offline mode, which ``confirm_or_abort`` treats as
+                # "about to download … proceed" — so without this, the user
+                # would see a contradictory "About to download / Proceeding
+                # anyway" pair right before the refusal below. Refuse once here,
+                # identically to ``_ensure_model_downloaded``. Scope the refusal
+                # on the SAME runnability predicate (``_cache_entry_is_runnable``)
+                # rather than ``is_repo_cached`` alone: a fully-cached mflux or
+                # split-video checkpoint has no root ``model*.safetensors``, so a
+                # text-only check would wrongly refuse a model that IS cached
+                # (codex #2357-P1). Also skip when a lane-local source makes the
+                # model available offline even with an empty HF cache — Wan's
+                # ``RAPID_MLX_WAN_MODEL_DIR`` override (its own download path
+                # never goes through ``_ensure_model_downloaded``) (codex #2357-P1).
+                # The exemption is scoped to the video-gen lane so a stray env
+                # var can't exempt an unrelated text model from the refusal.
+                _is_wane_exempt = False
+                if os.environ.get("RAPID_MLX_WAN_MODEL_DIR"):
+                    from vllm_mlx.model_aliases import resolve_profile as _rp
+
+                    _rp_entry = _rp(args.model)
+                    _is_wane_exempt = (
+                        _rp_entry is not None
+                        and _rp_entry.modality == "video-gen"
+                        and os.path.isdir(os.environ.get("RAPID_MLX_WAN_MODEL_DIR", ""))
+                    )
+                if (
+                    _offline_hub_mode_active()
+                    and _cache_runnability(args.model) is False
+                    and not _is_wane_exempt
+                ):
+                    _refuse_offline_uncached(args.model)
                 # The size estimate is a silent HF ``model_info`` round-trip
                 # (up to 5s). Cover it with a "Resolving…" spinner so the
                 # first-run cold start doesn't read as a hang here — the same
@@ -11486,9 +12077,14 @@ def main():
                 # including the auto-selected starter: it is an unpinned HF repo
                 # whose declared size we must actually verify, never assume,
                 # before waiving consent.
+                #
+                # ``estimate_download_size_bytes`` (not the raw
+                # ``estimate_repo_size_bytes``) so a catalog model's checked-in
+                # footprint still gates when the Hub can't be reached offline
+                # (issue #2350).
                 _short = args.model.split("/")[-1]
                 with _StatusSpinner(f"Resolving {_short} …"):
-                    _size = estimate_repo_size_bytes(args.model)
+                    _size = estimate_download_size_bytes(args.model)
                 confirm_or_abort(args.model, _size)
     # --- END B2 --------------------------------------------------------
 

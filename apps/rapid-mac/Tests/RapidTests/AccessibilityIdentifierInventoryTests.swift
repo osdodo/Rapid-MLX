@@ -24,6 +24,18 @@ import Testing
 @Suite("Accessibility identifier inventory")
 struct AccessibilityIdentifierInventoryTests {
 
+    @Test("Model switch guard names its destructive and cancel controls")
+    func modelSwitchGuardIdentifiers() throws {
+        try assertDeclared(
+            [
+                #""ModelSwitchGuard.Confirm""#,
+                #""ModelSwitchGuard.Cancel""#,
+            ],
+            in: "Sources/Rapid/UI/ContentView.swift",
+            surface: "Active-request model switch confirmation"
+        )
+    }
+
     @Test("Settings → App names the re-onboarding confirmation controls")
     func settingsAppReonboardingIdentifiers() throws {
         try assertDeclared(
@@ -145,6 +157,7 @@ struct AccessibilityIdentifierInventoryTests {
                 #""Settings.Tools.WebSearch.Backend.\(provider.id)""#,
                 #""Settings.Tools.WebSearch.KeyField.\(provider.id)""#,
                 #""Settings.Tools.WebSearch.SaveKey.\(provider.id)""#,
+                #""Settings.Tools.WebSearch.KeyUnavailable.\(provider.id)""#,
                 // The "Get a <provider> key" Link is interactive too — it
                 // opens the provider's dashboard. It was missed on the first
                 // pass precisely because it only renders for a provider that
@@ -541,6 +554,21 @@ struct AccessibilityIdentifierInventoryTests {
             [#""Launch.Integration.Copy.\(tool.id)""#],
             in: "Sources/Rapid/UI/ConnectToolsView.swift",
             surface: "Launch integration rows"
+        )
+    }
+
+    /// The stopped-state inline model picker (#2297) is addressed by its own
+    /// menu popup identifier inside ``ModelPickerBar``, not by a composite id
+    /// stamped on the whole bar (a composite id would propagate onto both the
+    /// popup and the (i) info button and make them indistinguishable to AX).
+    /// The `launch-integrations` golden journey now asserts this id to reach
+    /// the picker directly.
+    @Test("Stopped-state model picker is reachable by its menu popup identifier")
+    func stoppedStatePickerMenuIdentifier() throws {
+        try assertDeclared(
+            [#""ModelPickerBar.ModelMenu""#],
+            in: "Sources/Rapid/UI/ModelPickerBar.swift",
+            surface: "Stopped-state inline model picker"
         )
     }
 
