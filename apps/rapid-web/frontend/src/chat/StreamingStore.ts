@@ -1,4 +1,4 @@
-import { advance, emptyLexState, type LexState } from '../markdown/lex';
+import { advance, emptyLexState, type LexState } from '@/markdown/lex';
 
 /**
  * The live text of the answer currently streaming.

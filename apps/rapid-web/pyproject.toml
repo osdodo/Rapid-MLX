@@ -32,12 +32,6 @@ dependencies = [
 rmlx-web = "rmlx_web.cli:main"
 
 [project.optional-dependencies]
-# QR code in the startup banner, so a phone can scan instead of the user
-# retyping a 43-character token. Optional because it is a convenience:
-# without it the banner prints the same URL as text.
-qr = [
-    "segno>=1.6.0",
-]
 test = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",

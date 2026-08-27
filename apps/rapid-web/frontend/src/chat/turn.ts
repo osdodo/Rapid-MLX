@@ -1,7 +1,7 @@
-import { streamChat } from '../api/chat';
-import { asApiError } from '../api/errors';
-import { useStore, wireTurns } from '../state/store';
-import type { MessageNode } from '../state/types';
+import { streamChat } from '@/api/chat';
+import { asApiError } from '@/api/errors';
+import { useStore, wireTurns } from '@/state/store';
+import type { MessageNode } from '@/state/types';
 import { activePath, branchAnchor, siblings } from './MessageTree';
 import { streamingStore } from './StreamingStore';
 

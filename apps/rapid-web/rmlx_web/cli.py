@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import ipaddress
 import socket
 import sys
@@ -38,7 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "model",
         nargs="?",
-        help=("Model alias to load (e.g. qwen3.5-4b-4bit). Omit only with --attach."),
+        help=(
+            "Model alias to load at startup. Optional: omit it to start with "
+            "no model and choose one in the page."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -163,31 +165,6 @@ def _login_url(host: str, port: int, token: str | None) -> str:
     return f"{base}#token={quote(token, safe='')}"
 
 
-def _render_qr(url: str) -> str | None:
-    """ASCII QR for ``url``, or ``None`` if unavailable.
-
-    ``segno`` is an optional extra rather than a dependency: it exists
-    only to save typing a token on a phone, and hand-rolling a QR
-    encoder (Reed-Solomon, masking, version selection) is a great deal
-    of code for a convenience. Without it the URL is still printed.
-    """
-    try:
-        import segno
-    except ImportError:
-        return None
-
-    try:
-        buffer = io.StringIO()
-        # border=1 rather than the spec's 4: a terminal QR still scans
-        # reliably with a thinner quiet zone, and 4 rows of blank above
-        # and below pushes the banner off a short window.
-        segno.make(url, error="l").terminal(out=buffer, border=1)
-        return buffer.getvalue()
-    except Exception:
-        # A QR is decoration. Never let it stop the server starting.
-        return None
-
-
 def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) -> None:
     url = f"http://{_display_host(host)}:{port}/"
     login_url = _login_url(host, port, token)
@@ -201,16 +178,16 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
         print("  Auth:  none (loopback only)")
     print()
 
-    qr = _render_qr(login_url)
-    if qr:
-        print("  Scan to open:" if token is None else "  Scan to open and sign in:")
-        print(qr)
-    else:
-        if token is not None:
-            print("  Open this link to sign in automatically:")
-            print(f"  {login_url}")
-            print()
-        print("  (pip install 'rmlx-web[qr]' to show a scannable QR code)")
+    # The sign-in link, but no QR code. The banner is read on the Mac that
+    # started the server, and a 25-row block of blocks pushed everything
+    # above it — including the token — off a short terminal window.
+    #
+    # The link itself stays when there is a token: it carries the token in
+    # its fragment, so pasting it is what saves retyping 43 characters. With
+    # no token the URL is already printed above and repeating it says nothing.
+    if token is not None:
+        print("  Open this link to sign in automatically:")
+        print(f"  {login_url}")
         print()
 
     if not loopback:
@@ -240,12 +217,14 @@ def _resolve_engine(args: argparse.Namespace, *, downloads_enabled: bool):
         # so a list the user cannot act on would only mislead.
         return AttachedEngine(args.attach, api_key=args.attach_api_key), None, None
 
-    if not args.model:
-        raise SystemExit(
-            "error: a model alias is required (e.g. `rmlx-web "
-            "qwen3.5-4b-4bit`), or use --attach to reuse a running server."
-        )
-
+    # No model is a supported way to start: the page's model picker is
+    # the other way to choose one, and it can do everything this argument
+    # does. The engine simply stays stopped until the user picks, which
+    # is a state the supervisor already models (``_model`` is optional)
+    # and the page already renders (readiness ``noModel``).
+    #
+    # It is NOT allowed with --attach, which is checked above: there the
+    # model belongs to a server this process does not own.
     binary = find_rapid_mlx_binary(args.rapid_mlx_bin)
     engine = EngineSupervisor(
         binary=binary,
@@ -326,6 +305,12 @@ def main(argv: list[str] | None = None) -> int:
         # can take.
         print(f"  Loading {config.initial_model} in the background…")
         print("  The page is usable now; it will say when the model is ready.\n")
+        sys.stdout.flush()
+    elif not args.attach:
+        # Say so explicitly. Without a line here the banner is followed by
+        # silence, which reads like the server is still working on
+        # something rather than waiting for the user.
+        print("  No model loaded — choose one in the page to start it.\n")
         sys.stdout.flush()
 
     try:

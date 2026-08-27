@@ -1,4 +1,4 @@
-import type { MessageNode } from '../state/types';
+import type { MessageNode } from '@/state/types';
 
 /**
  * Tree arithmetic over a flat node array.

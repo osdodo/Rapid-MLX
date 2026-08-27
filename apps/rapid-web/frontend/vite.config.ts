@@ -46,6 +46,10 @@ const devProxy: ProxyOptions = {
 export default defineConfig({
   plugins: [tailwindcss(), react()],
 
+  resolve: {
+    alias: { '@': resolve(import.meta.dirname, 'src') },
+  },
+
   // app.py serves the shell at GET / and mounts the build at /static.
   base: '/static/',
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { activePath } from '../chat/MessageTree';
+import { activePath } from '@/chat/MessageTree';
 import { HISTORY_KEY } from './migrate';
 import {
   MAX_ACTIVE_PATH,

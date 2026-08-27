@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { COMMIT_INTERVAL_MS, StreamingStore } from './StreamingStore';
-import { tokensOf } from '../markdown/lex';
+import { tokensOf } from '@/markdown/lex';
 
 /**
  * Fake timers throughout. A test that asserted a real wall-clock bound here

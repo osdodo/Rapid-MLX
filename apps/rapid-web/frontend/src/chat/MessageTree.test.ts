@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { MessageNode } from '../state/types';
+import type { MessageNode } from '@/state/types';
 import {
   activePath,
   branchAnchor,

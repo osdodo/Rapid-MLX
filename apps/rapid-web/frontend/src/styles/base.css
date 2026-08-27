@@ -3,20 +3,7 @@
 *,
 *::before,
 *::after {
-  box-sizing: border-box;
   -webkit-tap-highlight-color: transparent;
-}
-
-html,
-body {
-  margin: 0;
-  padding: 0;
-  background: var(--canvas);
-  color: var(--fg);
-  font-family: var(--font-body);
-  font-size: 16px;
-  line-height: 1.55;
-  -webkit-font-smoothing: antialiased;
 }
 
 /*
@@ -27,67 +14,11 @@ body {
 body {
   height: 100dvh;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 #root {
   height: 100dvh;
-}
-
-/* A faint grain wash so the canvas has depth instead of reading as a flat
-   fill. Fixed and non-interactive so it never intercepts a tap. */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background:
-    radial-gradient(
-      1100px 620px at 12% -8%,
-      color-mix(in srgb, var(--brand) 9%, transparent),
-      transparent 62%
-    ),
-    radial-gradient(
-      820px 520px at 108% 4%,
-      color-mix(in srgb, var(--amber) 7%, transparent),
-      transparent 58%
-    );
-}
-
-button {
-  font: inherit;
-  cursor: pointer;
-  border: none;
-  background: none;
-  color: inherit;
-}
-
-input,
-textarea,
-select {
-  font-family: inherit;
-  color: inherit;
-  /*
-    16px is a hard floor, not a style choice: below it iOS Safari zooms the
-    page on focus and never zooms back out.
-  */
-  font-size: 16px;
-}
-
-/*
-  The old page set `outline: none` on every input, which removed the only
-  visible focus indicator on the whole surface. Focus is instead scoped to
-  :focus-visible, so a mouse or touch interaction stays quiet while keyboard
-  and assistive-technology navigation gets a real ring.
-*/
-:focus {
-  outline: none;
-}
-
-:focus-visible {
-  outline: 2px solid var(--amber);
-  outline-offset: 2px;
-  border-radius: 4px;
 }
 
 /*

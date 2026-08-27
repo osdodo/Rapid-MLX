@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { requestJson, requestPublic, setToken } from './api/client';
-import { asApiError } from './api/errors';
-import { fetchStatus, loadModel, pullModel } from './api/models';
-import type { AuthResponse, ConfigResponse } from './api/types';
-import { Gate } from './auth/Gate';
-import { consumeFragmentToken, rememberToken, storedToken } from './auth/token';
-import { branchPosition, editAndResend, retry, send, stopTurn, switchBranch } from './chat/turn';
-import { deleteConfirmationTitle, deletionImpact, subtree } from './chat/MessageTree';
-import { formatBytes } from './lib/format';
-import { probeMathMLSupport } from './markdown/math';
-import { LifecycleBand } from './readiness/LifecycleBand';
+import { requestJson, requestPublic, setToken } from '@/api/client';
+import { asApiError } from '@/api/errors';
+import { fetchStatus, loadModel, pullModel } from '@/api/models';
+import type { AuthResponse, ConfigResponse } from '@/api/types';
+import { Gate } from '@/components/common/Gate';
+import { consumeFragmentToken, rememberToken, storedToken } from '@/auth/token';
+import { branchPosition, editAndResend, retry, send, stopTurn, switchBranch } from '@/chat/turn';
+import { deleteConfirmationTitle, deletionImpact, subtree } from '@/chat/MessageTree';
+import { formatBytes } from '@/lib/format';
+import { probeMathMLSupport } from '@/markdown/math';
+import { LifecycleBand } from '@/components/models/LifecycleBand';
 import {
   composerPlaceholder,
   emptyStateHint,
@@ -20,18 +20,20 @@ import {
   sendTooltip,
   type CacheState,
   type ReadinessAction,
-} from './readiness/ModelReadiness';
-import { useActiveConversation, useActivePath, useStore } from './state/store';
-import { Composer } from './ui/Composer';
-import { ConfirmDialog } from './ui/ConfirmDialog';
-import { ChatBar } from './ui/ChatBar';
-import { ModelButton } from './ui/ModelButton';
-import { Sidebar, SidebarDrawer, useWideLayout } from './ui/Sidebar';
-import { LiveRegion, MessageRow, Transcript } from './ui/MessageRow';
-import { ModelSheet } from './ui/ModelSheet';
-import { NoticeStack } from './ui/Notice';
-import { noticeFor } from './ui/notices';
-import { SettingsSheet } from './ui/SettingsSheet';
+} from '@/readiness/ModelReadiness';
+import { useActiveConversation, useActivePath, useStore } from '@/state/store';
+import { Composer } from '@/components/chat/Composer';
+import { ConfirmDialog } from '@/components/common/ConfirmDialog';
+import { ChatBar } from '@/components/chat/ChatBar';
+import { ModelButton } from '@/components/models/ModelButton';
+import { Sidebar, SidebarDrawer, useWideLayout } from '@/components/conversations/Sidebar';
+import { SearchPalette, useSearchShortcut } from '@/components/conversations/SearchPalette';
+import { MessageRow } from '@/components/chat/MessageRow';
+import { LiveRegion, Transcript } from '@/components/chat/Transcript';
+import { ModelSheet } from '@/components/models/ModelSheet';
+import { NoticeStack } from '@/components/common/Notice';
+import { noticeFor } from '@/state/notices';
+import { SettingsSheet } from '@/components/common/SettingsSheet';
 
 type Phase = { kind: 'booting' } | { kind: 'gate'; initial: string } | { kind: 'ready' };
 
@@ -88,7 +90,7 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase.kind]);
 
-  if (phase.kind === 'booting') return <div className="bg-canvas h-dvh" />;
+  if (phase.kind === 'booting') return <div className="bg-background h-dvh" />;
 
   if (phase.kind === 'gate') {
     return (
@@ -130,6 +132,7 @@ function Chat() {
   const [sheet, setSheet] = useState<'none' | 'models' | 'settings'>('none');
   const wide = useWideLayout();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{
     id: string;
@@ -223,6 +226,8 @@ function Chat() {
   }, []);
 
   const newChat = useCallback(() => useStore.getState().createConversation(), []);
+  const openSearch = useCallback(() => setSearchOpen(true), []);
+  useSearchShortcut(openSearch);
 
   // One instance, handed to whichever shell is on screen. Building it here
   // rather than twice keeps the two paths from drifting.
@@ -242,6 +247,7 @@ function Chat() {
           header={modelSelector}
           onNewChat={newChat}
           onOpenSettings={() => setSheet('settings')}
+          onSearch={openSearch}
           collapsed={railCollapsed}
           onToggleCollapsed={() => setRailCollapsed((value) => !value)}
         />
@@ -252,6 +258,7 @@ function Chat() {
           header={modelSelector}
           onNewChat={newChat}
           onOpenSettings={() => setSheet('settings')}
+          onSearch={openSearch}
         />
       )}
 
@@ -310,6 +317,8 @@ function Chat() {
         <LiveRegion message={headline(readiness)} />
       </div>
 
+      <SearchPalette open={searchOpen} onOpenChange={setSearchOpen} onNewChat={newChat} />
+
       <ModelSheet open={sheet === 'models'} onClose={() => setSheet('none')} />
       <SettingsSheet
         open={sheet === 'settings'}
@@ -344,10 +353,10 @@ function EmptyState({ readiness }: { readiness: Parameters<typeof emptyStateSubt
   return (
     // pb-[6%] centres optically: a text block on the exact midpoint reads as
     // sitting slightly low.
-    <div className="flex flex-1 flex-col items-center justify-center gap-1.5 pb-[6%] text-center">
-      <h1 className="font-display m-0 text-[34px] font-semibold tracking-[-0.022em]">Ask anything</h1>
-      <p className="text-muted m-0 text-sm">{emptyStateSubtitle(readiness)}</p>
-      {hint ? <p className="text-faint m-0 max-w-[34ch] text-[12.5px]">{hint}</p> : null}
+    <div className="flex flex-1 flex-col items-center justify-center gap-2 pb-[6%] text-center">
+      <h1 className="m-0 text-3xl font-semibold tracking-tight">Ask anything</h1>
+      <p className="text-muted-foreground m-0 text-sm">{emptyStateSubtitle(readiness)}</p>
+      {hint ? <p className="text-muted-foreground m-0 max-w-[34ch] text-xs">{hint}</p> : null}
     </div>
   );
 }

@@ -119,6 +119,10 @@ gsm8k_*.json
 *.jinja
 !vllm_mlx/templates/*.jinja
 
+# `lib/` above is a Python packaging pattern but matches at any depth, which
+# silently swallows the frontend's source directory of the same name.
+!apps/rapid-web/frontend/src/lib/
+
 # Node — only apps/rapid-web/frontend/ has a package.json, but a stray npx or
 # a tool run from the wrong directory creates node_modules elsewhere, so the
 # bare pattern matches at any depth.

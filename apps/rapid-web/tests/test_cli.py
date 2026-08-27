@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the CLI: login URL, QR rendering, and the startup banner."""
+"""Tests for the CLI: login URL, the startup banner, and argument handling."""
 
 from __future__ import annotations
-
-import sys
 
 import pytest
 
@@ -39,43 +37,6 @@ class TestLoginURL:
         assert unquote(url.split("#token=")[1]) == token
 
 
-class TestQRRendering:
-    def test_returns_none_when_segno_is_missing(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, "segno", None)
-        # ``None`` in sys.modules makes ``import segno`` raise
-        # ImportError, which is the case a user without the extra hits.
-        assert cli._render_qr("http://example.invalid/") is None
-
-    def test_a_rendering_failure_does_not_propagate(self, monkeypatch):
-        class _Broken:
-            @staticmethod
-            def make(*args, **kwargs):
-                raise RuntimeError("encoder exploded")
-
-        monkeypatch.setitem(sys.modules, "segno", _Broken)
-        # A QR is decoration. It must never stop the server starting.
-        assert cli._render_qr("http://example.invalid/") is None
-
-    def test_renders_when_segno_is_available(self, monkeypatch):
-        class _Fake:
-            @staticmethod
-            def make(content, error=None):
-                class _QR:
-                    @staticmethod
-                    def terminal(out, border=None):
-                        out.write(f"QR({content}, border={border})")
-
-                return _QR()
-
-        monkeypatch.setitem(sys.modules, "segno", _Fake)
-        rendered = cli._render_qr("http://example.invalid/#token=x")
-
-        assert "http://example.invalid/#token=x" in rendered
-        # border=1 rather than the spec's 4: a terminal QR still scans
-        # with a thinner quiet zone, and 4 blank rows above and below
-        # pushes the banner off a short window.
-        assert "border=1" in rendered
-
 
 class TestBanner:
     def test_prints_the_url_and_token(self, capsys):
@@ -85,26 +46,26 @@ class TestBanner:
         assert "http://127.0.0.1:7788/" in out
         assert "tok" in out
 
-    def test_falls_back_to_a_text_link_without_segno(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: None)
+    def test_prints_the_sign_in_link(self, capsys):
+        # The link carries the token in its fragment, so pasting it is what
+        # saves retyping 43 characters.
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
         out = capsys.readouterr().out
 
         assert "#token=tok" in out
-        # Tell the user the QR is available, but do not make it sound
-        # required.
-        assert "rmlx-web[qr]" in out
 
-    def test_shows_the_qr_when_available(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: "##QR##")
+    def test_prints_no_qr_code(self, capsys):
+        # A 25-row block of blocks pushed the token off a short terminal
+        # window, which is the one thing the user cannot proceed without.
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
         out = capsys.readouterr().out
 
-        assert "##QR##" in out
-        assert "Scan" in out
+        assert "Scan" not in out
+        assert "qr" not in out.lower()
+        # Whatever else changes, the banner stays short enough to read.
+        assert len(out.splitlines()) < 15
 
     def test_warns_on_a_non_loopback_bind(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: None)
         monkeypatch.setattr(cli, "_display_host", lambda host: "192.168.1.5")
         cli._print_banner(host="0.0.0.0", port=7788, token="tok", loopback=False)
         out = capsys.readouterr().out
@@ -113,7 +74,6 @@ class TestBanner:
         assert "token is the only thing protecting it" in out
 
     def test_no_warning_on_loopback(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: None)
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
         assert "WARNING" not in capsys.readouterr().out
 
@@ -186,7 +146,6 @@ class TestTokenDecision:
 
 class TestBannerWithoutToken:
     def test_says_auth_is_off_rather_than_printing_a_token(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: None)
         cli._print_banner(host="127.0.0.1", port=7788, token=None, loopback=True)
         out = capsys.readouterr().out
 
@@ -197,11 +156,64 @@ class TestBannerWithoutToken:
         assert cli._login_url("127.0.0.1", 7788, None) == "http://127.0.0.1:7788/"
         assert "#" not in cli._login_url("127.0.0.1", 7788, None)
 
-    def test_the_qr_still_encodes_the_plain_url(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_render_qr", lambda url: "##QR##")
+    def test_does_not_repeat_the_url_without_a_token(self, capsys):
+        # With no token the sign-in link is just the URL already printed
+        # above it, so repeating it says nothing.
         cli._print_banner(host="127.0.0.1", port=7788, token=None, loopback=True)
         out = capsys.readouterr().out
 
-        # Still worth showing: it saves typing an IP and port on a phone.
-        assert "##QR##" in out
-        assert "Scan to open:" in out
+        assert out.count("http://127.0.0.1:7788/") == 1
+        assert "Scan" not in out
+
+
+class TestOptionalModelArgument:
+    """The model alias is optional; the page's picker is the other way in.
+
+    This used to be a hard `SystemExit`, so the tests below are the thing
+    stopping it from being reintroduced as an "obviously required"
+    argument.
+    """
+
+    def _args(self, argv: list[str]):
+        return cli.build_parser().parse_args(argv)
+
+    def test_starting_with_no_model_is_allowed(self, monkeypatch):
+        monkeypatch.setattr(cli, "find_rapid_mlx_binary", lambda explicit: "/bin/true")
+
+        engine, catalog, downloads = cli._resolve_engine(
+            self._args([]), downloads_enabled=True
+        )
+
+        # A supervisor, not an attached engine — it owns the child it will
+        # later spawn, which is what makes the picker able to switch.
+        assert engine.can_switch is True
+        assert engine.status().model is None
+        # The catalog is what the picker lists, so it must exist even
+        # though nothing is loaded yet.
+        assert catalog is not None
+        assert downloads is not None
+
+    def test_an_alias_is_still_honoured(self, monkeypatch):
+        monkeypatch.setattr(cli, "find_rapid_mlx_binary", lambda explicit: "/bin/true")
+
+        engine, catalog, _ = cli._resolve_engine(
+            self._args(["some-alias"]), downloads_enabled=False
+        )
+
+        assert engine.can_switch is True
+        assert catalog is not None
+
+    def test_attach_still_refuses_a_model(self):
+        # --attach targets a server this process does not own, so the
+        # model is not ours to choose.
+        with pytest.raises(SystemExit):
+            cli._resolve_engine(
+                self._args(["--attach", "http://x", "alias"]),
+                downloads_enabled=False,
+            )
+
+    def test_the_help_text_does_not_name_a_specific_model(self):
+        # A concrete alias in the help reads as a default and goes stale
+        # as the catalog moves.
+        help_text = cli.build_parser().format_help()
+        assert "qwen" not in help_text.lower()

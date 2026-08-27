@@ -1,4 +1,4 @@
-import { activePath, subtree } from '../chat/MessageTree';
+import { activePath, subtree } from '@/chat/MessageTree';
 import { HISTORY_KEY } from './migrate';
 import type { Conversation, MessageNode, PersistedStore } from './types';
 

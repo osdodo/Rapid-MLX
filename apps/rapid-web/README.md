@@ -14,12 +14,8 @@ Status: **M5** — the page is a React application (`frontend/`); see
 
 ```sh
 pip install rapid-mlx                 # the engine, if you do not have it
-pip install -e 'apps/rapid-web[qr]'   # this package
+pip install -e apps/rapid-web         # this package
 ```
-
-The `[qr]` extra prints a scannable QR code at startup so you do not have to
-type a 43-character token on a phone. Plain `pip install -e apps/rapid-web`
-works too; it prints the same link as text.
 
 If you installed this before the rename, run `pip uninstall rapid-mlx-web`
 first. The distribution is now `rmlx-web` and the command is `rmlx-web`
@@ -31,7 +27,7 @@ unaffected — the browser's storage keys deliberately did not change.
 ## Use
 
 ```sh
-rmlx-web qwen3.5-4b-4bit
+rmlx-web
 ```
 
 It prints a URL and an access token:
@@ -42,6 +38,17 @@ It prints a URL and an access token:
   Token: 1A_h7Z7Z-x1cARbeh4yGthsVl4x2SMRo0cWCcxIWDLw
 ```
 
+No model is loaded at startup — open the page and pick one, and the engine
+starts on it. Naming an alias is an optional shortcut for skipping that first
+pick:
+
+```sh
+rmlx-web <alias>
+```
+
+Either way the model can be changed from the page afterwards, so the argument
+only decides what is already loading while you walk over to your phone.
+
 On a loopback bind there is **no token** — open the URL and start typing. The
 OS already guarantees the caller is a process on this Mac, so a token there
 would only mean copying a 43-character string to reach your own machine.
@@ -49,8 +56,8 @@ would only mean copying a 43-character string to reach your own machine.
 Bind to anything else (`--host 0.0.0.0`, or any tunnel) and a token becomes
 mandatory. It travels in the URL **fragment**, which browsers never send to a
 server, so it cannot end up in an access log or a tunnel provider's request
-history; the page stores it and strips it from the address bar. Scan the QR
-code and you are signed in, or paste the token by hand.
+history; the page stores it and strips it from the address bar. Open the
+printed sign-in link and you are signed in, or paste the token by hand.
 
 You can force a token on loopback too — `--token` or `--new-token` — which is
 worth doing when screen-sharing.

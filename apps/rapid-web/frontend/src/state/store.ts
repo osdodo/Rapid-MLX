@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
-import type { DownloadJob, ModelEntry, StatusResponse } from '../api/types';
-import { activePath, choicesAlong, deepestLeaf } from '../chat/MessageTree';
-import { newId } from '../lib/ids';
+import type { DownloadJob, ModelEntry, StatusResponse } from '@/api/types';
+import { activePath, choicesAlong, deepestLeaf } from '@/chat/MessageTree';
+import { newId } from '@/lib/ids';
 import { HISTORY_BACKUP_KEY, HISTORY_KEY, deriveTitle, migrate } from './migrate';
 import { persist } from './persist';
 import {

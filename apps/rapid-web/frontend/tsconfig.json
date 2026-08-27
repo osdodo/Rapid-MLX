@@ -7,6 +7,9 @@
     "jsx": "react-jsx",
     "types": ["vite/client", "node"],
 
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] },
+
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noUnusedLocals": true,

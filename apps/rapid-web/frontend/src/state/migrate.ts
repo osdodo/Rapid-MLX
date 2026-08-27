@@ -1,5 +1,5 @@
-import { deduplicateById, promoteOrphans, repairLegacyChain } from '../chat/MessageTree';
-import { newId } from '../lib/ids';
+import { deduplicateById, promoteOrphans, repairLegacyChain } from '@/chat/MessageTree';
+import { newId } from '@/lib/ids';
 import {
   SCHEMA_VERSION,
   type Conversation,

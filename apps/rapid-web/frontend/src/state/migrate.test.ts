@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { activePath } from '../chat/MessageTree';
+import { activePath } from '@/chat/MessageTree';
 import { SCHEMA_VERSION } from './types';
 import { detect, deriveTitle, migrate, v1ToV2, v2ToV3 } from './migrate';
 

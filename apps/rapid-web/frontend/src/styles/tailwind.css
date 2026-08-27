@@ -1,47 +1,79 @@
 @import 'tailwindcss';
+@import 'tw-animate-css';
 
-/* tokens.css owns the light/dark switch via data-theme. */
-@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+/*
+  `dark:` must track BOTH ways the palette flips (tokens.css): the explicit
+  attribute, and the OS preference when the user has not chosen. shadcn's
+  component source uses `dark:` utilities, so a variant covering only the
+  attribute would leave them stuck on light values under a dark OS.
+*/
+@custom-variant dark {
+  &:where([data-theme='dark'], [data-theme='dark'] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme]), :root:not([data-theme]) *) {
+      @slot;
+    }
+  }
+}
 
-/* `inline` so utilities reference var(--brand) directly rather than copying
-   its value — otherwise the theme switch would not move them. */
+/* `inline` so utilities reference var(--background) directly rather than
+   copying its value — otherwise the theme switch would not move them. */
 @theme inline {
-  --color-brand: var(--brand);
-  --color-brand-hi: var(--brand-hi);
-  --color-brand-tint: var(--brand-tint);
-  --color-amber: var(--amber);
-  --color-amber-deep: var(--amber-deep);
-  --color-amber-tint: var(--amber-tint);
-  --color-green: var(--green);
-  --color-danger: var(--danger);
-
-  --color-canvas: var(--canvas);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
   --color-card: var(--card);
-  --color-fg: var(--fg);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
-  --color-faint: var(--faint);
-  --color-line: var(--line);
-  --color-line-soft: var(--line-soft);
-  --color-on-brand: var(--on-brand);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
 
-  --color-band: var(--band);
-  --color-band-ink: var(--band-ink);
-  --color-band-ink-2: var(--band-ink-2);
-  --color-band-track: var(--band-track);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
 
-  --radius-sm: var(--r-sm);
-  --radius-md: var(--r-md);
-  --radius-lg: var(--r-lg);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
 
-  --shadow-sm: var(--shadow-sm);
-  --shadow-md: var(--shadow-md);
-  --shadow-lg: var(--shadow-lg);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
 
-  --font-display: var(--font-display);
-  --font-body: var(--font-body);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
+}
 
-  --ease-brand: var(--ease);
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
 }
 
 /* Restored after preflight, which would otherwise undo them. */
@@ -58,86 +90,15 @@ button:not(:disabled) {
   cursor: pointer;
 }
 
-:focus {
-  outline: none;
-}
-
-:focus-visible {
-  outline: 2px solid var(--amber);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-
-@keyframes notice-drop {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
-}
-
-@keyframes sheet-rise {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-}
-
-@keyframes dialog-pop {
-  from {
-    opacity: 0;
-    transform: scale(0.96);
-  }
-}
-
-@keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-}
-
 @keyframes status-pulse {
   0%,
   100% {
     opacity: 1;
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent);
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--warning) 45%, transparent);
   }
   50% {
     opacity: 0.65;
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--amber) 0%, transparent);
-  }
-}
-
-@keyframes drawer-slide {
-  from {
-    opacity: 0;
-    transform: translateX(-12px);
-  }
-}
-
-@keyframes band-flash {
-  0%,
-  100% {
-    transform: none;
-  }
-  25% {
-    transform: translateX(-3px);
-  }
-  55% {
-    transform: translateX(2px);
-  }
-}
-
-@keyframes row-rise {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-}
-
-@keyframes jump-pop {
-  from {
-    opacity: 0;
-    transform: translateX(-50%) scale(0.9);
+    box-shadow: 0 0 0 5px color-mix(in oklab, var(--warning) 0%, transparent);
   }
 }
 
@@ -216,22 +177,22 @@ button:not(:disabled) {
   .md-quote {
     margin: 0 0 0.85em;
     padding: 0.1em 0 0.1em 0.9em;
-    border-left: 3px solid color-mix(in srgb, var(--brand) 45%, var(--line));
-    color: var(--muted);
+    border-left: 3px solid var(--border);
+    color: var(--muted-foreground);
   }
 
   .md-rule {
     margin: 1.2em 0;
     border: none;
-    border-top: 1px solid var(--line);
+    border-top: 1px solid var(--border);
   }
 
   .md-code-wrap {
     margin: 0 0 0.85em;
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-md);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 2px);
     overflow: hidden;
-    background: color-mix(in srgb, var(--fg) 3.5%, var(--card));
+    background: var(--muted);
   }
 
   .md-pre {
@@ -252,7 +213,7 @@ button:not(:disabled) {
     font-size: 0.88em;
     padding: 0.12em 0.34em;
     border-radius: 4px;
-    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    background: var(--muted);
     /* A long identifier would otherwise force the bubble wider than the
        screen. */
     overflow-wrap: anywhere;
@@ -293,35 +254,35 @@ button:not(:disabled) {
     color: var(--code-builtin);
   }
   .md-pre .hljs-deletion {
-    color: var(--danger);
+    color: var(--destructive);
   }
   .md-pre .hljs-addition {
-    color: var(--green);
+    color: var(--success);
   }
 
   .md-table-wrap {
     margin: 0 0 0.85em;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
-    border: 1px solid var(--line-soft);
-    border-radius: var(--r-md);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 2px);
   }
   .md-table {
     border-collapse: collapse;
     width: 100%;
-    font-family: var(--font-body);
+    font-family: var(--font-sans);
     font-size: 14px;
   }
   .md-table th,
   .md-table td {
     padding: 7px 11px;
-    border-bottom: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--border);
     text-align: left;
     white-space: nowrap;
   }
   .md-table th {
     font-weight: 600;
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
+    background: var(--muted);
   }
   .md-table tr:last-child td {
     border-bottom: none;
@@ -332,12 +293,12 @@ button:not(:disabled) {
   .md-dead-link {
     text-decoration: underline dotted;
     text-underline-offset: 2px;
-    color: var(--muted);
+    color: var(--muted-foreground);
     cursor: text;
   }
 
   /* MathML inherits the surrounding size, which is slightly large on the
-     serif prose face. */
+     prose face. */
   .md-math-inline {
     font-size: 1.02em;
   }

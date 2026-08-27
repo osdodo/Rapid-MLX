@@ -1,4 +1,4 @@
-import { setToken } from '../api/client';
+import { setToken } from '@/api/client';
 
 /**
  * Token acquisition.
