@@ -511,7 +511,9 @@ def parse_ddg_html(page: str, cap: int) -> list[dict]:
             {
                 "title": _strip_tags(title),
                 "url": url,
-                "snippet": _strip_tags(snippets[index]) if index < len(snippets) else "",
+                "snippet": _strip_tags(snippets[index])
+                if index < len(snippets)
+                else "",
             }
         )
     return results
@@ -541,8 +543,8 @@ def format_search_output(query: str, results: list[dict]) -> str:
             snippet = snippet[:WEB_SEARCH_SNIPPET_CHARS] + "…"
         title = result["title"] or result["url"]
         bullets.append(f"{index}. {title}\n   {result['url']}\n   {snippet}")
-    content = (
-        f'Web search: "{query}" — {len(results)} results\n\n' + "\n\n".join(bullets)
+    content = f'Web search: "{query}" — {len(results)} results\n\n' + "\n\n".join(
+        bullets
     )
     if len(content) > WEB_SEARCH_TOTAL_CHARS:
         content = content[:WEB_SEARCH_TOTAL_CHARS] + "\n…(truncated)"
@@ -650,7 +652,9 @@ def parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address
         return None
 
 
-async def resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+async def resolve_host(
+    host: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Every A/AAAA address for ``host``. Bounded: a stalled resolver would
     otherwise pin the tool call for the OS timeout (~30 s)."""
     loop = asyncio.get_running_loop()
@@ -711,7 +715,9 @@ def origin_of(url: str) -> str:
     return f"{scheme}://{host}:{port}"
 
 
-_SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_SCRIPT_STYLE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
 _BLOCK_END = re.compile(r"</(p|div|h[1-6]|li|tr|section|article|br)\s*>", re.IGNORECASE)
 _BLANK_LINES = re.compile(r"\n{3,}")
 
@@ -746,7 +752,9 @@ async def _fetch_capped(client: httpx.AsyncClient, url: str) -> tuple[bytes, str
         if response.status_code >= 300 and response.status_code < 400:
             return b"", response.headers.get("location", "")
         if response.status_code >= 400:
-            raise ToolError(f"HTTP {response.status_code} from {urlparse(url).hostname}")
+            raise ToolError(
+                f"HTTP {response.status_code} from {urlparse(url).hostname}"
+            )
         chunks = bytearray()
         async for chunk in response.aiter_bytes():
             chunks.extend(chunk)

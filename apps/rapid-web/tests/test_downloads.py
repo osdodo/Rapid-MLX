@@ -259,5 +259,3 @@ class TestCancellation:
         # cache with nothing watching it, and the user has no way to stop
         # it short of hunting down the PID.
         assert job.state is DownloadState.CANCELLED
-
-

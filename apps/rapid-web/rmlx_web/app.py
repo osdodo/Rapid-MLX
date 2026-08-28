@@ -987,9 +987,7 @@ def create_app(config: WebConfig) -> FastAPI:
         body = _decode_json_body(upstream)
         return body if isinstance(body, dict) else None
 
-    def _connector_snapshot(
-        servers_body: dict | None, tools_body: dict | None
-    ) -> dict:
+    def _connector_snapshot(servers_body: dict | None, tools_body: dict | None) -> dict:
         """The whole panel's state, composed from config plus engine truth.
 
         One response rather than three: every field the panel renders is
@@ -1156,9 +1154,7 @@ def create_app(config: WebConfig) -> FastAPI:
         name = payload.get("name")
         enabled = payload.get("enabled")
         if not isinstance(name, str) or not isinstance(enabled, bool):
-            return _json_error(
-                400, "`name` and `enabled` are required", "invalid_body"
-            )
+            return _json_error(400, "`name` and `enabled` are required", "invalid_body")
 
         try:
             config.connectors.set_server_enabled(name, enabled)
@@ -1235,13 +1231,9 @@ def create_app(config: WebConfig) -> FastAPI:
 
         store = config.connectors
         if not store.is_enabled:
-            return _json_error(
-                409, "connectors are turned off", "connectors_disabled"
-            )
+            return _json_error(409, "connectors are turned off", "connectors_disabled")
         if name in store.disabled_tools:
-            return _json_error(
-                409, f"tool '{name}' is turned off", "tool_disabled"
-            )
+            return _json_error(409, f"tool '{name}' is turned off", "tool_disabled")
 
         engine = config.engine
         base_url = engine.base_url

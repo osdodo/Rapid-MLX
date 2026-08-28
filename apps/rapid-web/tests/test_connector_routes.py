@@ -114,8 +114,11 @@ class TestSnapshot:
             ],
         )
         with build(store) as client:
-            client.post("/api/connectors/servers", headers={**AUTH, **JSON_CT},
-                        json=stdio_payload())
+            client.post(
+                "/api/connectors/servers",
+                headers={**AUTH, **JSON_CT},
+                json=stdio_payload(),
+            )
             body = client.get("/api/connectors", headers=AUTH).json()
 
         assert body["engine_servers"][0]["state"] == "connected"
@@ -225,12 +228,21 @@ class TestWrites:
     def test_a_reconfiguration_revokes_that_servers_grants(self, store, monkeypatch):
         fake_engine_mcp(monkeypatch)
         with build(store) as client:
-            client.post("/api/connectors/servers", headers={**AUTH, **JSON_CT},
-                        json=stdio_payload())
-            client.post("/api/connectors/settings", headers={**AUTH, **JSON_CT},
-                        json={"tool": "fs__read", "grant": True})
-            client.post("/api/connectors/settings", headers={**AUTH, **JSON_CT},
-                        json={"tool": "time__now", "grant": True})
+            client.post(
+                "/api/connectors/servers",
+                headers={**AUTH, **JSON_CT},
+                json=stdio_payload(),
+            )
+            client.post(
+                "/api/connectors/settings",
+                headers={**AUTH, **JSON_CT},
+                json={"tool": "fs__read", "grant": True},
+            )
+            client.post(
+                "/api/connectors/settings",
+                headers={**AUTH, **JSON_CT},
+                json={"tool": "time__now", "grant": True},
+            )
 
             body = client.post(
                 "/api/connectors/servers",
@@ -245,10 +257,16 @@ class TestWrites:
     def test_removing_a_connector_revokes_its_grants(self, store, monkeypatch):
         fake_engine_mcp(monkeypatch)
         with build(store) as client:
-            client.post("/api/connectors/servers", headers={**AUTH, **JSON_CT},
-                        json=stdio_payload())
-            client.post("/api/connectors/settings", headers={**AUTH, **JSON_CT},
-                        json={"tool": "fs__read", "grant": True})
+            client.post(
+                "/api/connectors/servers",
+                headers={**AUTH, **JSON_CT},
+                json=stdio_payload(),
+            )
+            client.post(
+                "/api/connectors/settings",
+                headers={**AUTH, **JSON_CT},
+                json={"tool": "fs__read", "grant": True},
+            )
 
             body = client.post(
                 "/api/connectors/servers/remove",

@@ -168,7 +168,9 @@ class TestSupervisorLifecycle:
         assert engine.status().state is ChildState.FAILED
 
     @pytest.mark.asyncio
-    async def test_the_engines_own_error_line_becomes_the_detail(self):        # `start` runs as a detached task, so the exception is swallowed by
+    async def test_the_engines_own_error_line_becomes_the_detail(
+        self,
+    ):  # `start` runs as a detached task, so the exception is swallowed by
         # the caller and `/api/status` is the only thing the page sees. A
         # null detail there leaves it with nothing to show but "unknown
         # error" — while the child printed exactly what to do.
@@ -469,9 +471,7 @@ class TestResidencyLoad:
         assert engine.status().resident == ["chat-model"]
 
     @pytest.mark.asyncio
-    async def test_an_older_engine_without_the_route_is_unsupported(
-        self, monkeypatch
-    ):
+    async def test_an_older_engine_without_the_route_is_unsupported(self, monkeypatch):
         # The ordinary path on an older install, not a failure to report.
         async def fake_post(self, url, **kwargs):
             return httpx.Response(404, json={}, request=httpx.Request("POST", url))
@@ -497,9 +497,7 @@ class TestResidencyLoad:
         assert outcome is supervisor.ResidencyOutcome.UNSUPPORTED
 
     @pytest.mark.asyncio
-    async def test_a_respawn_forgets_everything_that_was_resident(
-        self, monkeypatch
-    ):
+    async def test_a_respawn_forgets_everything_that_was_resident(self, monkeypatch):
         # A new process holds only what it was spawned for. Carrying the old
         # list over would tell the page a model is ready that is not loaded.
         async def fake_exec(*argv, **kwargs):

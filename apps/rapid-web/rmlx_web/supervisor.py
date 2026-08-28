@@ -51,6 +51,7 @@ def resident_memory_ceiling_gb() -> int:
         return 4
     return max(4, int(total / 1024**3 * 0.80))
 
+
 # The child is doing GPU work; polling tightly buys nothing.
 _READY_POLL_INTERVAL_S = 1.0
 

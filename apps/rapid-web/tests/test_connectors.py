@@ -22,9 +22,7 @@ def store(tmp_path):
 
 
 def stdio(name="fs", command="npx", args=None, **kwargs):
-    return ServerConfig(
-        name=name, command=command, args=list(args or []), **kwargs
-    )
+    return ServerConfig(name=name, command=command, args=list(args or []), **kwargs)
 
 
 class TestNameValidation:
@@ -89,9 +87,7 @@ class TestFileRoundTrip:
 
     def test_the_historical_servers_key_is_still_read(self):
         # A config written against an older guide must not read as empty.
-        parsed = connectors.decode_servers(
-            {"servers": {"fs": {"command": "npx"}}}
-        )
+        parsed = connectors.decode_servers({"servers": {"fs": {"command": "npx"}}})
         assert [s.name for s in parsed] == ["fs"]
 
     def test_an_existing_servers_key_is_not_migrated(self, tmp_path):
@@ -351,7 +347,9 @@ class TestPayloadParsing:
         # These reach a file the engine spawns from; a number in argv would
         # be written verbatim and fail much further away.
         with pytest.raises(ConnectorError, match="array of strings"):
-            connectors.server_from_payload({"name": "fs", "command": "npx", "args": [1]})
+            connectors.server_from_payload(
+                {"name": "fs", "command": "npx", "args": [1]}
+            )
 
     def test_an_invalid_entry_is_refused_at_the_boundary(self):
         with pytest.raises(ConnectorError, match="command to run"):

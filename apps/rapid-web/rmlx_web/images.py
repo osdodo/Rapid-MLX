@@ -100,7 +100,12 @@ class ImageJobManager:
             try:
                 status, body = await work()
             except httpx.HTTPError as exc:
-                _fail(job, 502, "engine_transport", f"connection to the engine failed: {exc}")
+                _fail(
+                    job,
+                    502,
+                    "engine_transport",
+                    f"connection to the engine failed: {exc}",
+                )
                 return
             except Exception as exc:  # noqa: BLE001
                 # Nothing awaits this task, so an escaping exception would

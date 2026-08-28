@@ -25,7 +25,9 @@ class TestNormalizeArguments:
         assert tools.normalize_arguments("[1, 2]", tools.WEATHER_DEFINITION) is None
 
     def test_rejects_malformed_json(self):
-        assert tools.normalize_arguments('{"location":', tools.WEATHER_DEFINITION) is None
+        assert (
+            tools.normalize_arguments('{"location":', tools.WEATHER_DEFINITION) is None
+        )
 
 
 class TestDispatchGate:
@@ -90,7 +92,9 @@ class TestSSRFGuard:
     def test_allows_public_v4(self, address):
         assert not tools.is_blocked_address(ipaddress.ip_address(address))
 
-    @pytest.mark.parametrize("address", ["::1", "fc00::1", "fd00::1", "fe80::1", "ff02::1"])
+    @pytest.mark.parametrize(
+        "address", ["::1", "fc00::1", "fd00::1", "fe80::1", "ff02::1"]
+    )
     def test_blocks_private_v6(self, address):
         assert tools.is_blocked_address(ipaddress.ip_address(address))
 
@@ -141,7 +145,9 @@ class TestOrigin:
         )
 
     def test_a_host_change_is_not(self):
-        assert tools.origin_of("https://a.example/") != tools.origin_of("https://b.example/")
+        assert tools.origin_of("https://a.example/") != tools.origin_of(
+            "https://b.example/"
+        )
 
 
 class TestBrowseApproval:
@@ -202,7 +208,9 @@ class TestGeocodingSelection:
         # "Xian" folds onto a tiny Spanish hamlet; answering with its weather
         # would be worse than saying the name was ambiguous.
         assert (
-            tools.select_geocoding_hit("Xian", [], [{"name": "Xián", "population": 300}])
+            tools.select_geocoding_hit(
+                "Xian", [], [{"name": "Xián", "population": 300}]
+            )
             is None
         )
 
@@ -237,7 +245,9 @@ class TestSearchParsing:
         # and the model would surface one for the user to click.
         assert tools.ddg_redirect_extract("/l/?uddg=javascript%3Aalert(1)") is None
 
-    @pytest.mark.parametrize("raw", ["javascript:alert(1)", "data:text/html,x", "file:///x"])
+    @pytest.mark.parametrize(
+        "raw", ["javascript:alert(1)", "data:text/html,x", "file:///x"]
+    )
     def test_rejects_unsafe_schemes(self, raw):
         assert not tools.is_safe_http_url(raw)
 
@@ -323,7 +333,7 @@ class TestDefinitions:
     def test_only_browse_requires_approval(self):
         # weather and web_search read public data with no destination the
         # model chose; browse fetches a URL the model picked.
-        assert tools.APPROVAL_REQUIRED == frozenset({"browse"})
+        assert set(tools.APPROVAL_REQUIRED) == {"browse"}
 
     def test_filters_to_the_enabled_subset(self):
         names = [d["function"]["name"] for d in tools.definitions_for({"weather"})]

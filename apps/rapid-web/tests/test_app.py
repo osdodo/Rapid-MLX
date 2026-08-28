@@ -62,7 +62,9 @@ class FakeEngine:
             resident=list(self.resident),
         )
 
-    async def residency_load(self, model, *, modality, size_bytes=None, image_mode=None):
+    async def residency_load(
+        self, model, *, modality, size_bytes=None, image_mode=None
+    ):
         self.hot_loaded.append((model, modality, size_bytes, image_mode))
         if self.residency_outcome is ResidencyOutcome.LOADED:
             self.resident.append(model)
@@ -711,7 +713,9 @@ class TestImageJobs:
 
         with build_client() as client:
             job_id = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             ).json()["id"]
 
             body = client.get(f"/api/images/jobs/{job_id}", headers=AUTH).json()
@@ -727,7 +731,12 @@ class TestImageJobs:
         async def fake_post(self, url, **kwargs):
             return httpx.Response(
                 409,
-                json={"error": {"message": "no image model", "type": "image_model_not_loaded"}},
+                json={
+                    "error": {
+                        "message": "no image model",
+                        "type": "image_model_not_loaded",
+                    }
+                },
                 request=httpx.Request("POST", url),
             )
 
@@ -735,7 +744,9 @@ class TestImageJobs:
 
         with build_client() as client:
             started = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             )
             # The start succeeded; the render is what failed.
             assert started.status_code == 200
@@ -753,7 +764,9 @@ class TestImageJobs:
 
         with build_client() as client:
             started = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             )
             body = _await_job(client, started.json()["id"])
 
@@ -781,10 +794,14 @@ class TestImageJobs:
 
         with build_client() as client:
             first = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             )
             second = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a dog"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a dog"},
             )
             assert second.status_code == 409
             assert second.json()["error"]["type"] == "image_busy"
@@ -813,7 +830,9 @@ class TestImageJobs:
         engine = FakeEngine()
         with build_client(engine) as client:
             job_id = client.post(
-                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             ).json()["id"]
 
             blocked = client.post(
@@ -833,7 +852,11 @@ class TestImageJobs:
             response = client.post(
                 "/api/images/jobs",
                 headers={**AUTH, **JSON_CT},
-                json={"mode": "edit", "image": base64.b64encode(b"x").decode(), "prompt": "  "},
+                json={
+                    "mode": "edit",
+                    "image": base64.b64encode(b"x").decode(),
+                    "prompt": "  ",
+                },
             )
         assert response.status_code == 400
         assert response.json()["error"]["type"] == "invalid_body"
@@ -843,7 +866,11 @@ class TestImageJobs:
             response = client.post(
                 "/api/images/jobs",
                 headers={**AUTH, **JSON_CT},
-                json={"mode": "edit", "image": "not base64!!", "prompt": "make it night"},
+                json={
+                    "mode": "edit",
+                    "image": "not base64!!",
+                    "prompt": "make it night",
+                },
             )
         assert response.status_code == 400
 
@@ -1099,7 +1126,9 @@ class TestAudio:
 
         async def fake_post(self, url, **kwargs):
             captured["files"] = kwargs.get("files")
-            return httpx.Response(200, json={"text": ""}, request=httpx.Request("POST", url))
+            return httpx.Response(
+                200, json={"text": ""}, request=httpx.Request("POST", url)
+            )
 
         monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 

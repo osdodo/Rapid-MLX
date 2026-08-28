@@ -493,9 +493,7 @@ class ConnectorStore:
     def _persist(self, servers: list[ServerConfig]) -> None:
         ordered = sorted(servers, key=lambda server: server.name.casefold())
         try:
-            _write_private(
-                self._config_path, encode_servers(ordered, self._document)
-            )
+            _write_private(self._config_path, encode_servers(ordered, self._document))
         except OSError as exc:
             raise ConnectorError(f"Couldn't save {self._config_path}: {exc}") from exc
         self._servers = ordered
@@ -554,9 +552,7 @@ class ConnectorStore:
             previous = stored.get(name)
             if isinstance(previous, str) and previous != fingerprint:
                 granted = {t for t in granted if not t.startswith(f"{name}__")}
-        self._write_settings(
-            {"fingerprints": current, "grantedTools": sorted(granted)}
-        )
+        self._write_settings({"fingerprints": current, "grantedTools": sorted(granted)})
 
     def _read_settings(self) -> dict:
         try:
@@ -568,11 +564,11 @@ class ConnectorStore:
     def _write_settings(self, patch: dict) -> None:
         merged = {**self._settings, **patch}
         try:
-            _write_private(self._settings_path, json.dumps(merged, indent=2, sort_keys=True))
+            _write_private(
+                self._settings_path, json.dumps(merged, indent=2, sort_keys=True)
+            )
         except OSError as exc:
-            raise ConnectorError(
-                f"Couldn't save {self._settings_path}: {exc}"
-            ) from exc
+            raise ConnectorError(f"Couldn't save {self._settings_path}: {exc}") from exc
         self._settings = merged
 
 

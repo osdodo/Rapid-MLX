@@ -76,6 +76,7 @@ _CACHED_SCAN_TTL_S = 5.0
 # so nothing here can manage or delete them.
 _PRESENT_STATES = frozenset({"ok", "unmapped"})
 
+
 # Which request shape an image alias accepts.
 #
 # ``models --json`` carries no capability field — only the human table does,
@@ -182,9 +183,7 @@ class ModelCatalog:
         # their own pair of subprocesses.
         self._lock = asyncio.Lock()
 
-    async def _run(
-        self, args: list[str], *, timeout: float
-    ) -> tuple[int, str, str]:
+    async def _run(self, args: list[str], *, timeout: float) -> tuple[int, str, str]:
         """Run the CLI to completion. Returns ``(code, stdout, stderr)``."""
         try:
             process = await asyncio.create_subprocess_exec(

@@ -38,7 +38,6 @@ class TestLoginURL:
         assert unquote(url.split("#token=")[1]) == token
 
 
-
 class TestBanner:
     def test_prints_the_url_and_token(self, capsys):
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
