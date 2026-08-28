@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model catalog, assembled from the ``rapid-mlx`` CLI.
 
-Two subprocess calls back this module:
+Three subprocess calls back this module:
 
 * ``rapid-mlx models --json`` — every alias the install knows about,
   bucketed by modality. Static for the life of an install.
 * ``rapid-mlx models --cached --json`` — what is actually on disk.
   Changes whenever a download lands or a model is removed.
+* ``rapid-mlx rm <org/repo> --yes`` — delete a snapshot from the cache.
 
-Both emit **only** the JSON payload on stdout (the CLI suppresses its
-staleness banner in JSON mode), which is what makes them parseable
-rather than scraped.
+The first two emit **only** the JSON payload on stdout (the CLI
+suppresses its staleness banner in JSON mode), which is what makes them
+parseable rather than scraped. ``rm`` emits human text, so its exit code
+is the contract and its output is only ever shown back to the user.
 
 Two facts from the payloads drive most of the logic here, and both are
 easy to get wrong:
@@ -36,6 +38,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -45,6 +48,17 @@ from dataclasses import dataclass, field
 # sub-second on a healthy install, so a short ceiling is enough to keep
 # a wedged CLI from hanging an HTTP request indefinitely.
 _SUBPROCESS_TIMEOUT_S = 30.0
+
+# Removal unlinks every blob in a snapshot, which for a 60 GB model on a
+# slow external volume is not a sub-second operation — hence its own,
+# much longer ceiling. It is still bounded: a `rm` that never returns
+# would otherwise hold the request open for the life of the process.
+_REMOVE_TIMEOUT_S = 300.0
+
+# ``org/repo``. Applied to the value taken from the catalog payload before
+# it becomes an argv token: a row whose ``hf_path`` began with ``-`` would
+# otherwise be parsed by the CLI as a flag rather than as a model.
+_HF_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # The alias list only changes when the `rapid-mlx` package itself is
 # upgraded, which cannot happen under a running supervisor. Cached for
@@ -58,6 +72,10 @@ _CACHED_SCAN_TTL_S = 5.0
 
 class CatalogError(RuntimeError):
     """The ``rapid-mlx`` CLI could not be queried."""
+
+
+class RemovalError(RuntimeError):
+    """A cached model could not be removed."""
 
 
 @dataclass
@@ -105,7 +123,10 @@ class ModelCatalog:
         # cold cache each spawn their own pair of subprocesses.
         self._lock = asyncio.Lock()
 
-    async def _run_json(self, args: list[str]) -> dict:
+    async def _run(
+        self, args: list[str], *, timeout: float
+    ) -> tuple[int, str, str]:
+        """Run the CLI to completion. Returns ``(code, stdout, stderr)``."""
         try:
             process = await asyncio.create_subprocess_exec(
                 self._binary,
@@ -126,24 +147,33 @@ class ModelCatalog:
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=_SUBPROCESS_TIMEOUT_S
+                process.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError as exc:
             # Kill rather than leave it: an abandoned scan keeps walking
             # the cache directory and competes for I/O with the retry.
             await self._kill_tree(process)
             raise CatalogError(
-                f"`{' '.join(args)}` timed out after {_SUBPROCESS_TIMEOUT_S:.0f}s"
+                f"`{' '.join(args)}` timed out after {timeout:.0f}s"
             ) from exc
 
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()[:400]
+        assert process.returncode is not None
+        return (
+            process.returncode,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        )
+
+    async def _run_json(self, args: list[str]) -> dict:
+        code, stdout, stderr = await self._run(args, timeout=_SUBPROCESS_TIMEOUT_S)
+
+        if code != 0:
             raise CatalogError(
-                f"`{' '.join(args)}` failed (exit {process.returncode}): {detail}"
+                f"`{' '.join(args)}` failed (exit {code}): {stderr.strip()[:400]}"
             )
 
         try:
-            return json.loads(stdout.decode("utf-8", errors="replace"))
+            return json.loads(stdout)
         except ValueError as exc:
             raise CatalogError(f"`{' '.join(args)}` did not emit JSON") from exc
 
@@ -261,3 +291,61 @@ class ModelCatalog:
             if row.get("alias") == alias:
                 return row
         return None
+
+    async def remove(self, alias: str) -> int | None:
+        """Delete ``alias``'s snapshot from the HF cache.
+
+        Returns the bytes freed, or ``None`` when the size was not
+        known. Raises :class:`RemovalError` if the CLI refused.
+
+        The argument passed to ``rm`` is the catalog's ``hf_path``, not
+        the user's string, and not the alias either. Two reasons, and
+        both matter:
+
+        * The alias is looked up in the catalog first, so the value that
+          reaches argv is one this install published rather than one a
+          caller chose. That is the same defence ``/api/models/pull``
+          and ``/api/models/load`` apply, and here it is the difference
+          between a model picker and a remote delete primitive.
+        * ``rm`` scans the cache for ``models--<owner>--<repo>``, which a
+          bare alias can never match. The CLI does resolve text aliases
+          itself, but only for names in ``aliases.json``; passing the
+          repo skips that lookup entirely and cannot resolve to a
+          different model than the row the user saw.
+
+        The size is measured before the delete, from the cached scan.
+        ``rm`` prints ``Freed 3.1G``, but that is a rounded human string
+        the page would have to parse back into bytes to re-format.
+        """
+        profile = await self.chat_profile(alias)
+        if profile is None:
+            raise RemovalError(f"unknown chat model alias: {alias}")
+
+        hf_path = profile.get("hf_path")
+        if not isinstance(hf_path, str) or not _HF_PATH_RE.match(hf_path):
+            # A malformed manifest row rather than anything the caller
+            # did, but it is still a string on its way to argv.
+            raise RemovalError(f"{alias} has no usable repository id")
+
+        async with self._lock:
+            cached = await self._cached_by_repo()
+        hit = cached.get(hf_path)
+        if hit is None:
+            # Not an error the user needs to act on — the row they
+            # tapped is already gone — but the caller reports it rather
+            # than claiming to have freed something.
+            raise RemovalError(f"{alias} is not downloaded")
+        freed = hit.get("size_bytes")
+
+        code, stdout, stderr = await self._run(
+            ["rm", hf_path, "--yes"], timeout=_REMOVE_TIMEOUT_S
+        )
+        # The disk changed either way: a partial failure may still have
+        # unlinked some of the snapshot.
+        self.invalidate_cache()
+
+        if code != 0:
+            detail = (stderr.strip() or stdout.strip())[:400]
+            raise RemovalError(detail or f"`rm` exited with code {code}")
+
+        return freed if isinstance(freed, int) else None

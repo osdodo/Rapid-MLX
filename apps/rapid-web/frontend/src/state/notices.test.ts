@@ -26,6 +26,14 @@ describe('noticeFor', () => {
     expect(notice.tone).toBe('error');
   });
 
+  it('shows the in-use message verbatim', () => {
+    // The server names which of the two holds the model open — the engine or
+    // an in-flight download — and the fix differs.
+    const notice = noticeFor(error('model_in_use', 'qwen3-4b is still downloading.'));
+    expect(notice.body).toBe('qwen3-4b is still downloading.');
+    expect(notice.tone).toBe('warning');
+  });
+
   it('offers no recovery for a state the user cannot change', () => {
     // A button that does nothing useful is worse than no button.
     const recover = vi.fn();
@@ -33,6 +41,9 @@ describe('noticeFor', () => {
     expect(noticeFor(error('downloads_disabled'), recover).action).toBeUndefined();
     expect(noticeFor(error('busy_streaming'), recover).action).toBeUndefined();
     expect(noticeFor(error('insufficient_storage'), recover).action).toBeUndefined();
+    // The model is held open by something the user has to change first;
+    // retrying the delete would only fail again.
+    expect(noticeFor(error('model_in_use'), recover).action).toBeUndefined();
   });
 
   it('offers a recovery where one exists', () => {
@@ -43,6 +54,7 @@ describe('noticeFor', () => {
       'engine_unavailable',
       'engine_transport',
       'network',
+      'removal_failed',
     ]) {
       const notice = noticeFor(error(type), recover);
       expect(notice.action, type).toBeDefined();
@@ -88,6 +100,8 @@ describe('noticeFor', () => {
       'downloads_disabled',
       'insufficient_storage',
       'download_busy',
+      'model_in_use',
+      'removal_failed',
       'engine_unavailable',
       'engine_transport',
       'unauthorized',

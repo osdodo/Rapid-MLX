@@ -48,6 +48,14 @@ export interface ModelsResponse {
   allow_downloads: boolean;
 }
 
+/** ``POST /api/models/remove``. ``freed_bytes`` is null when the cached scan
+ *  had no size for the snapshot — "unknown", never zero. */
+export interface RemovalResult {
+  ok: true;
+  model: string;
+  freed_bytes: number | null;
+}
+
 /** ``downloads.DownloadState`` — downloads.py:62-66, plus the synthetic
  *  ``idle`` the SSE generator emits when no job exists (app.py:558). */
 export type DownloadState = 'idle' | 'running' | 'done' | 'failed' | 'cancelled';

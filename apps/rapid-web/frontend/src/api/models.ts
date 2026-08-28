@@ -1,6 +1,6 @@
 import { request, requestJson } from './client';
 import { readJsonEventStream } from './sse';
-import type { DownloadJob, ModelsResponse, StatusResponse } from './types';
+import type { DownloadJob, ModelsResponse, RemovalResult, StatusResponse } from './types';
 
 export function fetchStatus(signal?: AbortSignal): Promise<StatusResponse> {
   return requestJson<StatusResponse>('/api/status', signal ? { signal } : {});
@@ -28,6 +28,23 @@ export function loadModel(alias: string): Promise<{ ok: true; model: string; sta
 
 export function pullModel(alias: string): Promise<DownloadJob> {
   return requestJson<DownloadJob>('/api/models/pull', {
+    method: 'POST',
+    body: { model: alias },
+  });
+}
+
+/**
+ * Delete a model's weights from the Mac's HuggingFace cache.
+ *
+ * POST rather than DELETE, matching the server: the CSRF content-type check
+ * runs on POST/PUT/PATCH, so this is the method that carries it (app.py).
+ *
+ * Refused with 409 ``model_in_use`` when the alias is the one the engine is
+ * running or is mid-download — deleting either would unlink files something
+ * else has open.
+ */
+export function removeModel(alias: string): Promise<RemovalResult> {
+  return requestJson<RemovalResult>('/api/models/remove', {
     method: 'POST',
     body: { model: alias },
   });

@@ -48,6 +48,10 @@ export interface Scenario {
   chatFailure: { status: number; type: string; message: string } | null;
   /** Fail the next model load with this status and error type. */
   loadFailure: { status: number; type: string; message: string } | null;
+  /** Fail the next model removal with this status and error type. */
+  removeFailure: { status: number; type: string; message: string } | null;
+  /** Aliases the stub has been asked to delete, in order. */
+  removed: string[];
   /** Delay between chat frames, so a spec can act mid-stream. */
   frameDelayMs: number;
 }
@@ -86,6 +90,8 @@ const DEFAULT_SCENARIO: Scenario = {
   chatFrames: null,
   chatFailure: null,
   loadFailure: null,
+  removeFailure: null,
+  removed: [],
   frameDelayMs: 10,
 };
 
@@ -125,7 +131,16 @@ function apiError(response: ServerResponse, status: number, type: string, messag
  * requests, so a single page can be walked through several server states.
  */
 export async function startStub(overrides: Partial<Scenario> = {}) {
-  const scenario = { ...DEFAULT_SCENARIO, ...overrides };
+  // `removed` and `models` are rebuilt rather than spread: a spread copies the
+  // module constant's arrays (and the row objects inside `models`) by
+  // REFERENCE, so every stub would share them — and the delete route mutates
+  // a row's `cached` flag. The specs would see each other's deletions.
+  const scenario: Scenario = {
+    ...DEFAULT_SCENARIO,
+    removed: [],
+    models: DEFAULT_SCENARIO.models.map((model) => ({ ...model })),
+    ...overrides,
+  };
 
   /**
    * Every socket this server has accepted.
@@ -234,6 +249,27 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
         return;
       }
       json(response, 200, { ok: true, model: scenario.model, state: 'ready' });
+      return;
+    }
+
+    if (path === '/api/models/remove') {
+      const body = JSON.parse((await readBody(request)) || '{}') as { model?: string };
+      if (scenario.removeFailure) {
+        const { status, type, message } = scenario.removeFailure;
+        apiError(response, status, type, message);
+        return;
+      }
+      const alias = body.model ?? '';
+      scenario.removed.push(alias);
+      // Mutate the catalog too, so a refresh after the delete reflects it —
+      // the page re-reads the list and the row must stop saying "on disk".
+      const entry = scenario.models.find((model) => model.alias === alias);
+      const freed = entry?.cached_bytes ?? null;
+      if (entry) {
+        entry.cached = false;
+        entry.cached_bytes = null;
+      }
+      json(response, 200, { ok: true, model: alias, freed_bytes: freed });
       return;
     }
 

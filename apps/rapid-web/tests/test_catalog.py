@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from rmlx_web.catalog import CatalogError, ModelCatalog
+from rmlx_web.catalog import CatalogError, ModelCatalog, RemovalError
 
 # Trimmed from the real payload. `flux2-klein-4b` is retained on purpose:
 # it is an image-gen alias that can be present, cached and "ok", and it
@@ -101,6 +101,9 @@ def fake_cli(tmp_path):
 
     Each invocation is logged so tests can assert on caching without
     reaching into the catalog's private state.
+
+    ``rm`` succeeds silently — the CLI's own output is human text and
+    the exit code is the contract.
     """
     calls = tmp_path / "calls.log"
     available = tmp_path / "available.json"
@@ -115,6 +118,7 @@ def fake_cli(tmp_path):
     script.write_text(
         "#!/bin/sh\n"
         f'echo "$@" >> {calls}\n'
+        '[ "$1" = "rm" ] && exit 0\n'
         'for arg in "$@"; do\n'
         f'  [ "$arg" = "--cached" ] && exec cat {cached}\n'
         "done\n"
@@ -254,6 +258,84 @@ class TestAliasValidation:
         # general-purpose remote fetch primitive.
         assert not await catalog.is_known_chat_alias("attacker/anything")
         assert not await catalog.is_known_chat_alias("../../etc/passwd")
+
+
+class TestRemove:
+    @pytest.mark.asyncio
+    async def test_the_repo_is_passed_not_the_alias(self, fake_cli):
+        script, calls = fake_cli
+        freed = await ModelCatalog(str(script)).remove("qwen3.5-9b-4bit")
+
+        # `rm` scans the cache for ``models--<owner>--<repo>``, which a
+        # bare alias can never match. Passing the catalog's own hf_path
+        # also means the argv token is one this install published rather
+        # than one the caller chose.
+        assert "rm mlx-community/Qwen3.5-9B-4bit --yes" in calls.read_text()
+        assert freed == 5977075377
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_alias_is_refused(self, fake_cli):
+        script, calls = fake_cli
+        with pytest.raises(RemovalError):
+            await ModelCatalog(str(script)).remove("attacker/anything")
+
+        assert "rm" not in calls.read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_non_chat_alias_is_refused(self, fake_cli):
+        script, calls = fake_cli
+        # Present in the catalog, but as an image model — and this route
+        # only ever lists chat models, so it must not reach past them.
+        with pytest.raises(RemovalError):
+            await ModelCatalog(str(script)).remove("flux2-klein-4b")
+
+        assert "rm" not in calls.read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_model_that_is_not_downloaded_is_refused(self, fake_cli):
+        script, calls = fake_cli
+        # The bonsai row is on disk but "incomplete", so it never counted
+        # as cached; there is nothing here to report as freed.
+        with pytest.raises(RemovalError) as excinfo:
+            await ModelCatalog(str(script)).remove("bonsai-1.7b-2bit")
+
+        assert "not downloaded" in str(excinfo.value)
+        assert "rm" not in calls.read_text()
+
+    @pytest.mark.asyncio
+    async def test_the_disk_scan_is_invalidated(self, fake_cli):
+        script, calls = fake_cli
+        catalog = ModelCatalog(str(script))
+
+        await catalog.remove("qwen3.5-9b-4bit")
+        await catalog.list_chat_models()
+
+        # Without this the page keeps showing "on disk" for up to the
+        # TTL after the row was deleted.
+        assert calls.read_text().count("models --cached --json") == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failing_rm_raises_with_its_output(self, tmp_path):
+        available = tmp_path / "available.json"
+        cached = tmp_path / "cached.json"
+        available.write_text(json.dumps(AVAILABLE))
+        cached.write_text(json.dumps(CACHED))
+
+        script = tmp_path / "rapid-mlx"
+        script.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = "rm" ] && { echo "permission denied" >&2; exit 1; }\n'
+            'for arg in "$@"; do\n'
+            f'  [ "$arg" = "--cached" ] && exec cat {cached}\n'
+            "done\n"
+            f"exec cat {available}\n"
+        )
+        script.chmod(0o755)
+
+        with pytest.raises(RemovalError) as excinfo:
+            await ModelCatalog(str(script)).remove("qwen3.5-9b-4bit")
+
+        assert "permission denied" in str(excinfo.value)
 
 
 class TestFailureModes:

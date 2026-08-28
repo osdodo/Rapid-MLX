@@ -90,6 +90,24 @@ export function noticeFor(error: ApiError, recover?: () => void): NoticeSpec {
         body: 'Only one download at a time. Wait for it, or cancel it first.',
       };
 
+    // ---- deletion
+    case 'model_in_use':
+      return {
+        tone: 'warning',
+        // Verbatim: the server names which of the two holds it open — the
+        // engine or an in-flight download — and the fix differs.
+        title: 'That model is in use',
+        body: error.message,
+      };
+
+    case 'removal_failed':
+      return {
+        tone: 'error',
+        title: "Couldn't delete that model",
+        body: error.message,
+        action: withRecovery('Refresh'),
+      };
+
     // ---- the chat proxy
     case 'engine_unavailable':
       return {

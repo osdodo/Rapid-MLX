@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import auth, proxy
-from .catalog import CatalogError, ModelCatalog
+from .catalog import CatalogError, ModelCatalog, RemovalError
 from .downloads import (
     DownloadError,
     DownloadManager,
@@ -455,6 +455,81 @@ def create_app(config: WebConfig) -> FastAPI:
             return _json_error(409, str(exc), "download_conflict")
 
         return JSONResponse({"ok": True, **job.to_dict()})
+
+    # POST, not DELETE. The CSRF control in the middleware — reject any
+    # body whose content-type is a CORS "simple" one — is applied to
+    # POST/PUT/PATCH, because those are the methods a cross-origin page
+    # can send without a preflight. A DELETE already requires a
+    # preflight, so it is not weaker; but routing the one destructive
+    # operation here through the method that carries the extra check
+    # means there is no second policy to keep correct.
+    @app.post("/api/models/remove")
+    async def remove_model(request: Request):
+        if config.catalog is None:
+            return _json_error(
+                501,
+                "model removal is unavailable in --attach mode",
+                "catalog_unavailable",
+            )
+
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+
+        alias = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(alias, str) or not alias.strip():
+            return _json_error(
+                400, "`model` must be a non-empty string", "invalid_body"
+            )
+        alias = alias.strip()
+
+        # Refuse to delete what the engine is running. The weights are
+        # mmap'd by the child, so unlinking them underneath it is not a
+        # clean operation, and the recovery — stop the engine, delete,
+        # leave the phone with nothing loaded — is a bigger decision
+        # than a trash button should make on the user's behalf. They can
+        # switch models first, which is one tap away in the same sheet.
+        #
+        # READY and STARTING only. A FAILED child has already exited and
+        # holds nothing, and deleting a checkpoint that just failed to
+        # load is precisely what a user does next.
+        snapshot = config.engine.status()
+        if snapshot.model == alias and snapshot.state in (
+            ChildState.READY,
+            ChildState.STARTING,
+        ):
+            return _json_error(
+                409,
+                f"{alias} is the model this server is running. "
+                "Switch to another model first, then delete it.",
+                "model_in_use",
+            )
+
+        # A pull writing into the very snapshot being unlinked leaves a
+        # half-materialised repo that the next scan reports as
+        # "incomplete" — present enough to look downloaded to a stale
+        # page, broken enough to fail inside the engine.
+        running = config.downloads.job if config.downloads is not None else None
+        if (
+            running is not None
+            and running.alias == alias
+            and config.downloads.is_running()
+        ):
+            return _json_error(
+                409,
+                f"{alias} is still downloading. Cancel the download first.",
+                "model_in_use",
+            )
+
+        try:
+            freed = await config.catalog.remove(alias)
+        except CatalogError as exc:
+            return _json_error(503, str(exc), "catalog_error")
+        except RemovalError as exc:
+            return _json_error(409, str(exc), "removal_failed")
+
+        return JSONResponse({"ok": True, "model": alias, "freed_bytes": freed})
 
     @app.post("/api/downloads/cancel")
     async def cancel_download():

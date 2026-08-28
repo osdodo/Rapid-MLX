@@ -95,7 +95,11 @@ refused send keeps your draft rather than swallowing it.
 
 Tap the model name in the header to switch models. Downloaded models are
 tagged; picking one that is not downloaded yet starts a download with a live
-progress bar you can cancel.
+progress bar you can cancel. A downloaded model also carries a trash button
+that removes its weights from the Mac, after a confirmation naming the space
+it frees. The model this server is currently running, and one that is
+mid-download, are both refused — deleting either would unlink files something
+still has open. Switch models or cancel the download first.
 
 Only chat models are listed. Image, video and audio aliases have no chat
 endpoint, so offering them would mean waiting out a large download for
@@ -181,13 +185,19 @@ Attaching a tunnel puts this on the public internet, so:
   open on the Mac could drive this port through your browser.
 - **Model names are validated against the catalog** before they reach a
   subprocess argument. Accepting an arbitrary `org/repo` would turn the model
-  picker into a general-purpose remote fetch.
+  picker into a general-purpose remote fetch — or, for deletion, into a
+  general-purpose remote delete. Removal passes the catalog's own repository
+  id, never the caller's string.
 - **Downloads are gated.** Enabled on loopback, but off by default once the
   port is on a network — `--allow-downloads` is required there, because a
   download is the one operation here that consumes an unbounded amount of
   someone else's disk. Every pull is also checked against free space (with
   10 GiB of headroom), and a model whose size is *unknown* is refused rather
   than guessed at. Only one download runs at a time.
+- **Deleting a model is not behind that flag.** It frees disk rather than
+  consuming it, so the reason downloads are gated does not apply — but it is
+  destructive, and anyone holding the token can do it. If that matters on your
+  network, the token is what is protecting it.
 
 ## Limitations
 

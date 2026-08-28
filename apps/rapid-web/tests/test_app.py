@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from rmlx_web import app as app_module
 from rmlx_web.app import WebConfig, create_app
-from rmlx_web.catalog import CatalogError, ModelEntry
+from rmlx_web.catalog import CatalogError, ModelEntry, RemovalError
 from rmlx_web.downloads import DownloadError, DownloadJob, DownloadState
 from rmlx_web.supervisor import ChildState, ChildStatus
 
@@ -69,7 +69,7 @@ class FakeEngine:
 class FakeCatalog:
     """Stands in for ModelCatalog, with no subprocess."""
 
-    def __init__(self, entries=None, error=None):
+    def __init__(self, entries=None, error=None, remove_error=None):
         self.entries = (
             entries
             if entries is not None
@@ -90,8 +90,10 @@ class FakeCatalog:
             ]
         )
         self.error = error
+        self.remove_error = remove_error
         self.forced = []
         self.invalidated = 0
+        self.removed = []
 
     async def list_chat_models(self, *, force=False):
         if self.error:
@@ -116,6 +118,18 @@ class FakeCatalog:
 
     def invalidate_cache(self):
         self.invalidated += 1
+
+    async def remove(self, alias):
+        if self.error:
+            raise self.error
+        if self.remove_error:
+            raise self.remove_error
+        for entry in self.entries:
+            if entry.alias == alias:
+                self.removed.append(alias)
+                self.invalidated += 1
+                return entry.cached_bytes
+        raise RemovalError(f"unknown chat model alias: {alias}")
 
 
 def build_client(
@@ -840,6 +854,187 @@ class TestCancelDownload:
             )
 
         assert response.status_code == 403
+
+
+class TestRemoveModel:
+    def test_a_cached_model_is_removed(self):
+        catalog = FakeCatalog()
+        engine = FakeEngine(model="bonsai-1.7b-2bit")
+        with build_client(engine=engine, catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "model": "qwen3.5-9b-4bit",
+            "freed_bytes": 5977075377,
+        }
+        assert catalog.removed == ["qwen3.5-9b-4bit"]
+
+    def test_unknown_alias_is_refused(self):
+        catalog = FakeCatalog()
+        with build_client(catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "attacker/arbitrary-repo"},
+            )
+
+        # Same reasoning as pull: an unvalidated alias reaching a
+        # subprocess argument is a primitive, and this one deletes.
+        assert response.status_code == 409
+        assert response.json()["error"]["type"] == "removal_failed"
+        assert catalog.removed == []
+
+    def test_the_serving_model_is_refused(self):
+        catalog = FakeCatalog()
+        engine = FakeEngine(model="qwen3.5-9b-4bit", state=ChildState.READY)
+        with build_client(engine=engine, catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        # The child has the weights mmap'd; unlinking them underneath it
+        # is not a clean operation.
+        assert response.status_code == 409
+        assert response.json()["error"]["type"] == "model_in_use"
+        assert catalog.removed == []
+
+    def test_a_model_that_is_still_loading_is_refused(self):
+        catalog = FakeCatalog()
+        engine = FakeEngine(model="qwen3.5-9b-4bit", state=ChildState.STARTING)
+        with build_client(engine=engine, catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["error"]["type"] == "model_in_use"
+
+    def test_a_model_whose_start_failed_can_be_deleted(self):
+        catalog = FakeCatalog()
+        engine = FakeEngine(model="qwen3.5-9b-4bit", state=ChildState.FAILED)
+        with build_client(engine=engine, catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        # The child has already exited and holds nothing. Deleting a
+        # checkpoint that just failed to load is exactly what a user
+        # does next, so refusing it would strand them.
+        assert response.status_code == 200
+        assert catalog.removed == ["qwen3.5-9b-4bit"]
+
+    def test_a_model_being_downloaded_is_refused(self):
+        catalog = FakeCatalog()
+        downloads = FakeDownloads(
+            job=DownloadJob(alias="qwen3.5-9b-4bit", total_bytes=1)
+        )
+        engine = FakeEngine(model=None)
+        with build_client(
+            engine=engine, catalog=catalog, downloads=downloads
+        ) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        # Unlinking underneath a running pull leaves a half-materialised
+        # snapshot, which the next scan reports as "incomplete".
+        assert response.status_code == 409
+        assert response.json()["error"]["type"] == "model_in_use"
+        assert catalog.removed == []
+
+    def test_a_finished_download_does_not_block_removal(self):
+        catalog = FakeCatalog()
+        downloads = FakeDownloads(
+            job=DownloadJob(
+                alias="qwen3.5-9b-4bit",
+                total_bytes=1,
+                state=DownloadState.DONE,
+            )
+        )
+        engine = FakeEngine(model=None)
+        with build_client(
+            engine=engine, catalog=catalog, downloads=downloads
+        ) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        # The manager retains the last finished job, so keying on the
+        # alias alone would permanently block deleting whatever was
+        # downloaded most recently.
+        assert response.status_code == 200
+
+    def test_removal_failure_is_reported(self):
+        catalog = FakeCatalog(remove_error=RemovalError("permission denied"))
+        engine = FakeEngine(model=None)
+        with build_client(engine=engine, catalog=catalog) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["error"]["type"] == "removal_failed"
+        assert "permission denied" in response.json()["error"]["message"]
+
+    def test_attach_mode_has_no_catalog_to_remove_from(self):
+        engine = FakeEngine(model=None, can_switch=False)
+        with build_client(engine=engine, catalog=None) as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+
+        assert response.status_code == 501
+        assert response.json()["error"]["type"] == "catalog_unavailable"
+
+    def test_removal_requires_a_token(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/models/remove", headers=JSON_CT, json={"model": "x"}
+            )
+
+        assert response.status_code == 401
+
+    def test_a_simple_content_type_is_refused(self):
+        # The CSRF control is what makes POST the right method here: a
+        # cross-origin page can send text/plain with no preflight.
+        with build_client() as client:
+            response = client.post(
+                "/api/models/remove",
+                headers={**AUTH, "Content-Type": "text/plain"},
+                content='{"model": "qwen3.5-9b-4bit"}',
+            )
+
+        assert response.status_code == 415
+
+    @pytest.mark.parametrize("body", [{}, {"model": ""}, {"model": 7}])
+    def test_invalid_bodies_are_rejected(self, body):
+        engine = FakeEngine(model=None)
+        with build_client(engine=engine) as client:
+            response = client.post(
+                "/api/models/remove", headers={**AUTH, **JSON_CT}, json=body
+            )
+
+        assert response.status_code == 400
 
 
 class TestDownloadCapabilityReporting:

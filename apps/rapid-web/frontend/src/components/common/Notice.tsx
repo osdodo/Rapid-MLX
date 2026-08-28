@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { X } from 'lucide-react';
 import { useStore } from '@/state/store';
-import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 
 /**
@@ -18,19 +17,18 @@ export function NoticeStack() {
   return (
     // Below the header, not above the composer: the iOS keyboard would cover
     // a bottom notice exactly when most of these fire.
-    <div className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+58px)] z-25 flex flex-col gap-2 px-3">
+    //
+    // Capped and right-aligned rather than full-bleed. On a phone the cap is
+    // wider than the viewport so this stays edge-to-edge, but on a desktop
+    // window a notice stretched across ~2000px puts its dismiss button a
+    // screen away from the text it belongs to.
+    <div className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+58px)] z-25 flex flex-col items-end gap-2 px-3">
       {notices.map((notice) => (
         <NoticeRow key={notice.id} id={notice.id} />
       ))}
     </div>
   );
 }
-
-const TONE_RULE = {
-  info: 'border-l-[3px] border-l-primary',
-  warning: 'border-l-[3px] border-l-warning',
-  error: 'border-l-[3px] border-l-destructive',
-} as const;
 
 function NoticeRow({ id }: { id: string }) {
   const notice = useStore((state) => state.notices.find((candidate) => candidate.id === id));
@@ -47,11 +45,10 @@ function NoticeRow({ id }: { id: string }) {
   if (!notice) return null;
 
   return (
+    // No tone-coloured left border: `role` and the wording already carry the
+    // severity, and the stripe read as decoration rather than as meaning.
     <div
-      className={cn(
-        'bg-popover text-popover-foreground animate-in fade-in-0 slide-in-from-top-2 pointer-events-auto flex items-center gap-2.5 rounded-lg border py-2.5 pr-2 pl-3 text-sm shadow-md',
-        TONE_RULE[notice.tone],
-      )}
+      className="bg-popover text-popover-foreground animate-in fade-in-0 slide-in-from-top-2 pointer-events-auto flex w-full max-w-md items-center gap-2.5 rounded-lg border py-2.5 pr-2 pl-3 text-sm shadow-md"
       // `alert` interrupts, `status` waits for a pause.
       role={notice.tone === 'error' ? 'alert' : 'status'}
     >

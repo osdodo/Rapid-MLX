@@ -272,7 +272,10 @@ test.describe('errors', () => {
       // The model selector is in the sidebar, which is a drawer at this width.
       await page.getByLabel('Open sidebar').click();
       await page.getByRole('button', { name: /qwen3-4b/ }).click();
-      await page.getByRole('button', { name: /gemma-2b/ }).click();
+      // Anchored: a cached row carries a "Delete <alias>" button as well, and
+      // an unanchored /gemma-2b/ matches both. The row's accessible name
+      // STARTS with the alias, the trash's starts with "Delete".
+      await page.getByRole('button', { name: /^gemma-2b/ }).click();
 
       await expect(page.getByText('still streaming')).toBeVisible();
       expect(alerted).toBe(false);

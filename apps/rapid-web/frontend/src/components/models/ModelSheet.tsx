@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { cancelDownload, fetchModels, loadModel, pullModel, watchDownloads } from '@/api/models';
+import { Trash2 } from 'lucide-react';
+import {
+  cancelDownload,
+  fetchModels,
+  loadModel,
+  pullModel,
+  removeModel,
+  watchDownloads,
+} from '@/api/models';
 import { asApiError } from '@/api/errors';
 import type { DownloadJob, ModelEntry, StatusResponse } from '@/api/types';
 import { formatBytes } from '@/lib/format';
@@ -7,6 +15,7 @@ import { useStore } from '@/state/store';
 import { noticeFor } from '@/state/notices';
 import { percent } from '@/components/models/LifecycleBand';
 import { Sheet } from '@/components/common/Sheet';
+import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -25,6 +34,8 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ModelEntry | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const watching = useRef<AbortController | null>(null);
 
   const refresh = useMemo(
@@ -144,6 +155,26 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
     }
   };
 
+  const remove = async (model: ModelEntry) => {
+    setDeleting(model.alias);
+    try {
+      const result = await removeModel(model.alias);
+      const freed = formatBytes(result.freed_bytes);
+      pushNotice({
+        tone: 'info',
+        title: freed ? `Deleted ${model.alias} — freed ${freed}` : `Deleted ${model.alias}`,
+        body: 'You can download it again by selecting it.',
+      });
+      // The row still says "on disk" until the catalog is re-scanned, and the
+      // server's TTL would otherwise hold that for a few seconds.
+      await refresh(true);
+    } catch (cause) {
+      pushNotice(noticeFor(asApiError(cause), () => void refresh(true)));
+    } finally {
+      setDeleting(null);
+    }
+  };
+
   return (
     <Sheet
       open={open}
@@ -184,49 +215,110 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
               key={model.alias}
               model={model}
               current={model.alias === selected}
+              deleting={deleting === model.alias}
               onChoose={() => void choose(model)}
+              onDelete={() => setPendingDelete(model)}
             />
           ))
         )}
       </div>
 
       {download ? <DownloadStrip job={download} onCancel={() => void cancelDownload()} /> : null}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title={`Delete "${pendingDelete?.alias ?? ''}"?`}
+        body={deleteBody(pendingDelete)}
+        confirmLabel="Delete"
+        destructive
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void remove(pendingDelete);
+          setPendingDelete(null);
+        }}
+      />
     </Sheet>
   );
+}
+
+function deleteBody(model: ModelEntry | null): string {
+  const size = formatBytes(model?.cached_bytes);
+  const freed = size ? ` Frees ${size}.` : '';
+  return `Removes the weights from your Mac. You can download it again later by selecting it.${freed}`;
 }
 
 function ModelRow({
   model,
   current,
+  deleting,
   onChoose,
+  onDelete,
 }: {
   model: ModelEntry;
   current: boolean;
+  deleting: boolean;
   onChoose(): void;
+  onDelete(): void;
 }) {
   const size = formatBytes(model.cached ? model.cached_bytes : model.size_bytes);
 
   return (
-    <button
-      type="button"
+    // A div, not the button it used to be: the trash is a second control, and
+    // a button inside a button is invalid and unclickable in Safari.
+    <div
       className={cn(
-        'hover:bg-accent flex w-full items-center gap-2.5 rounded-md px-3 py-2.5 text-left outline-none',
+        'group hover:bg-accent flex w-full items-center gap-1 rounded-md pr-1.5 pl-3',
         current && 'bg-accent',
       )}
-      onClick={onChoose}
     >
-      <span className="flex min-w-0 flex-1 flex-col gap-1">
-        <span className="text-sm font-medium [overflow-wrap:anywhere]">{model.alias}</span>
-        <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
-          {size ?? 'size unknown'}
-          {model.reasoning_parser ? <Badge variant="secondary">thinks</Badge> : null}
-          {model.tool_call_parser ? <Badge variant="secondary">tools</Badge> : null}
+      {/* `text-left` belongs on the button, NOT on the row around it: a
+          <button> gets `text-align: center` from the UA stylesheet, which
+          beats an inherited value. Set on the row only, the alias centred
+          itself while the metadata line below — a flex container, so
+          unaffected — stayed left, and the list read as ragged. */}
+      <button
+        type="button"
+        className="flex min-w-0 flex-1 items-center gap-2.5 py-2.5 text-left outline-none"
+        onClick={onChoose}
+      >
+        <span className="flex min-w-0 flex-1 flex-col gap-1">
+          <span className="text-sm font-medium [overflow-wrap:anywhere]">{model.alias}</span>
+          <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
+            {size ?? 'size unknown'}
+            {model.reasoning_parser ? <Badge variant="secondary">thinks</Badge> : null}
+            {model.tool_call_parser ? <Badge variant="secondary">tools</Badge> : null}
+          </span>
         </span>
+        <Badge variant={model.cached ? 'default' : 'outline'} className="shrink-0 rounded-full">
+          {model.cached ? 'on disk' : 'remote'}
+        </Badge>
+      </button>
+
+      {/* A fixed slot, always present, holding the trash only where there is
+          something to delete. Rendering the button conditionally instead let
+          the row's width change: an uncached row put its badge 36px further
+          right than a cached one, and hovering a cached row shifted its badge
+          as the button faded in. The badges have to line up in one column
+          down the list or it reads as ragged. */}
+      <span className="flex size-9 shrink-0 items-center justify-center">
+        {model.cached ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            // Revealed on hover on a pointer device, always shown on touch,
+            // where there is no hover and it would be unreachable — same rule
+            // as the conversation row's controls.
+            className="text-muted-foreground size-9 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 [&_svg:not([class*=size-])]:size-4 [@media(hover:none)]:opacity-100"
+            onClick={onDelete}
+            disabled={deleting}
+            aria-label={`Delete ${model.alias}`}
+            title="Delete"
+          >
+            <Trash2 />
+          </Button>
+        ) : null}
       </span>
-      <Badge variant={model.cached ? 'default' : 'outline'} className="shrink-0 rounded-full">
-        {model.cached ? 'on disk' : 'remote'}
-      </Badge>
-    </button>
+    </div>
   );
 }
 
