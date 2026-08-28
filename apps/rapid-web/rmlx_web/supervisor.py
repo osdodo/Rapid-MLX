@@ -1,24 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lifecycle of the supervised ``rapid-mlx serve`` child.
 
-Why supervise at all, rather than telling the user to start ``rapid-mlx
-serve`` themselves and pointing at it:
+Owning the child, rather than pointing at one the user started, is what
+keeps the external port fixed: switching models has no hot-swap path — a
+different model is a different process — so a page pointed straight at
+the engine would break on every switch. The child also gets an ephemeral
+port picked here, so this can run alongside an existing ``rapid-mlx
+serve`` or the desktop app.
 
-* **Switching models means restarting the engine.** There is no
-  hot-swap; a different model is a different process. A page pointed
-  straight at the engine would therefore break on every switch, because
-  the port it was talking to no longer exists. Owning the child lets the
-  external port stay fixed for the whole session while the child comes
-  and goes underneath it. (This is the same argument issue #2370 makes
-  for putting the proxy in the Swift layer, relocated to Python.)
-* **Port choice.** The child gets an ephemeral port picked here, so
-  running this alongside an existing ``rapid-mlx serve`` or the desktop
-  app does not collide.
-
-The child is driven as a **subprocess of the CLI**, not by importing
-``vllm_mlx``. That is what keeps this package installable and testable
-without the engine, and what makes it survive engine-internal
-refactors: the contract is the documented command line.
+The child is driven as a subprocess of the CLI, never by importing
+``vllm_mlx``: the contract is the documented command line, which is what
+keeps this package installable and testable without the engine.
 """
 
 from __future__ import annotations
@@ -34,20 +26,16 @@ from enum import Enum
 
 import httpx
 
-# How long to wait for the child to answer /health/ready before giving
-# up. A cold start compiles Metal shaders and may pull weights, so the
-# ceiling is minutes, not seconds — the wrong value here shows up as a
-# spurious "failed to start" on exactly the large models people most
-# want to run.
+# A cold start compiles Metal shaders and may pull weights, so the ceiling
+# is minutes. Too low shows up as a spurious "failed to start" on exactly
+# the large models people most want to run.
 DEFAULT_READY_TIMEOUT_S = 900.0
 
-# Gap between readiness polls. The child is doing GPU work; polling it
-# tightly buys nothing and shows up in its request log.
+# The child is doing GPU work; polling tightly buys nothing.
 _READY_POLL_INTERVAL_S = 1.0
 
-# Grace period between SIGTERM and SIGKILL when stopping the child.
-# mlx releases GPU buffers on the way out; killing immediately can leave
-# wired memory attributed to a dead process until the kernel reclaims it.
+# SIGTERM→SIGKILL grace. mlx releases GPU buffers on the way out; killing
+# immediately leaves wired memory attributed to a dead process.
 _TERM_GRACE_S = 10.0
 
 
@@ -68,9 +56,8 @@ class SupervisorError(RuntimeError):
 class ChildStatus:
     """Snapshot handed to ``/api/status``.
 
-    Deliberately a value object rather than a live view of the
-    supervisor: the HTTP handler serialises it after the lock is
-    released, so it must not be able to change underneath.
+    A value object rather than a live view: the HTTP handler serialises it
+    after the lock is released, so it must not change underneath.
     """
 
     state: ChildState
@@ -91,9 +78,8 @@ class ChildStatus:
 def find_rapid_mlx_binary(explicit: str | None = None) -> str:
     """Locate the ``rapid-mlx`` command.
 
-    Checked in precedence order so a user with several installs (pip in
-    a venv, Homebrew, a source checkout) can be explicit without editing
-    their PATH.
+    Precedence order, so a user with several installs (venv, Homebrew,
+    source checkout) can be explicit without editing PATH.
     """
     if explicit:
         if os.path.isabs(explicit) and not os.access(explicit, os.X_OK):
@@ -116,11 +102,9 @@ def find_rapid_mlx_binary(explicit: str | None = None) -> str:
 def pick_free_port() -> int:
     """Ask the OS for an unused localhost port.
 
-    Bind-then-close leaves a window in which something else could take
-    the port before the child binds it. That race is accepted here: the
-    alternative (hand the child an inherited socket) means coupling to
-    the engine's internals, and a collision surfaces immediately as a
-    startup failure rather than as silent misbehaviour.
+    Bind-then-close leaves a race window. Accepted: the alternative
+    (handing the child an inherited socket) couples to engine internals,
+    and a collision surfaces immediately as a startup failure.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -130,9 +114,8 @@ def pick_free_port() -> int:
 class EngineSupervisor:
     """Owns at most one ``rapid-mlx serve`` child process."""
 
-    # Owning the child is exactly what makes switching possible; the
-    # attached variant below sets this False so the HTTP layer can
-    # refuse up front instead of surfacing a mid-request exception.
+    # The attached variant below sets this False so the HTTP layer can
+    # refuse up front instead of raising mid-request.
     can_switch = True
 
     def __init__(
@@ -153,15 +136,13 @@ class EngineSupervisor:
         self._port: int | None = None
         self._state = ChildState.STOPPED
         self._detail: str | None = None
-        # Bounded tail of the child's output. Startup failures (a bad
-        # alias, an OOM, a missing checkpoint) are explained in the
-        # child's stderr and nowhere else, so the page needs some of it
-        # to say anything useful. Bounded because a long-running server
-        # logs every request.
+        # Startup failures (bad alias, OOM, missing checkpoint) are
+        # explained in the child's stderr and nowhere else. Bounded
+        # because a long-running server logs every request.
         self._output_tail: list[str] = []
         self._drain_task: asyncio.Task | None = None
-        # Serialises start/stop/switch. Two concurrent switch requests
-        # would otherwise both spawn a child and leak one of them.
+        # Two concurrent switch requests would otherwise both spawn a
+        # child and leak one.
         self._lock = asyncio.Lock()
 
     @property
@@ -207,11 +188,9 @@ class EngineSupervisor:
         ] + self._serve_args
 
         env = dict(os.environ)
-        # The child's bearer travels by environment, not argv. On macOS
-        # `ps -axww` shows argv to any user on the system, while `ps eww`
-        # gates environment behind same-UID-or-root. Same reasoning as
-        # BearerSecret.swift's SECURITY NOTE, and the engine documents
-        # RAPID_MLX_API_KEY as the supported form.
+        # The bearer travels by environment, not argv: on macOS `ps -axww`
+        # shows argv to any user, while `ps eww` gates environment behind
+        # same-UID-or-root.
         env["RAPID_MLX_API_KEY"] = self._api_key
 
         self._state = ChildState.STARTING
@@ -226,10 +205,9 @@ class EngineSupervisor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
-                # Own process group: stopping the supervisor must take
-                # the engine down with it. Without this, a Ctrl-C in the
-                # terminal reaches only us and leaves a multi-GB model
-                # resident with no owner.
+                # Own process group: without this a Ctrl-C in the terminal
+                # reaches only us and leaves a multi-GB model resident
+                # with no owner.
                 start_new_session=True,
             )
         except OSError as exc:
@@ -244,9 +222,8 @@ class EngineSupervisor:
             await self._await_ready(process, port)
         except SupervisorError:
             self._state = ChildState.FAILED
-            # Do not leave a half-started child behind: it may still be
-            # holding GPU memory, and the next start would then contend
-            # with it for the same device.
+            # A half-started child may still hold GPU memory, which the
+            # next start would then contend with.
             await self._stop_locked(preserve_failure=True)
             raise
 
@@ -257,12 +234,10 @@ class EngineSupervisor:
     ) -> None:
         """Poll ``/health/ready`` until the engine finishes startup.
 
-        ``/health/ready`` rather than ``/v1/models``: the engine returns
-        200 from ``/v1/models`` as soon as FastAPI binds, which is before
-        warmup and prefix-cache load. A request sent in that window
-        competes with warmup and looks like a hang. ``/health/ready``
-        answers 503 until lifespan startup is genuinely complete, which
-        is the signal we actually want.
+        Not ``/v1/models``: that returns 200 as soon as FastAPI binds,
+        before warmup and prefix-cache load, so a request sent in that
+        window competes with warmup and looks like a hang. ``/health/ready``
+        answers 503 until lifespan startup is genuinely complete.
         """
         deadline = asyncio.get_running_loop().time() + self._ready_timeout_s
         url = f"http://127.0.0.1:{port}/health/ready"
@@ -294,19 +269,18 @@ class EngineSupervisor:
     async def _drain_output(self, process: asyncio.subprocess.Process) -> None:
         """Continuously read the child's output into a bounded tail.
 
-        This is not optional bookkeeping. The child's stdout is a pipe
-        with a fixed kernel buffer; if nobody reads it, the child blocks
-        on write once that buffer fills and the engine simply stops
-        mid-generation. Draining is what keeps it alive.
+        Not optional bookkeeping: stdout is a pipe with a fixed kernel
+        buffer, and once it fills the child blocks on write and the engine
+        stops mid-generation.
         """
         assert process.stdout is not None
         while True:
             try:
                 line = await process.stdout.readline()
             except (ValueError, OSError):
-                # readline raises ValueError on an over-long line with no
-                # newline; treat it as end of usable output rather than
-                # killing the drain task and re-introducing the stall.
+                # ValueError on an over-long line with no newline. Treat as
+                # end of usable output rather than killing the drain task
+                # and re-introducing the stall.
                 break
             if not line:
                 break
@@ -328,10 +302,8 @@ class EngineSupervisor:
 
         if process.returncode is None:
             try:
-                # Signal the whole group, not just the child. The engine
-                # spawns helpers, and `start_new_session` put them in a
-                # group of their own; signalling only the leader would
-                # orphan them.
+                # Signal the whole group: the engine spawns helpers, and
+                # signalling only the leader would orphan them.
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 with contextlib.suppress(ProcessLookupError):
@@ -364,10 +336,9 @@ class EngineSupervisor:
 class AttachedEngine:
     """Stand-in for :class:`EngineSupervisor` in ``--attach`` mode.
 
-    Presents the same surface so the HTTP layer does not branch, but
-    owns nothing: the engine belongs to whoever started it. Model
-    switching is therefore impossible here, and callers must check
-    :attr:`can_switch` rather than discovering it from a failure.
+    Same surface so the HTTP layer does not branch, but owns nothing.
+    Switching is impossible, so callers check :attr:`can_switch` rather
+    than discovering it from a failure.
     """
 
     can_switch = False
@@ -385,11 +356,9 @@ class AttachedEngine:
         return self._api_key
 
     def status(self) -> ChildStatus:
-        # Reported as READY without probing: the caller asserted this
-        # endpoint exists. A probe here would only move the failure from
-        # the first chat request to startup, and would have to be
-        # repeated anyway since an attached engine can go away at any
-        # time.
+        # READY without probing: the caller asserted this endpoint exists,
+        # and a probe would only move the failure to startup while needing
+        # to be repeated anyway.
         return ChildStatus(state=ChildState.READY, model=None, port=None)
 
     async def start(self, model: str) -> None:

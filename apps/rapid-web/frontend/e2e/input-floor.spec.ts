@@ -4,13 +4,10 @@ import { startStub } from './stub-server';
 /**
  * The iOS 16px input floor, checked as a COMPUTED size.
  *
- * Below 16px Safari zooms the page on focus and never zooms back out, so this
- * is a hard floor rather than a style choice. It is also a cascade question
- * that is easy to get wrong by reading the source: `input { font-size: 16px }`
- * is unlayered, and unlayered rules beat anything in `@layer utilities`
- * regardless of specificity — so a `text-sm` on an input is silently a no-op,
- * and shadcn's own `md:text-sm` is too. Measuring is the only way to know
- * which way it actually resolved.
+ * Below 16px Safari zooms on focus and never zooms back out. It is also a
+ * cascade question that is easy to misread: `input { font-size: 16px }` is
+ * unlayered, and unlayered rules beat anything in `@layer utilities`, so a
+ * `text-sm` on an input is silently a no-op. Measuring is the only way to know.
  */
 test('every input renders at 16px or more on a phone', async ({ page }) => {
   const stub = await startStub({});

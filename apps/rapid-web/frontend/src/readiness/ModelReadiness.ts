@@ -1,35 +1,23 @@
 /**
  * The single lifecycle value for the whole page.
  *
- * A direct port of apps/rapid-mac/Sources/Rapid/UI/ModelReadiness.swift. The
- * point of it is not the enum but the fact that ONE value derives the
- * readiness banner, the composer placeholder, the send tooltip, the empty
- * state and the accessibility announcement — so those five can never disagree.
- * The old page had no such value: the model chip carried an ad-hoc class name,
- * the empty state carried a separately-patched subtitle, and every failure
- * arrived as `window.alert`.
+ * Ported from `apps/rapid-mac/Sources/Rapid/UI/ModelReadiness.swift`. The
+ * point is not the enum but that ONE value derives the readiness banner, the
+ * composer placeholder, the send tooltip, the empty state and the
+ * accessibility announcement — so those five cannot disagree.
  *
  * Pure and React-free, so the whole truth table is testable without a DOM.
  *
- * Two deliberate deviations from the Swift original:
- *
- *   * `engineMissing` is gone. There is no local binary here; a web client
- *     that cannot reach an engine is a network problem, not a setup problem.
- *   * `serverUnreachable` is new, and is the state the old page most badly
- *     lacked. On a phone behind a tunnel the connection dropping — the Mac
- *     slept, the tunnel died, the radio dropped — is the single most likely
- *     failure, and index.html:1449-1453 collapsed it into a red "offline"
- *     chip with no explanation and no reassurance.
+ * Two deviations from the Swift original: `engineMissing` is gone (there is no
+ * local binary here), and `serverUnreachable` is new — on a phone behind a
+ * tunnel, the connection dropping is the single most likely failure.
  */
 
 export type ReadinessAction =
   /**
-   * Deliberately NOT rendered as a button.
-   *
-   * The model chip sits in the header and already says "Choose a model", so
-   * a second control with the same words is a duplicate action. The case
-   * exists so the copy and the live-region announcement can still name the
-   * step. Same reasoning as ModelReadiness.swift:88-99.
+   * Deliberately NOT rendered as a button: the model chip already says
+   * "Choose a model". The case exists so the copy and the live-region
+   * announcement can still name the step.
    */
   | { kind: 'chooseModel' }
   | { kind: 'download'; alias: string }
@@ -40,11 +28,10 @@ export type ReadinessAction =
 export type ModelReadiness =
   | { kind: 'serverUnreachable'; consecutiveFailures: number }
   /**
-   * Nothing chosen. `canSwitch` is false in --attach mode, where the engine
-   * belongs to whoever started it — and the two cases need OPPOSITE copy:
-   * one points at the model picker, the other has to say the picker will not
-   * help. Carrying it on the state rather than patching the string at the
-   * call site keeps every surface agreeing, which is the point of this type.
+   * Nothing chosen. `canSwitch` is false in --attach mode, and the two cases
+   * need OPPOSITE copy: one points at the model picker, the other has to say
+   * the picker will not help. Carrying it on the state rather than patching
+   * the string at the call site is what keeps every surface agreeing.
    */
   | { kind: 'noModel'; canSwitch: boolean }
   | { kind: 'needsDownload'; alias: string; sizeText: string | null }
@@ -68,10 +55,9 @@ export type ModelReadiness =
 /**
  * What is known about an alias's weights.
  *
- * Four states, not a nullable boolean. Collapsing "we do not know" into
- * `null` is precisely the defect ModelReadiness.swift:191-200 records: an
- * alias the catalog had never heard of was told "It's already downloaded",
- * contradicting the picker's own unknown-model marker in the same row.
+ * Four states, not a nullable boolean: collapsing "we do not know" into `null`
+ * is what told an alias the catalog had never heard of that it was already
+ * downloaded, contradicting the picker's own unknown-model marker.
  */
 export type CacheState =
   /** The catalog says the weights are complete on disk. */
@@ -88,10 +74,9 @@ export type StatusRole = 'idle' | 'working' | 'ready' | 'error';
 // --------------------------------------------------------------- resolution
 
 /**
- * Placeholder names the engine reports that must never be interpolated into
- * copy as if they were models. Without this filter the page renders
- * "Couldn't start ." or "Starting Loading" — the defect
- * ModelDisplayName (RapidTheme.swift:809) exists to prevent.
+ * Names the engine reports that must never be interpolated into copy as if
+ * they were models, or the page renders "Couldn't start ." / "Starting
+ * Loading".
  */
 const PLACEHOLDERS = new Set([
   '',
@@ -112,15 +97,14 @@ export function displayable(alias: string | null | undefined): string | null {
 }
 
 /**
- * Permissive rule for a non-send-enabling serve state (`starting`): may the
- * in-flight start describe the current pick?
+ * Permissive rule for `starting`: may the in-flight start describe the current
+ * pick?
  *
- * Port of ModelReadiness.swift:622-645. The asymmetry in the last two cases
- * is the point: a real serving model with an unsynced selection is the launch
- * frame where the picker lags the auto-started model, and showing the real
- * name is right. But a PLACEHOLDER start while a real model B is selected
- * must not claim "Starting B" — that would suppress B's own Start button for
- * a start we cannot prove is B's.
+ * The asymmetry in the last two cases is the point. A real serving model with
+ * an unsynced selection is the launch frame where the picker lags the
+ * auto-started model, so showing the real name is right. But a PLACEHOLDER
+ * start while a real model B is selected must not claim "Starting B" — that
+ * would suppress B's own Start button for a start we cannot prove is B's.
  */
 export function serveStateSpeaksForSelection(
   serving: string | null,
@@ -138,10 +122,8 @@ export function serveStateSpeaksForSelection(
  * Strict rule for the send-enabling `ready` state.
  *
  * `ready` may describe the selection ONLY when a real serving model equals a
- * real selected model. If a different model is serving, or nothing is really
- * selected yet, `ready` must not win — resolving the selection's own state
- * keeps Send gated rather than enabling it against an alias the send path is
- * not holding. ModelReadiness.swift:647-658.
+ * real selected model. Otherwise Send stays gated rather than enabling against
+ * an alias the send path is not holding.
  */
 export function readyDescribesSelection(serving: string | null, selected: string | null): boolean {
   const s = displayable(serving);
@@ -152,18 +134,13 @@ export function readyDescribesSelection(serving: string | null, selected: string
 /**
  * Is a recorded failure still the CURRENT selection's problem?
  *
- * Port of ModelReadiness.swift:600-620. The asymmetry in the last two cases
- * is deliberate:
+ * The asymmetry in the last two cases is deliberate:
  *
- *   * Nothing chosen — show it. It is the most useful thing on screen and
- *     there is no other model to describe instead.
- *   * A model is chosen and the failure names a model — show it only when
- *     they are the same model.
- *   * A model is chosen and the failure names nothing — SUPPRESS it. We
- *     cannot prove the failure is about this model, and blaming the user's
- *     fresh pick for an unattributable error is the worse of the two
- *     mistakes. The selection's own state is shown instead, which is always
- *     true.
+ *   * Nothing chosen — show it; there is no other model to describe.
+ *   * A model is chosen and the failure names one — show it only if they match.
+ *   * A model is chosen and the failure names nothing — SUPPRESS it. Blaming
+ *     the user's fresh pick for an unattributable error is the worse mistake;
+ *     the selection's own state is shown instead, which is always true.
  */
 export function failureApplies(failedAlias: string | null, selectedAlias: string | null): boolean {
   if (selectedAlias === null) return true;
@@ -195,11 +172,8 @@ export interface ResolveInput {
 }
 
 /**
- * Two consecutive failures before declaring the server unreachable.
- *
- * One miss is a phone radio dropping a packet or a tunnel hiccuping, and the
- * old page turned the chip red for exactly that (index.html:1449-1453). Two
- * misses across the adaptive poll interval is a real outage.
+ * Two consecutive failures before declaring the server unreachable. One miss
+ * is a phone radio dropping a packet or a tunnel hiccuping.
  */
 const UNREACHABLE_THRESHOLD = 2;
 
@@ -207,23 +181,20 @@ const UNREACHABLE_THRESHOLD = 2;
  * Resolve the one readiness value.
  *
  * THE ORDER IS THE CONTRACT. Each step is justified against the one below it,
- * and reordering them changes behaviour in ways that are not obvious from the
- * cases alone.
+ * and reordering changes behaviour in ways the cases alone do not show.
  */
 export function resolveReadiness(input: ResolveInput): ModelReadiness {
   const { status, statusFailures, cacheState, sizeText, download, turnError } = input;
   const selected = displayable(input.selectedAlias);
 
-  // 1. Reachability first. Nothing below can be trusted if the last few
-  //    status polls never landed — a stale "ready" would enable Send against
-  //    a server that is gone.
+  // 1. Reachability first: a stale "ready" would enable Send against a server
+  //    that is gone.
   if (statusFailures >= UNREACHABLE_THRESHOLD) {
     return { kind: 'serverUnreachable', consecutiveFailures: statusFailures };
   }
 
-  // 2. Work in flight beats a stale failure. The user pressed Retry or
-  //    Download and it IS working; showing them the old error would be a lie
-  //    about the present.
+  // 2. Work in flight beats a stale failure — the user pressed Retry or
+  //    Download and it IS working.
   if (download && (download.alias === null || download.alias === selected)) {
     return {
       kind: 'downloading',
@@ -238,8 +209,7 @@ export function resolveReadiness(input: ResolveInput): ModelReadiness {
     serveStateSpeaksForSelection(status.model, input.selectedAlias)
   ) {
     // Fall back through both names rather than echoing a raw placeholder,
-    // which would render "Starting Loading" or "Starting " with a trailing
-    // space.
+    // which renders "Starting Loading" or a trailing space.
     const name = displayable(status.model) ?? selected ?? 'your local model';
     return { kind: 'starting', alias: name, detail: status.detail };
   }
@@ -276,8 +246,8 @@ export function resolveReadiness(input: ResolveInput): ModelReadiness {
   if (selected === null) return { kind: 'noModel', canSwitch: input.canSwitch };
 
   // 7-9. A real alias is chosen and nothing is serving it. What we tell the
-  //      user depends entirely on what we actually KNOW about the weights,
-  //      which is why cacheState has four values and not two.
+  //      user depends on what we actually KNOW about the weights, which is
+  //      why cacheState has four values and not two.
   switch (cacheState) {
     case 'notOnDisk':
       return { kind: 'needsDownload', alias: selected, sizeText };
@@ -292,12 +262,8 @@ export function resolveReadiness(input: ResolveInput): ModelReadiness {
 // ------------------------------------------------------------------ derived
 
 /**
- * The ONLY send-enabling predicate.
- *
- * A gated send must not consume the draft — see the composer. The trade is
- * deliberate: one extra tap on the banner's action buys the user a visible,
- * cancellable, explicable startup instead of a multi-gigabyte download behind
- * an indeterminate spinner.
+ * The ONLY send-enabling predicate. A gated send must not consume the draft —
+ * see the composer.
  */
 export function sendAllowed(r: ModelReadiness): boolean {
   return r.kind === 'ready';
@@ -367,10 +333,8 @@ export function readinessAction(r: ModelReadiness): ReadinessAction | null {
 }
 
 /**
- * Is this action worth rendering as a button?
- *
- * `chooseModel` is not: the model chip is a few pixels away and already says
- * the same thing.
+ * Is this action worth rendering as a button? `chooseModel` is not — the model
+ * chip is a few pixels away and already says the same thing.
  */
 export function actionIsRenderable(action: ReadinessAction | null): boolean {
   return action !== null && action.kind !== 'chooseModel';
@@ -395,8 +359,6 @@ export function actionTitle(action: ReadinessAction): string {
 //
 // ONE vocabulary, used by every surface: you CHOOSE a model, DOWNLOAD it if
 // needed, START it, and then it is READY. No surface may invent a fifth verb.
-// Ported string-for-string from ModelReadiness.swift:454-591 except where a
-// comment marks a web-specific change.
 
 /** Short status line — the bold half of the readiness banner. */
 export function headline(r: ModelReadiness): string {
@@ -421,21 +383,18 @@ export function headline(r: ModelReadiness): string {
   }
 }
 
-/** The explanation under the headline — the "say why sending is unavailable"
- *  half of the contract. */
+/** The explanation under the headline. */
 export function detail(r: ModelReadiness): string | null {
   switch (r.kind) {
     case 'serverUnreachable':
       return 'Rapid-MLX is probably still running. This page will keep trying.';
     case 'noModel':
-      // In --attach mode the picker is not the answer and saying so is the
-      // whole job: the previous copy sent the user to a control that was
-      // disabled, with no way to find out why.
+      // In --attach mode the picker is not the answer, and saying so is the
+      // whole job.
       return r.canSwitch
         ? 'Choose a model in the sidebar to get started.'
-        : // Terser than the sidebar's version on purpose. The sidebar already
-          // explains the ownership in full and is on screen at the same time;
-          // saying it twice, verbatim, in one viewport reads as a stutter.
+        : // Terser than the sidebar's version on purpose: the sidebar already
+          // explains the ownership in full and is on screen at the same time.
           'The attached engine has no model loaded.';
     case 'needsDownload':
       return r.sizeText
@@ -444,9 +403,8 @@ export function detail(r: ModelReadiness): string | null {
     case 'needsStart':
       return "It's already downloaded — starting takes a few seconds.";
     case 'unknownModel':
-      // Deliberately promises nothing. We cannot say it is downloaded (the
-      // old copy did), we cannot quote a size, and we must not promise a
-      // download either. State the one thing that is true.
+      // Promises nothing on purpose: we cannot say it is downloaded, quote a
+      // size, or promise a download.
       return "Rapid doesn't know this one, so it can't say whether it's already on your Mac.";
     case 'downloading':
       return r.detail ?? 'Starting the download…';
@@ -460,11 +418,9 @@ export function detail(r: ModelReadiness): string | null {
 }
 
 /**
- * Placeholder for the compose field.
- *
- * Terse: it names the blocking step rather than repeating the banner's full
- * sentence, so the two are complementary instead of redundant. On a phone
- * this is often the ONLY affordance visible, since there is no tooltip.
+ * Placeholder for the compose field. Terse: it names the blocking step rather
+ * than repeating the banner's sentence. On a phone this is often the ONLY
+ * affordance visible, since there is no tooltip.
  */
 export function composerPlaceholder(r: ModelReadiness): string {
   switch (r.kind) {
@@ -482,8 +438,6 @@ export function composerPlaceholder(r: ModelReadiness): string {
     case 'starting':
       return `Starting ${r.alias}…`;
     case 'ready':
-      // Web deviation: matches the existing page's placeholder rather than
-      // the Mac app's "Send a message…".
       return 'Message';
     case 'failed':
       return 'Retry to continue';
@@ -491,11 +445,9 @@ export function composerPlaceholder(r: ModelReadiness): string {
 }
 
 /**
- * Send-button tooltip.
- *
- * Doubles as the live-region announcement when a gated send is attempted, so
- * both channels say the same thing. On a phone there is no hover, so the
- * announcement is the only channel that fires.
+ * Send-button tooltip. Doubles as the live-region announcement when a gated
+ * send is attempted — on a phone there is no hover, so that is the only
+ * channel that fires.
  */
 export function sendTooltip(r: ModelReadiness): string {
   switch (r.kind) {
@@ -546,8 +498,7 @@ export function emptyStateSubtitle(r: ModelReadiness): string {
 
 /**
  * The quieter third line on the empty state. Null whenever the subtitle
- * already says everything — an empty state must not stack three sentences
- * that mean the same thing.
+ * already says everything.
  */
 export function emptyStateHint(r: ModelReadiness): string | null {
   switch (r.kind) {

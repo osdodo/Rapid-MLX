@@ -94,16 +94,12 @@ CACHED = {
 def fake_cli(tmp_path):
     """A stub `rapid-mlx` that answers the two JSON queries.
 
-    Payloads are written as JSON files and read back at runtime rather
-    than interpolated into the script source: JSON's ``null`` / ``true``
-    / ``false`` are not Python literals, so embedding them directly
-    produces a script that raises ``NameError``.
+    Payloads are written as JSON files and read back at runtime rather than
+    interpolated into the script source: JSON's ``null``/``true``/``false``
+    are not Python literals and would raise ``NameError``.
 
     Each invocation is logged so tests can assert on caching without
     reaching into the catalog's private state.
-
-    ``rm`` succeeds silently — the CLI's own output is human text and
-    the exit code is the contract.
     """
     calls = tmp_path / "calls.log"
     available = tmp_path / "available.json"

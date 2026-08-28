@@ -2,13 +2,10 @@ import { expect, test as base } from '@playwright/test';
 import { startStub, chatFrame, type Scenario } from './stub-server';
 
 /**
- * The conversation row's `···` menu.
+ * The conversation row's `···` menu, with Pin left outside it.
  *
- * The actions used to be four bare icons on the row. They now live behind a
- * menu, with Pin left outside it — the same split the Mac app's sidebar uses
- * (SidebarView.swift `rowControls`). What matters here is that moving them
- * behind a trigger did not make them unreachable, and that opening the menu
- * does not also activate the row underneath it.
+ * What matters: moving the actions behind a trigger did not make them
+ * unreachable, and opening the menu does not activate the row underneath.
  */
 
 type Stub = Awaited<ReturnType<typeof startStub>>;

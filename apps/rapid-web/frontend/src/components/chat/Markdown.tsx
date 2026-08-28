@@ -10,12 +10,9 @@ import { copyText } from '@/lib/clipboard';
 /**
  * Markdown tokens to React elements.
  *
- * Tokens, never an HTML string. There is no sanitizer in this pipeline
- * because there is nothing to sanitize: React escapes every text node by
- * construction, so the old page's escape-ordering argument
- * (index.html:1111-1114) does not have an equivalent here. The single
- * exception is the MathML that Temml produces, which is the app's only
- * `dangerouslySetInnerHTML` and has its own fixtures.
+ * Tokens, never an HTML string: React escapes every text node by construction,
+ * so there is nothing to sanitize. The single exception is Temml's MathML,
+ * the app's only `dangerouslySetInnerHTML`, which has its own fixtures.
  *
  * Two modes, selected by the `streaming` prop:
  *
@@ -24,8 +21,8 @@ import { copyText } from '@/lib/clipboard';
  *
  * The split keys off `message.status === 'streaming'`, never a global "is
  * anything streaming" flag: the latter is true for the whole transcript while
- * the last answer arrives, so keying off it would swap every earlier message's
- * renderer the moment a new turn starts.
+ * the last answer arrives, so it would swap every earlier message's renderer
+ * the moment a new turn starts.
  */
 
 export interface MarkdownProps {
@@ -282,18 +279,14 @@ interface InlineProps {
 /**
  * Inline content, segmented for math BEFORE it is inline-lexed.
  *
- * The ordering is forced and it is the whole reason this component exists.
- * `marked`'s inline lexer applies CommonMark's backslash-escape rule, which
- * turns `\[`, `\]`, `\(`, `\)` and `\,` into `escape` tokens — so by the time
- * a token tree exists, `\[ 0.85P = 47 \]` has already been shredded into
- * `escape`/`text`/`escape` and the formula is unrecoverable. That is exactly
- * the failure the Swift original documents (LaTeXSegmenter.swift:26-39):
- * delimiters silently stripped, LaTeX left on screen as source.
+ * The ordering is forced and is the whole reason this component exists.
+ * `marked`'s inline lexer applies CommonMark's backslash-escape rule, turning
+ * `\[`, `\]`, `\(`, `\)` and `\,` into `escape` tokens — so by the time a
+ * token tree exists, `\[ 0.85P = 47 \]` is shredded and unrecoverable.
  *
- * So math is found on the block's RAW inline source, and only the prose
- * between formulas is handed to the inline lexer. The cost is that inline
- * code is no longer structurally excluded, which is why `segmentLaTeX` skips
- * backtick runs itself.
+ * So math is found on the block's RAW inline source and only the prose between
+ * formulas reaches the inline lexer. The cost: inline code is no longer
+ * structurally excluded, so `segmentLaTeX` skips backtick runs itself.
  */
 function InlineSource({
   source,

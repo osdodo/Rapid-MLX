@@ -2,17 +2,11 @@ import { expect, test as base } from '@playwright/test';
 import { startStub, type Scenario } from './stub-server';
 
 /**
- * The notice's shape on a wide window.
+ * The notice's shape on a wide window. Asserted by MEASUREMENT — a class name
+ * in the source proves nothing about what the cascade computed.
  *
- * Both properties here were user-visible defects: the notice spanned the full
- * ~2000px window, putting its dismiss button a screen away from the text it
- * belonged to, and carried a tone-coloured left stripe that read as
- * decoration rather than as meaning. Asserted by MEASUREMENT — a class name
- * in the source proves nothing about what the cascade actually computed.
- *
- * The suite's one project is a phone, where a full-bleed notice is correct.
- * The regression only exists above the cap, so this overrides the viewport;
- * without that it would silently test nothing.
+ * The suite's one project is a phone, where a full-bleed notice is correct, so
+ * this overrides the viewport; without that it would silently test nothing.
  */
 type Stub = Awaited<ReturnType<typeof startStub>>;
 

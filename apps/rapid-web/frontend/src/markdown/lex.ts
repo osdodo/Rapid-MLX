@@ -3,21 +3,15 @@ import { Lexer, type Token, type TokensList } from 'marked';
 /**
  * Block-level markdown lexing, with incremental support for streaming.
  *
- * `marked`'s LEXER, not its HTML renderer. Two reasons, and the first is the
- * one that matters:
+ * `marked`'s LEXER, not its HTML renderer, for two reasons:
  *
- * 1. Every token carries `raw`, the exact source that produced it. That is
- *    what makes the frozen-block arithmetic below possible at all — without a
- *    per-token source length there is no way to know how much of the buffer a
- *    set of tokens accounts for.
- * 2. We walk tokens and emit React elements. There is no HTML string and no
- *    sanitizer anywhere in the pipeline, so the old page's whole
- *    escape-ordering argument (index.html:1111-1114) becomes structurally
- *    unnecessary — React escapes text nodes by construction.
+ * 1. Every token carries `raw`, the exact source that produced it — without a
+ *    per-token source length the frozen-block arithmetic below is impossible.
+ * 2. We walk tokens and emit React elements, so there is no HTML string and
+ *    no sanitizer anywhere in the pipeline; React escapes text by construction.
  *
- * `react-markdown` + `remark-gfm` was rejected: ~250 KB for the same feature
- * set against marked's ~43 KB measured, and its AST does not expose per-block
- * source offsets, so incremental lexing would have to be bolted on outside it.
+ * `react-markdown` + `remark-gfm` was rejected: ~250 KB for the same features
+ * against marked's ~43 KB, and its AST exposes no per-block source offsets.
  */
 
 const LEXER_OPTIONS = {
@@ -36,13 +30,8 @@ export function parseMarkdown(source: string): TokensList {
  *
  * `frozen` holds blocks that can never change again; `frozenChars` is how much
  * of the buffer they account for. Each flush re-lexes only
- * `buffer.slice(frozenChars)`, so the cost is proportional to the current
- * block rather than the whole answer.
- *
- * This is what removes the O(n²). The old page re-parsed the ENTIRE
- * accumulated buffer on every animation frame (index.html:1744-1755) and then
- * replaced the whole subtree, which also destroyed any open `<details>`, the
- * text selection, and every `<pre>`'s scroll position, sixty times a second.
+ * `buffer.slice(frozenChars)`, so cost is proportional to the current block
+ * rather than the whole answer. This is what removes the O(n²).
  */
 export interface LexState {
   /** Referentially stable across flushes, so `React.memo` can skip them. */
@@ -60,24 +49,19 @@ export function emptyLexState(): LexState {
  * May the tokens before the last one in `tail` be frozen?
  *
  * A block that LOOKS complete can still be rewritten by text that has not
- * arrived yet, and freezing one that later changes makes the transcript
- * flicker between two renderings — the most confusing possible symptom, and
- * one that only reproduces against specific model output.
+ * arrived, and freezing one that later changes makes the transcript flicker
+ * between two renderings.
  *
- * The vetoes, each for a construct that mutates retroactively:
+ * The vetoes, each a construct that mutates retroactively:
  *
- *   * An open code fence. The generalisation of the old page's special case
- *     (index.html:1131-1140), which existed because every streaming reply
- *     containing code otherwise flashed literal backticks until its closing
- *     fence arrived.
+ *   * An open code fence — otherwise every streaming reply containing code
+ *     flashes literal backticks until its closing fence arrives.
  *   * An open `$$` or `\[`. Same problem, for math.
- *   * A trailing paragraph. `Title\n=====` turns a settled paragraph into an
- *     `<h1>` retroactively — a setext heading is only recognisable from the
- *     line AFTER it.
- *   * A trailing table. Its alignment row arrives after its header row, so a
- *     header alone lexes as a paragraph and is re-read as a table one line
- *     later.
- *   * A trailing list. A blank line before the next item turns a tight list
+ *   * A trailing paragraph: `Title\n=====` turns a settled paragraph into an
+ *     `<h1>`, since a setext heading is only visible from the NEXT line.
+ *   * A trailing table: its alignment row arrives after the header row, so a
+ *     header alone lexes as a paragraph and is re-read one line later.
+ *   * A trailing list: a blank line before the next item turns a tight list
  *     loose, re-wrapping every item in a `<p>`.
  */
 export function canFreeze(tailSource: string, tail: Token[]): boolean {

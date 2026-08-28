@@ -1,13 +1,9 @@
 /**
  * Server-sent event framing over ``fetch`` + ``ReadableStream``.
  *
- * Why not ``EventSource``: it cannot set an ``Authorization`` header, and this
+ * Not ``EventSource``: it cannot set an ``Authorization`` header, and this
  * server's only credential is a bearer. That is also why the chat stream is a
- * POST rather than a GET — ``EventSource`` is GET-only.
- *
- * The old page open-coded this loop twice (index.html:1667-1689 for downloads
- * and :1738-1772 for chat), with the two copies already drifting apart. One
- * implementation, one set of tests.
+ * POST — ``EventSource`` is GET-only.
  */
 
 /** A parsed frame. Comment frames and ``[DONE]`` never reach a caller. */
@@ -16,17 +12,14 @@ export interface SseFrame {
 }
 
 /**
- * Split a byte stream into SSE frames.
+ * Split a byte stream into SSE frames, yielding each ``data:`` payload.
+ * Three behaviours are load-bearing:
  *
- * Yields each frame's ``data:`` payload. Three behaviours are load-bearing:
- *
- * * **Partial frames survive chunk boundaries.** A network chunk can end in
- *   the middle of ``data:``; the trailing segment is retained in the buffer
- *   rather than parsed, or a token would be silently truncated.
- * * **Comment frames are skipped.** The download feed sends ``: keepalive``
- *   every 15 s (app.py:566) to hold the connection open through a tunnel.
- *   They have no ``data:`` prefix and simply do not match.
- * * **``[DONE]`` is swallowed.** It is OpenAI's terminator, not a payload.
+ * * **Partial frames survive chunk boundaries.** A chunk can end mid-``data:``,
+ *   so the trailing segment is retained rather than parsed.
+ * * **Comment frames are skipped** — the keepalives that hold a tunnel open
+ *   have no ``data:`` prefix and simply do not match.
+ * * **``[DONE]`` is swallowed.** OpenAI's terminator, not a payload.
  */
 export async function* readEventStream(
   body: ReadableStream<Uint8Array>,

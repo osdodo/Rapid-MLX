@@ -3,36 +3,28 @@ import type { MessageNode } from '@/state/types';
 /**
  * Tree arithmetic over a flat node array.
  *
- * A port of apps/rapid-mac/Sources/Rapid/Chat/MessageTree.swift.
+ * Ported from `apps/rapid-mac/Sources/Rapid/Chat/MessageTree.swift`.
  *
- * A conversation persists EVERY branch it has ever grown as one unsorted bag
- * of nodes; the transcript on screen is the single root-to-leaf path derived
- * here. Keeping the maths in one module — rather than spread across the store
- * and the components — is what lets the sibling switcher, the wire body,
- * export and search all agree on what "the conversation" means at any moment.
+ * A conversation persists EVERY branch it has grown as one unsorted bag of
+ * nodes; the transcript on screen is the single root-to-leaf path derived
+ * here. Keeping the maths in one module is what lets the sibling switcher, the
+ * wire body, export and search agree on what "the conversation" means.
  *
- * Edges are single-direction (`parentId` only). Everything a `childIds` array
- * would have given us is recomputed by scan instead, which trades a linear
- * pass per query for the guarantee that the two halves of a bidirectional link
- * can never disagree. Transcripts are hundreds of nodes at the very top end
- * and every one of these runs off a user gesture, never per streamed token, so
- * the scan does not show up.
+ * Edges are single-direction (`parentId` only) — everything a `childIds` array
+ * would give is recomputed by scan, trading a linear pass per query for the
+ * guarantee that two halves of a bidirectional link cannot disagree. Every
+ * query runs off a user gesture, never per streamed token.
  *
  * EVERY ENTRY POINT IS TOTAL. Cycles, orphans and dangling leaf pointers are
- * absorbed into a sensible answer rather than throwing. A corrupt or
- * hand-edited localStorage blob must degrade to a readable transcript, never
- * to a white screen — and unlike the Mac app's file, this one lives in a
- * store the user can open and edit in a devtools console.
+ * absorbed rather than thrown: this store lives in a localStorage blob the
+ * user can edit in a devtools console, and a corrupt one must degrade to a
+ * readable transcript rather than a white screen.
  */
 
 /**
- * Sibling order.
- *
- * `createdAt` is the real signal — branches are grown one at a time by a user
- * gesture — with the id as a tie-break so two nodes stamped inside the same
- * millisecond still order deterministically across reloads. An unstable order
- * would make the `‹ 2/3 ›` index jump around under the user between one
- * session and the next.
+ * Sibling order. `createdAt` is the real signal, with the id as a tie-break so
+ * two nodes stamped in the same millisecond still order deterministically —
+ * an unstable order makes the `‹ 2/3 ›` index jump around between sessions.
  */
 export function precedes(a: MessageNode, b: MessageNode): boolean {
   if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt;
@@ -44,13 +36,12 @@ function sorted(nodes: MessageNode[]): MessageNode[] {
 }
 
 /**
- * First occurrence of each id wins; later duplicates are dropped.
+ * First occurrence of each id wins.
  *
- * Duplicate ids can only come from a corrupt or hand-merged store, but they
- * must be resolved ONCE, up front: the path walk's index keeps the first copy
- * while the sibling and subtree scans would count every copy — so navigation
- * and deletion could disagree about what a node even is. Every consumer of a
- * whole tree runs its input through this first.
+ * Duplicate ids only come from a corrupt or hand-merged store, but they must
+ * be resolved ONCE up front: the path walk's index keeps the first copy while
+ * the sibling and subtree scans count every copy, so navigation and deletion
+ * would disagree about what a node is.
  */
 export function deduplicateById(nodes: MessageNode[]): MessageNode[] {
   const seen = new Set<string>();
@@ -67,10 +58,9 @@ export function children(parentId: string | null, nodes: MessageNode[]): Message
 }
 
 /**
- * The sibling group containing `id` — every alternative answer at that point,
- * including `id` itself. A node with no alternatives returns a single-element
- * array, which is the signal the UI uses to hide the switcher entirely rather
- * than render a permanent `‹ 1/1 ›`.
+ * The sibling group containing `id`, including `id` itself. A node with no
+ * alternatives returns a single-element array, which is the signal the UI uses
+ * to hide the switcher rather than render a permanent `‹ 1/1 ›`.
  */
 export function siblings(id: string, nodes: MessageNode[]): MessageNode[] {
   const node = nodes.find((candidate) => candidate.id === id);
@@ -81,12 +71,10 @@ export function siblings(id: string, nodes: MessageNode[]): MessageNode[] {
 /**
  * Walk down from `id` and return the leaf that terminates the walk.
  *
- * At each step `preferring` decides which way to go, falling back to the
- * newest child when it has no opinion. That map is what makes returning to a
- * branch land where the user left it: without it a branch carrying a long
- * continuation would always jump to its deepest tip, so a user who stepped
- * back three turns and then looked at a sibling would find their position
- * silently discarded on the way back.
+ * `preferring` decides each step, falling back to the newest child. That map
+ * is what makes returning to a branch land where the user left it — without it
+ * a long continuation always jumps to its deepest tip, silently discarding the
+ * position of a user who stepped back and looked at a sibling.
  */
 export function deepestLeaf(
   id: string,
@@ -100,16 +88,14 @@ export function deepestLeaf(
     const options = children(current, nodes);
     if (options.length === 0) break;
 
-    // A remembered choice only counts while it is still a child of this node.
-    // A stale entry — branch deleted, store hand-edited — degrades to the
-    // newest child rather than stranding the walk.
+    // A remembered choice only counts while it is still a child of this node;
+    // a stale entry degrades to the newest child rather than stranding.
     const wanted = preferring[current];
     const remembered = wanted ? options.find((option) => option.id === wanted) : undefined;
     const next = remembered ?? options[options.length - 1];
     if (!next) break;
 
-    // A cycle can only come from a corrupt store, but walking one would hang
-    // the tab. Bail and treat the current node as the leaf.
+    // A cycle only comes from a corrupt store, but walking one hangs the tab.
     if (seen.has(next.id)) break;
     seen.add(next.id);
     current = next.id;
@@ -119,13 +105,11 @@ export function deepestLeaf(
 }
 
 /**
- * The leaf to show when a conversation carries no usable `activeLeafId` —
- * either because it predates branching or because the stored pointer no
- * longer resolves.
+ * The leaf to show when a conversation carries no usable `activeLeafId`.
  *
- * Picks the newest node overall, then resolves downwards, which lands on the
- * tip of the branch most recently worked in and reduces to "the last message"
- * for a linear transcript.
+ * Picks the newest node overall, then resolves downwards: lands on the tip of
+ * the branch most recently worked in, and reduces to "the last message" for a
+ * linear transcript.
  */
 export function defaultLeaf(
   nodes: MessageNode[],
@@ -140,11 +124,9 @@ export function defaultLeaf(
 /**
  * The parent -> chosen-child edges of `path`.
  *
- * Recorded every time a path becomes the visible one, so each fork remembers
- * which way the user last went. Only the edges actually on the path are
- * produced; callers MERGE this over what they already hold rather than
- * replacing it, so a branch the user has not visited this session keeps the
- * position it had.
+ * Recorded whenever a path becomes visible, so each fork remembers which way
+ * the user went. Callers MERGE this over what they hold rather than replacing
+ * it, so an unvisited branch keeps its position.
  */
 export function choicesAlong(path: MessageNode[]): Record<string, string> {
   const edges: Record<string, string> = {};
@@ -159,10 +141,9 @@ export function choicesAlong(path: MessageNode[]): Record<string, string> {
  * The visible transcript: the root-to-leaf path ending at `activeLeafId`,
  * oldest turn first.
  *
- * This is what the user sees, what gets sent to the model, and what export
- * writes — one definition, so those three can never diverge. An unresolvable
- * `activeLeafId` falls back to `defaultLeaf` rather than rendering an empty
- * conversation.
+ * What the user sees, what is sent to the model, and what export writes — one
+ * definition, so the three cannot diverge. An unresolvable `activeLeafId`
+ * falls back to `defaultLeaf` rather than rendering an empty conversation.
  */
 export function activePath(
   nodes: MessageNode[],
@@ -198,10 +179,9 @@ export function activePath(
 /**
  * `id` plus every node beneath it, across every branch.
  *
- * Deleting a turn takes its whole subtree with it. The alternative —
- * re-parenting the orphans onto the deleted node's parent — would splice a
- * prompt and an answer that never belonged together and present the result as
- * real history.
+ * Deleting a turn takes its whole subtree. Re-parenting the orphans onto the
+ * deleted node's parent would splice a prompt and an answer that never
+ * belonged together and present it as real history.
  */
 export function subtree(id: string, nodes: MessageNode[]): Set<string> {
   const collected = new Set<string>([id]);
@@ -220,17 +200,14 @@ export function subtree(id: string, nodes: MessageNode[]): Set<string> {
 }
 
 /**
- * Reconnect a transcript that carries no parent links into a degenerate tree —
- * each row parented to the one before it.
- *
- * Runs on load for every conversation written before branching existed. The
- * result renders identically to how it always did, and the first retry on it
- * grows a real branch from there.
+ * Reconnect a parentless transcript into a degenerate tree, each row parented
+ * to the one before it. Runs on load for conversations written before
+ * branching existed.
  *
  * DELIBERATELY keyed on "NO node has a parent" rather than "SOME node lacks
- * one": in the branching model a user who edits the opening prompt legitimately
- * owns several parentless roots, so a partially-linked tree is already a real
- * tree and must be left alone.
+ * one": a user who edits the opening prompt legitimately owns several
+ * parentless roots, so a partially-linked tree is already real and must be
+ * left alone.
  */
 export function repairLegacyChain(nodes: MessageNode[]): MessageNode[] {
   if (nodes.length <= 1) return nodes;
@@ -242,12 +219,11 @@ export function repairLegacyChain(nodes: MessageNode[]): MessageNode[] {
 }
 
 /**
- * Drop parent links that point at a node which is not present.
+ * Drop parent links pointing at an absent node.
  *
- * A dangling parent would strand its whole subtree outside every path, making
- * those turns unreachable in the UI — present in storage, invisible on screen,
- * and counted by nothing. Promoting the orphan to a root keeps the content
- * visible. Applied on load, after the legacy repair.
+ * A dangling parent strands its whole subtree outside every path — present in
+ * storage, invisible on screen. Promoting the orphan to a root keeps the
+ * content visible. Applied on load, after the legacy repair.
  */
 export function promoteOrphans(nodes: MessageNode[]): MessageNode[] {
   const present = new Set(nodes.map((node) => node.id));
@@ -257,12 +233,12 @@ export function promoteOrphans(nodes: MessageNode[]): MessageNode[] {
 }
 
 /**
- * The node that a `‹ 2/3 ›` switcher on `id` should actually pivot on.
+ * The node a `‹ 2/3 ›` switcher on `id` should pivot on.
  *
  * Walks back to the first node after the owning user turn, so every row of a
- * logical answer — the answer itself, a tool chip, a follow-up — maps onto the
- * same fork. Without this, the switcher on the second row of a multi-part
- * answer would offer that row's siblings rather than the answer's.
+ * logical answer maps onto the same fork. Without it the switcher on the
+ * second row of a multi-part answer offers that row's siblings, not the
+ * answer's.
  */
 export function branchAnchor(id: string, nodes: MessageNode[]): string | null {
   const index = new Map(nodes.map((node) => [node.id, node] as const));

@@ -18,19 +18,13 @@ import { useMidnightTick } from '@/lib/useMidnightTick';
 /**
  * Global conversation search, opened with the sidebar's magnifier or ⌘K.
  *
- * Replaces the always-on search field and Archived toggle that used to sit in
- * the sidebar. Those cost two permanent controls at the top of a 260px rail
- * for something used occasionally, and the toggle in particular was a mode:
- * the list silently stopped showing active conversations until you noticed
- * and switched back.
+ * Replaces an always-on search field and an Archived toggle — two permanent
+ * controls in a 260px rail, one of which was a mode that silently hid active
+ * conversations.
  *
- * Ported from the Mac app's `ConversationSearchView`. Two behaviours come
- * with it and are the reason the toggle is not needed:
- *
- *   - **Archived conversations are included**, marked with a box icon rather
- *     than hidden behind a mode. Search is their recovery path.
- *   - **Every branch is searched**, not just the visible path — see
- *     `chat/ConversationSearch.ts`.
+ * Two behaviours are why the toggle is not needed: archived conversations are
+ * **included** (marked with a box icon; search is their recovery path), and
+ * **every branch is searched**, not just the visible path.
  */
 export function SearchPalette({
   open,

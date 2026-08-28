@@ -4,20 +4,15 @@ import { cn } from '@/lib/utils';
  * The official Rapid-MLX `R` brand mark.
  *
  * The three path strings are copied **verbatim** from `RapidRMark.swift`
- * (`apps/rapid-mac`), which in turn took them straight from the brand's
- * `rapid_icon.svg` — a 192 × 192 viewBox with three `<path>` elements. Nothing
- * here is traced, redrawn or approximated, so the web and the Mac app render
- * the same geometry and re-exporting the logo means replacing three strings in
- * two places.
+ * (`apps/rapid-mac`), itself taken straight from the brand's `rapid_icon.svg`.
+ * Nothing is traced or approximated, so re-exporting the logo means replacing
+ * three strings in two places.
  *
- * The SVG's white background `<rect>` is deliberately NOT reproduced: the mark
- * has to sit on the sidebar's own surface in both themes, and a filled tile
- * would be a white square in the dark one. `fill="currentColor"` inherits the
- * surrounding text colour for the same reason.
+ * The SVG's white background `<rect>` is deliberately NOT reproduced — it
+ * would be a white tile in dark mode. `fill="currentColor"` instead.
  *
- * The `R`'s counter — the enclosed space in the bowl — is formed by the path
- * folding back on itself, which fills correctly under the default `nonzero`
- * rule. Do not set `fill-rule="evenodd"` here; it hollows the glyph out.
+ * Do not set `fill-rule="evenodd"`: the `R`'s counter is formed by the path
+ * folding back on itself and needs the default `nonzero`.
  */
 export function RapidMark({ className }: { className?: string }) {
   return (

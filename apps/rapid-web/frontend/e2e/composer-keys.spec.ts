@@ -4,12 +4,9 @@ import { startStub, type Scenario } from './stub-server';
 /**
  * Return-to-send, which the default project cannot cover.
  *
- * `playwright.config.ts` runs one project — iPhone 14 — because the audience
- * is a phone. But this behaviour is deliberately keyboard-only: on touch a
- * bare Return must stay a newline, since there is no Shift to reach for and
- * the phone would otherwise lose the only way to type one. So the desktop
- * half needs a context with a fine pointer, and the touch half needs the
- * default one. Both are asserted here, against each other.
+ * `playwright.config.ts` runs one project (iPhone 14), but this behaviour is
+ * keyboard-only: on touch a bare Return must stay a newline. So the desktop
+ * half needs a context with a fine pointer and the touch half the default one.
  */
 
 type Stub = Awaited<ReturnType<typeof startStub>>;

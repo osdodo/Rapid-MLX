@@ -1,35 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model catalog, assembled from the ``rapid-mlx`` CLI.
 
-Three subprocess calls back this module:
+Backed by three subprocess calls: ``models --json`` (every alias),
+``models --cached --json`` (what is on disk) and ``rm <org/repo> --yes``.
+The first two emit only JSON on stdout; ``rm`` emits human text, so its
+exit code is the contract.
 
-* ``rapid-mlx models --json`` — every alias the install knows about,
-  bucketed by modality. Static for the life of an install.
-* ``rapid-mlx models --cached --json`` — what is actually on disk.
-  Changes whenever a download lands or a model is removed.
-* ``rapid-mlx rm <org/repo> --yes`` — delete a snapshot from the cache.
-
-The first two emit **only** the JSON payload on stdout (the CLI
-suppresses its staleness banner in JSON mode), which is what makes them
-parseable rather than scraped. ``rm`` emits human text, so its exit code
-is the contract and its output is only ever shown back to the user.
-
-Two facts from the payloads drive most of the logic here, and both are
-easy to get wrong:
+Two facts from the payloads drive most of the logic, and both are easy to
+get wrong:
 
 * **Only the ``text`` bucket is chat-capable.** ``video-gen`` and
   ``image-gen`` aliases have no ``stream_chat``, so
-  ``/v1/chat/completions`` on one is an ``AttributeError``, and audio
-  aliases are a different lane entirely. Offering them in a chat model
-  picker is how a user ends up waiting out a multi-GB download for a
-  model that dead-ends on first send. ``flux2-klein-4b`` is a live
-  example: it can be present, cached and ``state: "ok"``, and is still
-  not a chat model.
-* **``state: "ok"`` is not the same as "present".** A cached row can be
-  ``incomplete`` — a partial download, config.json plus some shards.
-  Treating that as cached means "switch" hands the engine a snapshot it
-  cannot load, and the failure surfaces minutes later as a start
-  failure rather than immediately as "not downloaded".
+  ``/v1/chat/completions`` on one is an ``AttributeError``.
+  ``flux2-klein-4b`` can be present, cached and ``state: "ok"`` and is
+  still not a chat model.
+* **``state: "ok"`` is not "present".** A cached row can be ``incomplete``
+  — a partial download. Treating that as cached hands the engine a
+  snapshot it cannot load, surfacing minutes later as a start failure
+  rather than immediately as "not downloaded".
 """
 
 from __future__ import annotations
@@ -43,30 +31,22 @@ import signal
 import time
 from dataclasses import dataclass, field
 
-# The catalog call is pure Python (it reads a checked-in manifest, no
-# network), and the cached scan walks the HF cache directory. Both are
-# sub-second on a healthy install, so a short ceiling is enough to keep
-# a wedged CLI from hanging an HTTP request indefinitely.
+# Both calls are sub-second on a healthy install (the catalog reads a
+# checked-in manifest, the scan walks the HF cache), so this only keeps a
+# wedged CLI from hanging an HTTP request indefinitely.
 _SUBPROCESS_TIMEOUT_S = 30.0
 
-# Removal unlinks every blob in a snapshot, which for a 60 GB model on a
-# slow external volume is not a sub-second operation — hence its own,
-# much longer ceiling. It is still bounded: a `rm` that never returns
-# would otherwise hold the request open for the life of the process.
+# Removal unlinks every blob in a snapshot — not sub-second for a 60 GB
+# model on a slow volume — but still bounded.
 _REMOVE_TIMEOUT_S = 300.0
 
-# ``org/repo``. Applied to the value taken from the catalog payload before
-# it becomes an argv token: a row whose ``hf_path`` began with ``-`` would
-# otherwise be parsed by the CLI as a flag rather than as a model.
+# ``org/repo``. Applied before the value becomes an argv token: an
+# ``hf_path`` beginning with ``-`` would be parsed by the CLI as a flag.
 _HF_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# The alias list only changes when the `rapid-mlx` package itself is
-# upgraded, which cannot happen under a running supervisor. Cached for
-# the whole process.
-#
-# The disk scan is different: a download landing changes it, so it
-# carries a short TTL instead. The TTL is what makes repeated polling
-# from the page cheap without going stale enough to notice.
+# The alias list only changes when `rapid-mlx` itself is upgraded, which
+# cannot happen under a running supervisor, so it is cached for the whole
+# process. The disk scan changes whenever a download lands, hence a TTL.
 _CACHED_SCAN_TTL_S = 5.0
 
 
@@ -119,8 +99,8 @@ class ModelCatalog:
         self._binary = binary
         self._available: dict | None = None
         self._cached: _CachedScan | None = None
-        # Serialises refreshes. Without it, N concurrent page loads on a
-        # cold cache each spawn their own pair of subprocesses.
+        # Without this, N concurrent page loads on a cold cache each spawn
+        # their own pair of subprocesses.
         self._lock = asyncio.Lock()
 
     async def _run(
@@ -134,12 +114,9 @@ class ModelCatalog:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 # Own process group so a timeout can kill the whole tree.
-                # Killing only the leader leaves its children holding the
-                # stdout pipe open, and asyncio does not consider the
-                # process finished until those pipes close — so the
-                # "timeout" would still block for the child's full
-                # runtime, which is exactly what the timeout exists to
-                # prevent.
+                # Killing only the leader leaves children holding the
+                # stdout pipe open, and asyncio waits for those pipes — so
+                # the "timeout" would still block for the full runtime.
                 start_new_session=True,
             )
         except OSError as exc:
@@ -206,8 +183,8 @@ class ModelCatalog:
         by_repo: dict[str, dict] = {}
         for row in payload.get("cached", []):
             repo = row.get("repo")
-            # Only fully-materialised snapshots count. An "incomplete"
-            # row is a partial download; calling it cached makes a switch
+            # Only fully-materialised snapshots count: an "incomplete" row
+            # is a partial download, and calling it cached makes a switch
             # fail minutes later inside the engine instead of here.
             if repo and row.get("state") == "ok":
                 by_repo[repo] = row
@@ -216,20 +193,15 @@ class ModelCatalog:
         return by_repo
 
     def invalidate_cache(self) -> None:
-        """Force the next disk scan to re-run.
-
-        Called after anything that changes what is on disk — a completed
-        download, a removal — so the page does not keep showing a stale
-        "not downloaded" for up to the TTL.
-        """
+        """Force the next disk scan to re-run, after a download or removal
+        changes what is present."""
         self._cached = None
 
     async def list_chat_models(self, *, force: bool = False) -> list[ModelEntry]:
         """Chat-capable aliases, with on-disk state merged in.
 
-        Non-text modalities are excluded entirely rather than flagged:
-        this list feeds a picker whose only action is "load for chat",
-        and every non-text entry in it would be a trap.
+        Non-text modalities are excluded rather than flagged: the only
+        action in this picker is "load for chat", so they would be traps.
         """
         async with self._lock:
             available = await self._available_payload()
@@ -242,8 +214,8 @@ class ModelCatalog:
             if not alias or not hf_path:
                 continue
             # Matched on hf_path, not alias: a cached row carries
-            # ``alias: null`` whenever the repo is not in the registry,
-            # so an alias-keyed join would silently drop entries.
+            # ``alias: null`` when the repo is not in the registry, so an
+            # alias-keyed join would silently drop entries.
             hit = cached.get(hf_path)
             entries.append(
                 ModelEntry(
@@ -258,32 +230,28 @@ class ModelCatalog:
                 )
             )
 
-        # Downloaded models first, then alphabetical. On a 179-alias
-        # catalog the handful the user actually has is what they want to
-        # reach, and burying those in an alphabetical wall makes the
-        # picker useless on a phone.
+        # Downloaded first, then alphabetical: on a 179-alias catalog the
+        # handful the user has is what they want to reach.
         entries.sort(key=lambda e: (not e.cached, e.alias))
         return entries
 
     async def is_known_chat_alias(self, alias: str) -> bool:
         """Whether ``alias`` is a chat model this install knows.
 
-        Every alias arriving over HTTP is checked against this before it
-        reaches a subprocess argument. The alternative — passing the
-        string through — would let a remote caller name an arbitrary
-        ``org/repo``, which is a general-purpose fetch primitive rather
-        than a model picker.
+        Every alias arriving over HTTP is checked here before it reaches a
+        subprocess argument: passing the string through would let a remote
+        caller name an arbitrary ``org/repo``.
         """
         return await self.chat_profile(alias) is not None
 
     async def chat_profile(self, alias: str) -> dict | None:
         """The catalog row for a chat alias, or ``None`` if unknown.
 
-        Returns the row rather than a bool so callers that need the
-        download size do not have to re-list. ``size_bytes`` is
-        ``None`` for repos missing from the size manifest — that is a
-        real case (``google/embeddinggemma-300m-6bit``), and callers
-        must treat it as "unknown", never as zero.
+        Returns the row rather than a bool so callers needing the download
+        size do not re-list. ``size_bytes`` is ``None`` for repos missing
+        from the size manifest (a real case:
+        ``google/embeddinggemma-300m-6bit``) and must be treated as
+        unknown, never as zero.
         """
         async with self._lock:
             available = await self._available_payload()
@@ -295,27 +263,16 @@ class ModelCatalog:
     async def remove(self, alias: str) -> int | None:
         """Delete ``alias``'s snapshot from the HF cache.
 
-        Returns the bytes freed, or ``None`` when the size was not
-        known. Raises :class:`RemovalError` if the CLI refused.
+        Returns the bytes freed, or ``None`` when unknown. Raises
+        :class:`RemovalError` if the CLI refused.
 
-        The argument passed to ``rm`` is the catalog's ``hf_path``, not
-        the user's string, and not the alias either. Two reasons, and
-        both matter:
+        ``rm`` is passed the catalog's ``hf_path``, never the alias: the
+        CLI scans for ``models--<owner>--<repo>``, which a bare alias
+        cannot match, and looking the alias up first means the argv token
+        is one this install published rather than one a caller chose.
 
-        * The alias is looked up in the catalog first, so the value that
-          reaches argv is one this install published rather than one a
-          caller chose. That is the same defence ``/api/models/pull``
-          and ``/api/models/load`` apply, and here it is the difference
-          between a model picker and a remote delete primitive.
-        * ``rm`` scans the cache for ``models--<owner>--<repo>``, which a
-          bare alias can never match. The CLI does resolve text aliases
-          itself, but only for names in ``aliases.json``; passing the
-          repo skips that lookup entirely and cannot resolve to a
-          different model than the row the user saw.
-
-        The size is measured before the delete, from the cached scan.
-        ``rm`` prints ``Freed 3.1G``, but that is a rounded human string
-        the page would have to parse back into bytes to re-format.
+        Size is measured before the delete, from the cached scan — ``rm``
+        prints a rounded human string like ``Freed 3.1G``.
         """
         profile = await self.chat_profile(alias)
         if profile is None:
@@ -323,17 +280,15 @@ class ModelCatalog:
 
         hf_path = profile.get("hf_path")
         if not isinstance(hf_path, str) or not _HF_PATH_RE.match(hf_path):
-            # A malformed manifest row rather than anything the caller
-            # did, but it is still a string on its way to argv.
+            # A malformed manifest row, but still a string on its way to argv.
             raise RemovalError(f"{alias} has no usable repository id")
 
         async with self._lock:
             cached = await self._cached_by_repo()
         hit = cached.get(hf_path)
         if hit is None:
-            # Not an error the user needs to act on — the row they
-            # tapped is already gone — but the caller reports it rather
-            # than claiming to have freed something.
+            # Reported rather than ignored: the row is already gone, but
+            # claiming to have freed something would be wrong.
             raise RemovalError(f"{alias} is not downloaded")
         freed = hit.get("size_bytes")
 

@@ -1,13 +1,9 @@
 /**
  * The persisted domain model.
  *
- * The single most important change from the old page: `messages` used to be a
- * live alias into `store.conversations[i].messages`, and every mutation path
- * (`push`, `splice`, in-place `stats` assignment) depended on the two names
- * pointing at the same array object (index.html:1098-1102, :1852-1859). There
- * is no such variable here. Reads go through `selectActivePath`, writes go
- * through store actions, and nothing outside the conversations slice touches
- * the node bag.
+ * There is deliberately no live alias into the node bag. Reads go through
+ * `selectActivePath`, writes go through store actions, and nothing outside the
+ * conversations slice touches the nodes.
  */
 
 export type Role = 'system' | 'user' | 'assistant';

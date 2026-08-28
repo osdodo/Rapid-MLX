@@ -22,13 +22,10 @@ import { Input } from '@/components/ui/input';
  * The conversation list.
  *
  * Rendered in two places and deliberately ONE implementation: the persistent
- * sidebar on a wide screen, and the slide-out drawer below the layout
- * breakpoint. Two copies would drift — the search, the grouping and the
- * midnight ticker all have to behave identically or the narrow build quietly
- * becomes the worse one.
+ * sidebar on a wide screen, and the slide-out drawer below the breakpoint. Two
+ * copies would drift and the narrow build would quietly become the worse one.
  *
- * `onNavigate` is what differs: the drawer closes itself after a selection,
- * the sidebar does not.
+ * `onNavigate` is what differs: the drawer closes after a selection.
  */
 export function ConversationList({ onNavigate }: { onNavigate?: () => void }) {
   const conversations = useStore((state) => state.conversations);

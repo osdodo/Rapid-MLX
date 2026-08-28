@@ -7,10 +7,9 @@
 /**
  * Binary byte sizes.
  *
- * Returns null rather than "0 B" for a missing or zero size, so a caller can
- * omit the whole element instead of showing a size it does not know. The old
- * page did the same (index.html:1463-1469), and it matters here because
- * `size_bytes` is genuinely null for models the catalog cannot size.
+ * Returns null rather than "0 B" for a missing size, so a caller can omit the
+ * element entirely — `size_bytes` is genuinely null for models the catalog
+ * cannot size.
  */
 export function formatBytes(bytes: number | null | undefined): string | null {
   if (bytes === null || bytes === undefined || bytes <= 0) return null;
@@ -65,12 +64,10 @@ export type DateGroup = 'Today' | 'Yesterday' | 'Previous 7 days' | 'Previous 30
 /**
  * Which date bucket a conversation belongs to.
  *
- * Bucketed on CALENDAR days, not on elapsed milliseconds. Something sent at
- * 23:55 belongs to "Yesterday" the moment the clock passes midnight, which a
+ * Bucketed on CALENDAR days, not elapsed milliseconds: something sent at 23:55
+ * belongs to "Yesterday" once the clock passes midnight, which a
  * `now - then < 86400000` test gets wrong for the next 23 hours — and gets
- * wrong specifically for the most recent conversation, which is the one the
- * user is most likely looking for. The Mac app's sidebar ticks over at
- * midnight for the same reason (SidebarView.swift).
+ * wrong for the most recent conversation specifically.
  */
 export function dateGroupOf(timestamp: number, now: number): DateGroup {
   const startOfToday = new Date(now);

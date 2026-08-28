@@ -1,10 +1,9 @@
 /**
  * Split assistant text into alternating markdown and LaTeX runs.
  *
- * A port of apps/rapid-mac/Sources/Rapid/UI/Markdown/LaTeXSegmenter.swift.
+ * Ported from `apps/rapid-mac/Sources/Rapid/UI/Markdown/LaTeXSegmenter.swift`.
  *
- * DELIMITERS — matched against the KaTeX/MathJax defaults every model in the
- * wild emits:
+ * DELIMITERS — the KaTeX/MathJax defaults every model in the wild emits:
  *
  *   $$ … $$   display math, may span lines
  *   $  …  $   inline math, SINGLE LINE ONLY, so a stray dollar in prose
@@ -12,40 +11,28 @@
  *   \[ … \]   display math, bracket form
  *   \( … \)   inline math, bracket form
  *
- * The bracket forms are NOT optional extras. A dogfood run recorded in the
- * Swift original (LaTeXSegmenter.swift:26-39) had an instruction-tuned model
- * emit ONLY bracket delimiters for a plain word problem — no `$` anywhere.
- * Missing them is not cosmetic, because CommonMark's escape rule then eats
- * them: `\(`, `\)`, `\[` and `\]` all wrap ASCII punctuation, so they collapse
- * to bare parens and brackets, while `\frac` and `\times` (backslash + letter,
- * not a valid escape) survive verbatim. The reader is left looking at
- * `( P = \frac{47}{0.85} \approx 55.29 )` — delimiters silently stripped,
- * LaTeX left as source.
+ * The bracket forms are NOT optional extras: instruction-tuned models emit
+ * them exclusively for plain word problems, and CommonMark's escape rule then
+ * eats them. `\(`, `\)`, `\[` and `\]` all wrap ASCII punctuation so they
+ * collapse to bare parens, while `\frac` and `\times` survive verbatim —
+ * leaving the reader `( P = \frac{47}{0.85} \approx 55.29 )`.
  *
  * Delimiter STYLE is not preserved: `\(x\)` and `$x$` both produce
- * `{ latex: 'x', display: false }`. The round-trip property holds up to that
- * normalisation.
+ * `{ latex: 'x', display: false }`.
  *
- * ANTI-CASES. Three of the Swift version's hardest ones are free here and
- * that is worth stating, because it is a real architectural win: this runs
- * AFTER `marked.lexer()`, on the inline content of text-bearing tokens only.
- * So math inside a fenced code block, inside a 4-space indented code block,
- * or inside inline backticks is STRUCTURALLY unreachable — those are `code`
- * and `codespan` tokens and the segmenter never sees them. The remaining
- * anti-cases are implemented and individually tested here:
+ * ANTI-CASES. Math inside fenced, indented or inline code is STRUCTURALLY
+ * unreachable — this runs after `marked.lexer()` on text-bearing tokens only,
+ * and those are `code`/`codespan` tokens. The rest are implemented here:
  *
  *   \$          an escaped dollar stays literal and never opens a run
- *   \\( and \\[ an escaped backslash followed by a literal bracket does NOT
- *               open math
- *   unclosed    `Use \( to group` has no `\)`, so the opener stays literal
- *               rather than swallowing the rest of the reply. This is also
- *               the streaming case, mid-answer, on every single formula.
+ *   \\( and \\[ an escaped backslash plus a literal bracket does NOT open math
+ *   unclosed    `Use \( to group` keeps the opener literal rather than
+ *               swallowing the reply. Also the streaming case, mid-answer.
  *   bare $      `it costs $20 today` — one dollar, no closer
- *   currency    `$20 to $30` has TWO dollars on one line, so the bare-dollar
- *               guard misses it. Any `$` immediately followed by a DIGIT is
- *               rejected, mirroring the MathJax convention: a real opener
- *               starts with a control sequence, a variable letter or a
- *               bracket, never a bare digit.
+ *   currency    `$20 to $30` has two dollars on one line, so the bare-dollar
+ *               guard misses it. Any `$` followed by a DIGIT is rejected,
+ *               mirroring MathJax: a real opener starts with a control
+ *               sequence, a variable letter or a bracket.
  */
 
 export type LaTeXSegment =
@@ -75,10 +62,9 @@ const OPENERS: Opener[] = [
 /**
  * Is the character at `index` escaped by an odd number of backslashes?
  *
- * Counting the run rather than checking one character is what distinguishes
- * `\$` (escaped, literal) from `\\$` (an escaped backslash, then a real
- * opener). Getting this wrong in either direction is visible: one way a
- * literal dollar opens math, the other way real math renders as source.
+ * Counting the run distinguishes `\$` (literal) from `\\$` (escaped
+ * backslash, then a real opener). Wrong either way is visible: a literal
+ * dollar opens math, or real math renders as source.
  */
 function isEscaped(text: string, index: number): boolean {
   let backslashes = 0;
@@ -102,16 +88,13 @@ function looksLikeCurrency(text: string, index: number): boolean {
  *
  * Returns the index just past the closing run, or -1 if this is not a code
  * span. Per CommonMark a run of N backticks closes on the next run of exactly
- * N, so the length has to be counted rather than assumed to be one.
+ * N, so the length must be counted.
  *
- * This anti-case was originally expected to be structural — segmentation runs
- * per block, so surely `codespan` tokens would already be separated out. They
- * are not: segmentation has to happen on the block's RAW source, because
- * marked's inline lexer shreds `\[` and `\,` into `escape` tokens and destroys
- * the formula before it can be recognised. Running before inline lexing means
- * inline code is back in scope and must be skipped explicitly. Fenced and
- * indented code remain structural — those are `code` tokens and never reach
- * this function.
+ * This anti-case is NOT structural, contrary to first expectations.
+ * Segmentation has to happen on the block's RAW source, because marked's
+ * inline lexer shreds `\[` and `\,` into `escape` tokens and destroys the
+ * formula before it can be recognised. Running before inline lexing puts
+ * inline code back in scope. Fenced and indented code stay structural.
  */
 function skipCodeSpan(text: string, index: number): number {
   let openLength = 0;

@@ -1,12 +1,9 @@
 // A stub Rapid-MLX server for the end-to-end suite.
 //
-// It serves the BUILT artifact, so the specs drive the real page rather than a
-// dev bundle — the thing users get is the thing under test.
-//
-// Behaviour is driven by a scenario object supplied per test, because the
-// interesting cases are all about how the page reacts to a server that is slow,
-// busy, or failing. `node:http` only; adding a framework here would mean the
-// harness has dependencies that can break independently of the app.
+// Serves the BUILT artifact, so the specs drive the real page. Behaviour comes
+// from a per-test scenario object, since the interesting cases are all about
+// how the page reacts to a slow, busy or failing server. `node:http` only, so
+// the harness has no dependencies that can break independently of the app.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -158,12 +155,9 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
   /**
    * Every socket this server has accepted.
    *
-   * `server.close()` stops listening but WAITS for open connections. The chat
-   * stream is still SSE and a spec can abandon one mid-flight, and keep-alive
-   * connections linger regardless — so a plain close can hang until the test
-   * times out, surfacing as "Tearing down stub exceeded the test timeout"
-   * against whichever test happened to be running, which points nowhere near
-   * the cause. They are destroyed explicitly instead.
+   * `server.close()` stops listening but WAITS for open connections, so an
+   * abandoned SSE stream hangs teardown until the test times out — surfacing
+   * against whichever test happened to be running. Destroyed explicitly.
    */
   const sockets = new Set<import('node:net').Socket>();
 

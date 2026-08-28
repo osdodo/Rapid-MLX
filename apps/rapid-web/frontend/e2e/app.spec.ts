@@ -4,17 +4,11 @@ import { startStub, chatFrame, type Scenario } from './stub-server';
 /**
  * End-to-end specs against the BUILT artifact.
  *
- * PLAN.md:221-224 records Playwright being driven ad hoc during M4 — it
- * "caught the title bug and confirmed the fragment strip, migration,
- * retry-without-duplicating-the-user-turn, delete, and the localStorage-throws
- * path" — and none of it was committed. Every one of those was a regression
- * waiting to happen with nothing watching. This file is that harness, kept.
- *
- * It has already paid for itself twice: it caught a temporal dead zone error
- * in the store that made the whole bundle throw on load and render a blank
- * page, and an auto-login path that validated a token without persisting it,
- * so every reload re-prompted. Neither is reachable from a unit test — one
- * needs the module evaluated in load order, the other needs a reload.
+ * Has already paid for itself twice: it caught a TDZ error in the store that
+ * made the whole bundle throw on load and render a blank page, and an
+ * auto-login path that validated a token without persisting it. Neither is
+ * reachable from a unit test — one needs the module evaluated in load order,
+ * the other needs a reload.
  */
 
 type Stub = Awaited<ReturnType<typeof startStub>>;
@@ -23,10 +17,8 @@ type Stub = Awaited<ReturnType<typeof startStub>>;
  * One stub per test, torn down automatically.
  *
  * A `let stub` shared across a describe block does NOT work: the config sets
- * `fullyParallel`, so tests in one file run concurrently and each assignment
- * clobbers the previous test's handle — producing failures that disappear when
- * the same test is run alone. That is the worst kind of flake, so the harness
- * is shaped to make it impossible rather than merely avoided.
+ * `fullyParallel`, so tests run concurrently and each assignment clobbers the
+ * previous test's handle — failures that vanish when run alone.
  */
 const test = base.extend<{ scenario: Partial<Scenario>; stub: Stub }>({
   scenario: [{}, { option: true }],
@@ -97,10 +89,9 @@ test.describe('boot and auth', () => {
 
 test.describe('history migration', () => {
   test('migrates a v1 transcript and does NOT label it "New chat"', async ({ page, stub }) => {
-    // The exact bug PLAN.md:217-220 records: a transcript brought forward from
-    // M1 never passes through the "touch on write" path, so an underived title
-    // left it showing as "New chat" despite having messages. Found in a
-    // browser, by a human, with nothing to catch it again.
+    // A transcript brought forward from v1 never passes through the "touch on
+    // write" path, so an underived title left it showing as "New chat"
+    // despite having messages.
     await seedStorage(page, {
       'rapid-mlx-web.history': JSON.stringify([
         { role: 'user', content: 'what is a metal shader' },

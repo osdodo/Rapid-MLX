@@ -1,16 +1,13 @@
 /**
  * Id generation.
  *
- * `crypto.randomUUID` is only available in a SECURE CONTEXT. A tunnel without
- * TLS, or a plain `--host 0.0.0.0` LAN bind, is not one — the same reason the
- * old page carried a clipboard fallback (index.html:1382-1397). There
- * `randomUUID` is simply `undefined`, and calling it throws on every single id
- * generation, which is every message and every conversation.
+ * `crypto.randomUUID` is only available in a SECURE CONTEXT, which a tunnel
+ * without TLS or a plain `--host 0.0.0.0` bind is not. There it is
+ * `undefined`, and calling it throws on every message and conversation.
  *
- * The fallback does not need to be cryptographically strong. These ids are
- * local keys in one browser's storage; nothing authenticates or authorises on
- * them. It needs to be unique, and monotonic-ish so `precedes` has a sensible
- * tie-break.
+ * The fallback need not be cryptographically strong — these are local storage
+ * keys, and nothing authenticates on them. It needs to be unique, and
+ * monotonic-ish so `precedes` has a sensible tie-break.
  */
 
 let counter = 0;

@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """HTTP surface served to the phone.
 
-Route policy, since it is not uniform and the differences are
-deliberate:
-
-* ``GET /`` and the static assets are **unauthenticated**. They have to
-  be: the page is what the user opens in order to enter the token.
-  Nothing sensitive is in the HTML.
-* Everything under ``/api`` and ``/v1`` requires the bearer, plus the
-  browser-origin checks in :mod:`.auth`.
-* ``GET /api/status`` is authenticated too, even though it is read-only.
-  It reveals which model is loaded and the engine's recent log tail,
-  which is more than an unauthenticated caller should learn about the
-  host.
+``GET /`` and the static assets are unauthenticated — the page is what the
+user opens in order to enter the token. Everything under ``/api`` and
+``/v1`` requires the bearer plus the browser-origin checks in :mod:`.auth`,
+including read-only ``/api/status``, which reveals the loaded model and the
+engine's log tail.
 """
 
 from __future__ import annotations
@@ -63,15 +56,10 @@ class _HashedAssets(StaticFiles):
 class StreamTracker:
     """Counts chat streams currently being relayed.
 
-    Model switching kills the engine process, so doing it while a
-    generation is in flight destroys someone else's answer mid-sentence
-    — most likely the person sitting at the Mac, who has no idea the
-    phone exists. The count is what lets ``/api/models/load`` refuse
-    with a 409 instead.
-
-    A plain integer is enough: everything here runs on one event loop,
-    and ``asyncio`` yields only at awaits, so increment and decrement are
-    each atomic with respect to the other.
+    Model switching kills the engine process, so ``/api/models/load`` uses
+    this to refuse with a 409 rather than destroy an in-flight generation.
+    A plain integer suffices: one event loop, and asyncio yields only at
+    awaits.
     """
 
     def __init__(self) -> None:
@@ -87,9 +75,8 @@ class StreamTracker:
         try:
             yield
         finally:
-            # Must decrement even when the client vanishes mid-stream. A
-            # leaked count would make switching impossible for the rest
-            # of the session, with no way for the user to clear it.
+            # Must decrement even when the client vanishes mid-stream, or
+            # switching stays impossible for the rest of the session.
             self._active -= 1
 
 
@@ -97,34 +84,25 @@ class StreamTracker:
 class WebConfig:
     """Everything the HTTP layer needs that is decided at startup."""
 
-    # ``None`` disables the bearer entirely, which the CLI does only for
-    # a loopback bind. It is deliberately not a boolean flag beside a
-    # token: two fields could disagree, and the failure mode of that
-    # disagreement is "auth silently off".
+    # ``None`` disables the bearer entirely (loopback binds only). Not a
+    # boolean beside a token: two fields could disagree, and that failure
+    # mode is "auth silently off".
     token: str | None
     engine: EngineSupervisor | AttachedEngine
-    # Model to load once the event loop is running. Loading cannot happen
-    # before uvicorn starts: an asyncio subprocess is bound to the loop
-    # that created it, so a child spawned under a throwaway
-    # ``asyncio.run`` would be attached to a closed loop by the time the
-    # first request arrives — its output drain would be dead and the pipe
-    # would eventually fill and stall the engine.
+    # Loaded once the event loop is running: an asyncio subprocess is bound
+    # to the loop that created it, so spawning under a throwaway
+    # ``asyncio.run`` leaves a dead output drain and eventually a full pipe.
     initial_model: str | None = None
     # ``None`` in --attach mode: listing aliases needs the CLI, and an
     # attached engine may be the only rapid-mlx on the machine.
     catalog: ModelCatalog | None = None
-    # ``None`` when downloads are disabled — which is also the single
-    # source of truth for whether they are allowed, so there is no
-    # separate flag that could disagree with it.
+    # ``None`` when downloads are disabled — also the single source of
+    # truth for whether they are allowed.
     downloads: DownloadManager | None = None
 
 
 def _json_error(status: int, message: str, code: str) -> JSONResponse:
-    """Uniform error envelope.
-
-    Matches the engine's ``{"error": {...}}`` shape so the page has a
-    single error path for both proxied and locally-generated failures.
-    """
+    """Uniform error envelope matching the engine's ``{"error": {...}}``."""
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": code}},
@@ -134,28 +112,19 @@ def _json_error(status: int, message: str, code: str) -> JSONResponse:
 async def _boot(config: WebConfig) -> None:
     """Load the initial model, recording failure in the supervisor.
 
-    Failures are swallowed here rather than propagated: this runs as a
-    detached task, and an unhandled exception in one only reaches the
-    user as an asyncio warning on stderr. The supervisor has already
-    recorded ``FAILED`` plus the child's output tail, which is what
-    ``/api/status`` surfaces and what the page can actually show.
+    Failures are swallowed because this is a detached task: raising only
+    reaches the user as an asyncio warning on stderr, whereas the
+    supervisor's ``FAILED`` state is what ``/api/status`` surfaces.
     """
     with contextlib.suppress(SupervisorError):
         await config.engine.start(config.initial_model)
 
 
 async def _switch(config: WebConfig, alias: str) -> None:
-    """Restart the engine on ``alias``.
-
-    Failures are swallowed for the same reason as :func:`_boot`: this is
-    a detached task, so raising would only produce an asyncio warning on
-    the Mac's stderr, which the phone cannot see. The supervisor records
-    ``FAILED`` plus the child's output, and ``/api/status`` surfaces it.
-    """
+    """Restart the engine on ``alias``. Failures swallowed as in :func:`_boot`."""
     with contextlib.suppress(SupervisorError):
         await config.engine.start(alias)
-    # The new model's weights may have just been pulled by the engine's
-    # own downloader, so what is on disk has changed.
+    # The engine's own downloader may have just pulled these weights.
     if config.catalog is not None:
         config.catalog.invalidate_cache()
 
@@ -165,16 +134,13 @@ def create_app(config: WebConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # One client for the whole process. Creating a client per request
-        # throws away connection reuse and, more importantly, leaks
-        # connections when a streaming response is abandoned partway.
+        # One client per process: per-request clients lose connection reuse
+        # and leak connections when a streaming response is abandoned.
         app.state.http = httpx.AsyncClient()
 
-        # Kick the engine off in the background rather than awaiting it.
-        # A cold start is minutes; blocking startup would leave the port
-        # unbound for that whole time, so the phone would get "connection
-        # refused" instead of a page saying "loading". The supervisor's
-        # own state is what the page polls.
+        # Background, not awaited: a cold start is minutes, and blocking
+        # startup would leave the port unbound for all of it — the phone
+        # would see "connection refused" instead of a page saying "loading".
         if config.initial_model and isinstance(config.engine, EngineSupervisor):
             app.state.boot = asyncio.create_task(_boot(config))
         else:
@@ -190,14 +156,13 @@ def create_app(config: WebConfig) -> FastAPI:
                     await boot
             with contextlib.suppress(Exception):
                 await app.state.http.aclose()
-            # A pull left running past this process would keep writing to
-            # the cache with nothing watching it, and the user has no way
-            # to stop it short of hunting down the PID.
+            # A pull left running would keep writing to the cache with
+            # nothing watching it, and no way to stop it short of the PID.
             if config.downloads is not None:
                 with contextlib.suppress(Exception):
                     await config.downloads.shutdown()
-            # Always stop the child, including when startup itself failed.
-            # A half-started engine still holds GPU memory.
+            # Always stop the child, including when startup itself failed:
+            # a half-started engine still holds GPU memory.
             await config.engine.stop()
 
     app = FastAPI(
@@ -212,11 +177,8 @@ def create_app(config: WebConfig) -> FastAPI:
     async def _guard(request: Request, call_next):
         path = request.url.path
 
-        # Static surface + the capability probe are open; see the module
-        # docstring. ``/api/config`` has to be reachable without a token
-        # because it is how the page learns whether a token is needed at
-        # all. It reveals only that one bit — nothing about the host, the
-        # loaded model, or the catalog.
+        # ``/api/config`` is open because it is how the page learns whether
+        # a token is needed at all. It reveals only that one bit.
         if path == "/" or path == "/api/config" or path.startswith("/static"):
             response = await call_next(request)
             _apply_security_headers(response)
@@ -240,13 +202,11 @@ def create_app(config: WebConfig) -> FastAPI:
                 "unsupported_media_type",
             )
 
-        # The bearer is skipped only when the server is bound to
-        # loopback, where the OS already guarantees the caller is a
-        # process on this Mac. The Origin / content-type checks above
-        # are NOT skipped with it: without a token they become the only
-        # thing standing between this port and any web page the user
-        # happens to have open, which can otherwise reach a loopback
-        # port through the browser.
+        # The bearer is skipped only on a loopback bind. The Origin and
+        # content-type checks above are NOT skipped with it: without a
+        # token they become the only thing between this port and any web
+        # page the user happens to have open, since a browser can reach a
+        # loopback port.
         if config.token is not None:
             presented = auth.extract_bearer(request.headers.get("authorization"))
             if not auth.token_matches(config.token, presented):
@@ -278,10 +238,8 @@ def create_app(config: WebConfig) -> FastAPI:
     async def public_config() -> JSONResponse:
         """Unauthenticated: does this server require a token?
 
-        Deliberately the only unauthenticated JSON endpoint, and it
-        answers exactly one question. The page needs it before it can
-        decide whether to show a login prompt; everything else stays
-        behind the guard.
+        The only unauthenticated JSON endpoint. The page needs the answer
+        before it can decide whether to show a login prompt.
         """
         return JSONResponse({"auth_required": config.token is not None})
 
@@ -290,8 +248,8 @@ def create_app(config: WebConfig) -> FastAPI:
         """Token probe for the login screen.
 
         Reaching this handler already means the middleware accepted the
-        bearer, so the body is only a confirmation. It exists so the
-        page can validate a pasted token without sending a chat turn.
+        bearer; it exists so the page can validate a pasted token without
+        sending a chat turn.
         """
         engine = config.engine
         return JSONResponse(
@@ -318,9 +276,8 @@ def create_app(config: WebConfig) -> FastAPI:
     async def list_models(refresh: bool = False) -> JSONResponse:
         """Chat-capable aliases, with on-disk state.
 
-        Only chat models are listed. Image, video and audio aliases have
-        no chat surface, so including them would offer a multi-GB
-        download for something that dead-ends on first send.
+        Image, video and audio aliases have no chat surface, so listing
+        them would offer a multi-GB download that dead-ends on first send.
         """
         if config.catalog is None:
             return _json_error(
@@ -366,10 +323,9 @@ def create_app(config: WebConfig) -> FastAPI:
             )
         alias = alias.strip()
 
-        # Validate against the catalog before the alias reaches a
-        # subprocess argument. Passing an arbitrary string through would
-        # let a remote caller name any `org/repo`, turning a model picker
-        # into a general-purpose remote fetch.
+        # Validate against the catalog before the alias reaches a subprocess
+        # argument: an arbitrary string would let a remote caller name any
+        # `org/repo`, turning a model picker into a general-purpose fetch.
         try:
             known = await config.catalog.is_known_chat_alias(alias)
         except CatalogError as exc:
@@ -379,9 +335,8 @@ def create_app(config: WebConfig) -> FastAPI:
                 404, f"unknown chat model alias: {alias}", "unknown_model"
             )
 
-        # Switching restarts the engine, which destroys any generation
-        # in progress — including one belonging to whoever is sitting at
-        # the Mac, who does not know this web surface exists.
+        # Switching restarts the engine, destroying any generation in
+        # progress — including one belonging to whoever is at the Mac.
         if streams.active:
             return _json_error(
                 409,
@@ -391,8 +346,8 @@ def create_app(config: WebConfig) -> FastAPI:
 
         snapshot = engine.status()
         if snapshot.model == alias and snapshot.state is ChildState.READY:
-            # Already there. Restarting would cost minutes of reload for
-            # no change, and a double-tap on a phone is easy.
+            # Already there; a double-tap on a phone is easy and a restart
+            # would cost minutes of reload for no change.
             return JSONResponse({"ok": True, "model": alias, "state": "ready"})
 
         if snapshot.state is ChildState.STARTING:
@@ -402,10 +357,8 @@ def create_app(config: WebConfig) -> FastAPI:
                 "busy_loading",
             )
 
-        # Run the switch detached and answer immediately. A load takes
-        # minutes, which is far past any phone browser's fetch timeout;
-        # the page polls /api/status for the outcome, exactly as it does
-        # for the initial boot.
+        # Detached, answering immediately: a load takes minutes, far past
+        # any phone browser's fetch timeout. The page polls /api/status.
         app.state.boot = asyncio.create_task(_switch(config, alias))
         return JSONResponse({"ok": True, "model": alias, "state": "starting"})
 
@@ -431,8 +384,8 @@ def create_app(config: WebConfig) -> FastAPI:
             )
         alias = alias.strip()
 
-        # Same reasoning as the switch route: an unvalidated alias
-        # reaching a subprocess argument is a remote fetch primitive.
+        # Same reasoning as the switch route: an unvalidated alias reaching
+        # a subprocess argument is a remote fetch primitive.
         try:
             profile = await config.catalog.chat_profile(alias)
         except CatalogError as exc:
@@ -456,13 +409,9 @@ def create_app(config: WebConfig) -> FastAPI:
 
         return JSONResponse({"ok": True, **job.to_dict()})
 
-    # POST, not DELETE. The CSRF control in the middleware — reject any
-    # body whose content-type is a CORS "simple" one — is applied to
-    # POST/PUT/PATCH, because those are the methods a cross-origin page
-    # can send without a preflight. A DELETE already requires a
-    # preflight, so it is not weaker; but routing the one destructive
-    # operation here through the method that carries the extra check
-    # means there is no second policy to keep correct.
+    # POST, not DELETE: the middleware's CSRF control (reject CORS-simple
+    # content types) runs on POST/PUT/PATCH, so routing the one destructive
+    # operation through it avoids a second policy to keep correct.
     @app.post("/api/models/remove")
     async def remove_model(request: Request):
         if config.catalog is None:
@@ -484,16 +433,10 @@ def create_app(config: WebConfig) -> FastAPI:
             )
         alias = alias.strip()
 
-        # Refuse to delete what the engine is running. The weights are
-        # mmap'd by the child, so unlinking them underneath it is not a
-        # clean operation, and the recovery — stop the engine, delete,
-        # leave the phone with nothing loaded — is a bigger decision
-        # than a trash button should make on the user's behalf. They can
-        # switch models first, which is one tap away in the same sheet.
-        #
-        # READY and STARTING only. A FAILED child has already exited and
-        # holds nothing, and deleting a checkpoint that just failed to
-        # load is precisely what a user does next.
+        # Refuse to delete what the engine is running: the weights are
+        # mmap'd by the child. READY and STARTING only — a FAILED child has
+        # exited and holds nothing, and deleting a checkpoint that just
+        # failed to load is precisely what a user does next.
         snapshot = config.engine.status()
         if snapshot.model == alias and snapshot.state in (
             ChildState.READY,
@@ -506,10 +449,9 @@ def create_app(config: WebConfig) -> FastAPI:
                 "model_in_use",
             )
 
-        # A pull writing into the very snapshot being unlinked leaves a
-        # half-materialised repo that the next scan reports as
-        # "incomplete" — present enough to look downloaded to a stale
-        # page, broken enough to fail inside the engine.
+        # A pull writing into the snapshot being unlinked leaves a
+        # half-materialised repo: present enough to look downloaded to a
+        # stale page, broken enough to fail inside the engine.
         running = config.downloads.job if config.downloads is not None else None
         if (
             running is not None
@@ -546,22 +488,12 @@ def create_app(config: WebConfig) -> FastAPI:
     async def download_status():
         """Current download job, polled by the page.
 
-        Deliberately a poll rather than the SSE feed this replaced.
-        Measured against a real ``trycloudflare`` tunnel: headers arrived
-        in 1.8 s and then **not one body byte in 65 s**, while the same
-        endpoint on loopback delivered its first frame in 0.0 s.
-        Cloudflare also strips the ``X-Accel-Buffering: no`` hint (it is
-        an nginx convention), and padding the first frame to 2 KiB did
-        not shake the response loose either.
-
-        The chat stream survives the same tunnel because it emits tokens
-        continuously; a download feed that sends 25 bytes and then a
-        keepalive every 15 s is too sparse to break through the buffer.
-
-        Progress is low-frequency data — a bar that updates once a
-        second is indistinguishable from one that updates ten times a
-        second — so holding a long-lived connection open for it bought
-        nothing and cost every intermediary's buffering behaviour.
+        A poll rather than the SSE feed this replaced: measured against a
+        real ``trycloudflare`` tunnel, a sparse feed delivered headers in
+        1.8 s and then no body byte in 65 s (loopback: 0.0 s). Cloudflare
+        strips ``X-Accel-Buffering`` and padding the first frame did not
+        help. Chat streaming survives the same tunnel because it emits
+        tokens continuously — sparseness is the variable, not SSE.
         """
         if config.downloads is None:
             return _json_error(
@@ -596,8 +528,7 @@ def create_app(config: WebConfig) -> FastAPI:
 
         if proxy.is_streaming_request(payload):
             # Counted for the whole life of the relay, so a concurrent
-            # /api/models/load can refuse rather than kill the engine
-            # out from under this generation.
+            # /api/models/load refuses rather than killing the engine.
             async def tracked() -> AsyncIterator[bytes]:
                 with streams.track():
                     async for chunk in proxy.proxy_streaming(
@@ -614,10 +545,8 @@ def create_app(config: WebConfig) -> FastAPI:
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
-                    # Tunnels and reverse proxies buffer by default,
-                    # which turns a token stream into one delivery at
-                    # the end. nginx and several tunnel implementations
-                    # honour this hint to disable that.
+                    # nginx and several tunnels honour this to disable the
+                    # buffering that would deliver the stream all at once.
                     "X-Accel-Buffering": "no",
                 },
             )

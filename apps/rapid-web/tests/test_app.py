@@ -535,23 +535,17 @@ class TestLoadModel:
 class TestSwitchBlockedByActiveStream:
     """Switching mid-stream would kill someone else's generation.
 
-    Most likely the person sitting at the Mac, who does not know this web
-    surface exists.
-
     Two things these tests must avoid, both learned the hard way:
 
     * **Do not use ``TestClient``.** It drives the app through a single
       portal thread, so a held-open stream and a concurrent synchronous
-      request can never both make progress — the test deadlocks instead
-      of exercising the guard.
+      request deadlock instead of exercising the guard.
     * **Do not monkeypatch ``httpx.AsyncClient``.** The async test client
       is itself an ``AsyncClient``, so patching the class replaces the
-      test's own transport as well as the app's, and the request never
-      reaches the app at all.
+      test's own transport and the request never reaches the app.
 
-    So the seam patched here is ``proxy.proxy_streaming`` — the function
-    ``app.py`` actually calls. The tracker wrapping lives outside it, so
-    it is still the real code under test.
+    So the seam patched here is ``proxy.proxy_streaming``. The tracker
+    wrapping lives outside it, so it is still the real code under test.
     """
 
     @staticmethod
@@ -1046,13 +1040,9 @@ class TestDownloadCapabilityReporting:
 class TestDownloadStatus:
     """The polled progress endpoint.
 
-    This replaced an SSE feed. The feed was correct on loopback but
-    unusable through a ``trycloudflare`` tunnel: headers arrived in
-    1.8 s and then not one body byte in 65 s, measured against a real
-    tunnel. Cloudflare strips ``X-Accel-Buffering: no``, and padding the
-    first frame to 2 KiB did not shake it loose. Chat survives the same
-    tunnel because it emits tokens continuously; a feed that sends 25
-    bytes then a keepalive every 15 s is too sparse to break the buffer.
+    Replaced an SSE feed that was correct on loopback but unusable through
+    a ``trycloudflare`` tunnel: headers in 1.8 s, then no body byte in
+    65 s. Chat survives the same tunnel because it emits continuously.
     """
 
     def test_a_running_job_is_reported(self):

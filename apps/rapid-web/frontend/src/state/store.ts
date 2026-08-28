@@ -17,25 +17,21 @@ import {
 /**
  * The application store.
  *
- * zustand rather than context + useReducer: a single context holding this
- * would re-render every consumer on every change, and with a few hundred
- * message rows that is a re-render storm on each commit. Fixing it means
- * sharding into half a dozen contexts and hand-rolling selector equality,
- * i.e. reimplementing zustand less well. Measured at 9 KB.
+ * zustand rather than context + useReducer: one context holding this would
+ * re-render every consumer on every change, and fixing that means sharding
+ * into half a dozen contexts with hand-rolled selector equality — zustand,
+ * reimplemented worse. Measured at 9 KB.
  *
- * STREAMING TEXT NEVER ENTERS THIS STORE. It lives in chat/StreamingStore,
- * and the finished message is committed here exactly once, at stream end.
- * That is what stops the persist debounce stringifying the whole store ten
- * times a second while an answer arrives.
+ * STREAMING TEXT NEVER ENTERS THIS STORE. It lives in chat/StreamingStore and
+ * is committed here once, at stream end, so the persist debounce does not
+ * stringify the whole store ten times a second.
  */
 
 // Pre-rename spelling, kept deliberately — see `HISTORY_KEY` in
-// state/migrate.ts for why none of the three storage keys track the package
-// name.
+// state/migrate.ts.
 const SETTINGS_KEY = 'rapid-mlx-web.settings';
 
-/** How long after the last change to write. Trailing, so a burst of slider
- *  drags produces one write rather than sixty. */
+/** Trailing, so a burst of slider drags produces one write rather than sixty. */
 const PERSIST_DEBOUNCE_MS = 400;
 
 function safeRead(key: string): string | null {
@@ -370,18 +366,13 @@ export const useStore = create<StoreState>()((set, get) => {
     selectAlias(alias) {
       set((state) => ({
         selectedAlias: alias,
-        // Mark the status as no longer describing the selection.
+        // Mark the status as no longer describing the selection. Without this
+        // the cached snapshot still names the PREVIOUS model, so
+        // `resolveReadiness` finds no serving state and tells the user to
+        // press Start on something that is already starting.
         //
-        // Without this the cached snapshot still names the PREVIOUS model, so
-        // `resolveReadiness` finds no serving state for the new pick and falls
-        // through to "isn't running / It's already downloaded" — for a model
-        // that is, at that very moment, starting. The user is told to press
-        // Start on something already starting. It self-corrects on the next
-        // poll, which is exactly long enough to be seen and mistrusted.
-        //
-        // `null`, not a synthesised "starting": we genuinely do not know yet,
-        // and inventing a state would be guessing on the user's behalf. A null
-        // status resolves to `needsStart` at worst, which is honest.
+        // `null`, not a synthesised "starting": we do not know yet, and null
+        // resolves to `needsStart` at worst, which is honest.
         status: alias !== null && alias !== state.status?.model ? null : state.status,
       }));
     },
@@ -420,17 +411,15 @@ export const useStore = create<StoreState>()((set, get) => {
  * Force a write immediately, bypassing the debounce.
  *
  * Reads the store rather than reaching into the factory's closure. An earlier
- * version had the factory assign a mutable module-level binding, which is a
- * temporal dead zone error: `create()` runs during module evaluation, before
- * the `let` below it is initialised, so the whole bundle threw on load and the
- * page rendered nothing at all. Caught by the end-to-end suite, which is
- * exactly the class of failure a unit test cannot see — every unit test
- * imports the store lazily and never evaluates the module in load order.
+ * version assigned a mutable module-level binding from the factory, which is a
+ * TDZ error — `create()` runs during module evaluation, before the `let` below
+ * it exists — so the bundle threw on load and the page rendered nothing. Only
+ * e2e catches this: unit tests import the store lazily, never in load order.
  *
  * iOS Safari kills a backgrounded tab WITHOUT firing `beforeunload`, so
- * `visibilitychange` is the one that actually fires on a phone; `pagehide`
- * covers the bfcache path. All three are registered because which one fires
- * depends on how the page is being torn down.
+ * `visibilitychange` is the one that fires on a phone and `pagehide` covers
+ * bfcache. All three are registered because which fires depends on the
+ * teardown path.
  */
 export function flushPersistNow(): void {
   const state = useStore.getState();

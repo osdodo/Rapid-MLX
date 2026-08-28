@@ -7,10 +7,9 @@ import { cn } from '@/lib/utils';
 /**
  * Is the transcript scrolled to (or near) its end?
  *
- * 64px of slack: a user who is "at the bottom" is rarely at exactly zero, and
- * a strict test would drop follow on a one-pixel overscroll. A transcript that
- * does not overflow at all is trivially at the bottom, which is what keeps the
- * jump button off an empty conversation.
+ * 64px of slack, since a strict test would drop follow on a one-pixel
+ * overscroll. A transcript that does not overflow is trivially at the bottom,
+ * which keeps the jump button off an empty conversation.
  */
 function isAtBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 64;
@@ -24,12 +23,8 @@ export interface TranscriptProps {
 }
 
 /**
- * The scrolling transcript.
- *
- * The old page called `scrollToBottom()` unconditionally on every paint
- * (index.html:1753) with `scroll-behavior: smooth` set, so reading back
- * during a stream was impossible — the view yanked itself down sixty times a
- * second, and each yank queued a smooth animation.
+ * The scrolling transcript. Follow is conditional on the user being at the
+ * bottom — scrolling back during a stream must not yank the view down.
  */
 export function Transcript({ children, revision, streaming }: TranscriptProps) {
   const ref = useRef<HTMLDivElement>(null);

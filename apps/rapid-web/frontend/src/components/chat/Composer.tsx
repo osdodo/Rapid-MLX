@@ -127,14 +127,12 @@ export function Composer({
 /**
  * Does a bare Return send, or insert a newline?
  *
- * It sends wherever there is a physical keyboard, because Shift+Return is
- * then available as the newline. On touch there is no Shift, so Return has to
- * stay a newline or the phone loses the only way to type one — and the send
- * button is already under the thumb there anyway.
+ * It sends wherever there is a physical keyboard, since Shift+Return is then
+ * available for the newline. On touch there is no Shift, so Return must stay a
+ * newline or the phone loses the only way to type one.
  *
- * Keyed on `(hover: none) and (pointer: coarse)` rather than a width query: a
- * narrow window on a desktop still has a keyboard, and an iPad with a Magic
- * Keyboard is wide but is still touch-first without one.
+ * Keyed on `(hover: none) and (pointer: coarse)`, not a width query: a narrow
+ * desktop window still has a keyboard, and an iPad without one does not.
  */
 function sendsOnEnter(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return true;

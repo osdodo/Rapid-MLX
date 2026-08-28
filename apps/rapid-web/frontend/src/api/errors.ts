@@ -3,11 +3,9 @@ import type { ErrorEnvelope } from './types';
 /**
  * A failure carrying the server's machine-readable ``type`` code.
  *
- * The old page discarded ``error.type`` entirely and routed every failure to
- * ``window.alert(error.message)``. That threw away the server's most useful
- * output: ``busy_streaming`` wants "stop and switch", ``insufficient_storage``
- * wants the message verbatim, and ``unauthorized`` wants the token cleared and
- * the gate shown. They are not the same event and must not look like one.
+ * The code is the server's most useful output: ``busy_streaming`` wants "stop
+ * and switch", ``insufficient_storage`` wants the message verbatim, and
+ * ``unauthorized`` wants the token cleared and the gate shown.
  */
 export class ApiError extends Error {
   readonly status: number;
@@ -24,10 +22,9 @@ export class ApiError extends Error {
 /**
  * Every ``error.type`` the server can emit, as a closed set.
  *
- * Grouped by origin so a new code lands in the right place. The union is
- * open-ended via ``(string & {})`` because a proxied engine error carries the
- * engine's own vocabulary, which this package does not own — but the named
- * members still autocomplete and still typo-check.
+ * Open-ended via ``(string & {})`` because a proxied engine error carries the
+ * engine's own vocabulary — the named members still autocomplete and
+ * typo-check.
  */
 export type ErrorCode =
   // app.py — the middleware guard

@@ -139,8 +139,8 @@ def _display_host(host: str) -> str:
         return host
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            # No packet is sent; connect() on UDP only selects a route,
-            # which is enough to learn which local address would be used.
+            # No packet is sent: connect() on UDP only selects a route,
+            # which is enough to learn the local address.
             probe.connect(("192.0.2.1", 9))
             return probe.getsockname()[0]
     except OSError:
@@ -150,14 +150,10 @@ def _display_host(host: str) -> str:
 def _login_url(host: str, port: int, token: str | None) -> str:
     """URL that logs the browser in without retyping the token.
 
-    The token goes in the **fragment**, not the query string. A fragment
-    is never sent to the server, so it cannot land in an access log, a
-    proxy log, or a tunnel provider's request history — all of which a
-    query parameter would reach. The page reads it, stores it, and
-    strips it from the address bar.
-
-    It is still visible in the URL itself, so it belongs in a QR code
-    or a copy-paste, not somewhere it will be shoulder-surfed.
+    The token goes in the **fragment**, never the query string: a
+    fragment is not sent to the server, so it cannot land in an access
+    log, a proxy log, or a tunnel provider's request history. The page
+    reads it, stores it, and strips it from the address bar.
     """
     base = f"http://{_display_host(host)}:{port}/"
     if token is None:
@@ -178,13 +174,9 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
         print("  Auth:  none (loopback only)")
     print()
 
-    # The sign-in link, but no QR code. The banner is read on the Mac that
-    # started the server, and a 25-row block of blocks pushed everything
-    # above it — including the token — off a short terminal window.
-    #
-    # The link itself stays when there is a token: it carries the token in
-    # its fragment, so pasting it is what saves retyping 43 characters. With
-    # no token the URL is already printed above and repeating it says nothing.
+    # No QR code: a 25-row block pushed everything above it — including
+    # the token — off a short terminal window. The link stays when there
+    # is a token, since its fragment saves retyping 43 characters.
     if token is not None:
         print("  Open this link to sign in automatically:")
         print(f"  {login_url}")
@@ -197,10 +189,8 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
         )
         print("  The access token is the only thing protecting it.")
         print()
-    # Flush explicitly: stdout is block-buffered whenever it is not a TTY,
-    # so under `rmlx-web > log &` — a normal way to run this — the
-    # token would not appear until the buffer happened to fill. The token
-    # is the one thing the user cannot proceed without.
+    # stdout is block-buffered when not a TTY, so under `rmlx-web > log &`
+    # the token would not appear until the buffer filled.
     sys.stdout.flush()
 
 
@@ -212,25 +202,16 @@ def _resolve_engine(args: argparse.Namespace, *, downloads_enabled: bool):
                 "model already loaded by the running server."
             )
         # No catalog: listing aliases needs the `rapid-mlx` CLI, and an
-        # attached engine may be the only rapid-mlx on this machine (a
-        # remote host, a container). Switching is impossible here anyway,
-        # so a list the user cannot act on would only mislead.
+        # attached engine may be the only rapid-mlx on this machine.
+        # Switching is impossible here anyway.
         return AttachedEngine(args.attach, api_key=args.attach_api_key), None, None
 
-    # No model is a supported way to start: the page's model picker is
-    # the other way to choose one, and it can do everything this argument
-    # does. The engine simply stays stopped until the user picks, which
-    # is a state the supervisor already models (``_model`` is optional)
-    # and the page already renders (readiness ``noModel``).
-    #
-    # It is NOT allowed with --attach, which is checked above: there the
-    # model belongs to a server this process does not own.
     binary = find_rapid_mlx_binary(args.rapid_mlx_bin)
     engine = EngineSupervisor(
         binary=binary,
-        # The engine's bearer is NOT the web token. Keeping them separate
-        # means a leaked web token cannot be replayed against the engine
-        # directly, and the web token never reaches the engine's logs.
+        # NOT the web token: keeping them separate means a leaked web
+        # token cannot be replayed against the engine, and the web token
+        # never reaches the engine's logs.
         api_key=auth.generate_token(),
         serve_args=list(args.serve_arg),
     )
@@ -243,11 +224,9 @@ def main(argv: list[str] | None = None) -> int:
 
     loopback = _is_loopback(args.host)
 
-    # Downloads default ON for loopback and OFF otherwise. The asymmetry
-    # is the point: on loopback the only caller is the person at this
-    # Mac, but once the port is on a network a download is an endpoint a
-    # stranger can use to fill someone else's disk. Off the loopback the
-    # user has to say so explicitly.
+    # ON for loopback, OFF otherwise: once the port is on a network a
+    # download is an endpoint a stranger can use to fill someone else's
+    # disk, so it has to be asked for explicitly.
     downloads_enabled = loopback or args.allow_downloads
     if not loopback and args.allow_downloads:
         print(
@@ -256,14 +235,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # No bearer on a loopback bind: the OS already guarantees the caller
-    # is a process on this Mac, so a token there only makes the user copy
-    # a 43-character string to reach their own machine. It is NOT skipped
-    # once the port is on a network — that is exactly when it is the only
-    # thing protecting inference, model switching and downloads.
-    #
-    # An explicit --token or --new-token opts back in on loopback too, so
-    # there is still a way to have one when sharing a screen.
+    # No bearer on a loopback bind — the OS already guarantees the caller
+    # is a process on this Mac. NOT skipped once the port is on a network,
+    # where it is the only thing protecting inference and downloads.
+    # --token / --new-token opts back in for screen-sharing.
     needs_token = (not loopback) or bool(args.token) or args.new_token
 
     token: str | None = None
@@ -299,17 +274,12 @@ def main(argv: list[str] | None = None) -> int:
 
     _print_banner(host=args.host, port=args.port, token=token, loopback=loopback)
     if config.initial_model:
-        # The engine loads in the background once uvicorn's loop is up, so
-        # the page is reachable immediately and reports "loading" rather
-        # than refusing connections for the several minutes a cold start
-        # can take.
         print(f"  Loading {config.initial_model} in the background…")
         print("  The page is usable now; it will say when the model is ready.\n")
         sys.stdout.flush()
     elif not args.attach:
-        # Say so explicitly. Without a line here the banner is followed by
-        # silence, which reads like the server is still working on
-        # something rather than waiting for the user.
+        # Without this the banner is followed by silence, which reads as
+        # "still working" rather than "waiting for you".
         print("  No model loaded — choose one in the page to start it.\n")
         sys.stdout.flush()
 

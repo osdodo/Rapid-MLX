@@ -4,17 +4,13 @@ import { startStub, type Scenario } from './stub-server';
 /**
  * Download progress reaches the UI by POLLING, not by a stream.
  *
- * The SSE feed this replaced worked perfectly on loopback and was unusable
- * through a `trycloudflare` tunnel: response headers arrived in 1.8 s and then
- * not one body byte in 65 s, measured against a real tunnel. Cloudflare strips
- * the `X-Accel-Buffering: no` hint, and padding the first frame to 2 KiB did
- * not shake it loose. Chat survives the same tunnel because it emits tokens
- * continuously; a download feed sending 25 bytes and then a keepalive every
- * 15 s is far too sparse to break through the buffer.
+ * The SSE feed this replaced was fine on loopback and unusable through a
+ * `trycloudflare` tunnel: headers in 1.8 s, then no body byte in 65 s.
+ * Cloudflare strips `X-Accel-Buffering` and padding the first frame did not
+ * help. Chat survives the same tunnel because it emits tokens continuously.
  *
- * These specs pin the behaviour that matters to the user — the bar moves, and
- * a job already running when the sheet opens is picked up — without asserting
- * the transport, so the two are not coupled.
+ * These specs pin what matters to the user (the bar moves, a running job is
+ * picked up on open) without asserting the transport.
  */
 type Stub = Awaited<ReturnType<typeof startStub>>;
 

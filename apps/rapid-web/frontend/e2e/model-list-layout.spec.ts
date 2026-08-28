@@ -2,19 +2,14 @@ import { expect, test as base } from '@playwright/test';
 import { startStub, type Scenario } from './stub-server';
 
 /**
- * The model list's alignment.
- *
- * Two defects the screenshots showed, both invisible to a unit test and to a
- * class-name grep:
+ * The model list's alignment. Two defects, both invisible to a unit test and
+ * to a class-name grep:
  *
  * 1. The alias centred itself. `text-left` was on the row `div`, but the
- *    `<button>` inside it takes `text-align: center` from the UA stylesheet,
- *    which beats an inherited value. The metadata line underneath is a flex
- *    container so it was unaffected — hence a centred name over a left-aligned
- *    size, on every row.
- * 2. The badge column moved. The trash was rendered only for cached models and
- *    occupied no space otherwise, so an uncached row's badge sat further right
- *    than a cached one's, and hovering shifted it again as the button faded in.
+ *    `<button>` inside takes `text-align: center` from the UA stylesheet,
+ *    which beats an inherited value.
+ * 2. The badge column moved. The trash was rendered only for cached models
+ *    and occupied no space otherwise, so the badges sat in two columns.
  */
 type Stub = Awaited<ReturnType<typeof startStub>>;
 

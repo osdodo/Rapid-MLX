@@ -11,14 +11,10 @@ export type NoticeSpec = Omit<Notice, 'id' | 'action'> & {
 /**
  * Turn a server failure into a notice with a recovery.
  *
- * The old page discarded `error.type` and showed `error.message` in a
- * `window.alert` for every failure, so a transient "wait a moment" and a hard
- * "this server cannot do that at all" were indistinguishable. The codes are
- * the server's most useful output; this is where they are spent.
- *
- * `recover` is what the notice's button does. It is supplied by the caller
- * because the right recovery depends on what was being attempted — a retry of
- * a model switch is not a retry of a chat turn.
+ * The codes are the server's most useful output — a transient "wait a moment"
+ * and a hard "this server cannot do that" need different copy. `recover` is
+ * supplied by the caller because the right recovery depends on what was being
+ * attempted: retrying a model switch is not retrying a chat turn.
  */
 export function noticeFor(error: ApiError, recover?: () => void): NoticeSpec {
   const withRecovery = (label: string) => (recover ? { label, run: recover } : undefined);

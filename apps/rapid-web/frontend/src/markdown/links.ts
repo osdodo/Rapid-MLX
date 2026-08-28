@@ -1,16 +1,13 @@
 /**
  * Link scheme allow-list.
  *
- * A port of apps/rapid-mac/Sources/Rapid/UI/Markdown/ChatLinkSafetyFilter.swift
- * (security finding #304): default-deny, with exactly `http`, `https` and
- * `mailto` permitted. Everything else — `file:`, `javascript:`, `data:`,
- * `vscode:`, `raycast:` — renders as text with a dead click.
+ * Ported from `ChatLinkSafetyFilter.swift`: default-deny, with exactly `http`,
+ * `https` and `mailto` permitted. Everything else — `file:`, `javascript:`,
+ * `data:`, `vscode:` — renders as text with a dead click.
  *
- * `javascript:` is the case worth naming, because the old page's comment
- * called it out directly (index.html:1229-1232): HTML escaping does not touch
- * a URL scheme, so `javascript:` survives escaping intact and lands in an
- * `href` unchanged. In this design it cannot reach an `href` at all — React
- * only sets what we compute, and for a rejected scheme we compute null.
+ * `javascript:` is the case worth naming: HTML escaping does not touch a URL
+ * scheme, so it survives escaping intact and lands in an `href` unchanged.
+ * Here it cannot reach an `href` at all — a rejected scheme computes null.
  */
 
 const ALLOWED_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
@@ -18,16 +15,14 @@ const ALLOWED_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
 /**
  * The href to use, or null if the link must be rendered inert.
  *
- * Parsing through `URL` rather than pattern-matching the string is what makes
- * this robust: the constructor normalises first, so whitespace- and
- * control-character-obfuscated schemes (`java\tscript:`), case variants
- * (`JaVaScRiPt:`) and protocol-relative URLs (`//evil.example`) all resolve to
- * their real protocol before the comparison happens.
+ * Parsing through `URL` rather than pattern-matching is what makes this
+ * robust: the constructor normalises first, so obfuscated schemes
+ * (`java\tscript:`), case variants (`JaVaScRiPt:`) and protocol-relative URLs
+ * all resolve to their real protocol before the comparison.
  */
 export function safeHref(raw: string, base: string = window.location.origin): string | null {
-  // An empty target — `[text]()` — resolves to the page's own URL, which
-  // would render as a live link that silently reloads the app and loses the
-  // draft. It is not a link the model meant to make.
+  // An empty target — `[text]()` — resolves to the page's own URL, rendering
+  // as a live link that silently reloads the app and loses the draft.
   if (raw.trim() === '') return null;
 
   let url: URL;

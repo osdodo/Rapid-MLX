@@ -72,12 +72,10 @@ export function App() {
     setToken(phase.initial);
     void probeCapabilities()
       .then((capabilities) => {
-        // Persisted only AFTER the server accepts it — and it MUST be
-        // persisted here, not only on the manual path. A fragment token is
-        // stripped from the URL immediately, so if this path validates it
-        // without storing it, the very next reload has nothing to present and
-        // the user is asked to log in again despite having just scanned the
-        // QR code. Caught end-to-end; no unit test sees a reload.
+        // Persisted only AFTER the server accepts it, and it MUST happen on
+        // this path too: a fragment token is stripped from the URL
+        // immediately, so validating without storing means the next reload
+        // has nothing to present. Only e2e catches this.
         rememberToken(phase.initial);
         applyCapabilities(capabilities);
         setPhase({ kind: 'ready' });

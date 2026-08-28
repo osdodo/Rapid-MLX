@@ -15,22 +15,16 @@ import typescript from 'highlight.js/lib/languages/typescript';
 import yaml from 'highlight.js/lib/languages/yaml';
 
 /**
- * Syntax highlighting.
+ * Syntax highlighting: `lowlight` over `highlight.js/lib/core`, with an
+ * explicit language list.
  *
- * `lowlight` over `highlight.js/lib/core`, with an explicit language list.
+ * lowlight emits a HAST TREE rather than an HTML string, so it maps onto React
+ * elements and highlighting cannot introduce markup — no
+ * `dangerouslySetInnerHTML` on this path.
  *
- * Why lowlight: it emits a HAST TREE rather than an HTML string, which maps
- * directly onto React elements. So this path, like the rest of the markdown
- * pipeline, contains no `dangerouslySetInnerHTML` — highlighting a code block
- * cannot introduce markup.
- *
- * Why `lib/core` plus explicit registration: `lib/common` drags in ~180
- * languages, measured at roughly 120 KB more than this list. The bundle is
- * inlined into one HTML file that the server re-sends on every request with no
- * caching, so that is not an acceptable default.
- *
- * Measured at 79 KB minified for this set (2026-08-27) — under the estimate,
- * which is what makes temml's overrun affordable. See size-budget.json.
+ * `lib/core` plus explicit registration because `lib/common` drags in ~180
+ * languages, ~120 KB more than this list. Measured at 79 KB minified for this
+ * set; see size-budget.json.
  */
 
 const lowlight = createLowlight({

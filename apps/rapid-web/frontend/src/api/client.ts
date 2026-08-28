@@ -27,16 +27,11 @@ export interface RequestOptions {
 function headers(): HeadersInit {
   const base: Record<string, string> = {
     /**
-     * Sent on EVERY request, including GETs.
-     *
-     * This is a CSRF control, not a parsing convenience (auth.py:188-200).
-     * ``text/plain``, ``application/x-www-form-urlencoded`` and
-     * ``multipart/form-data`` are the three CORS "simple" content types: a
-     * cross-origin page can send them with no preflight, so the request lands
-     * before the browser ever consults a CORS policy. ``application/json`` is
-     * not on that list, so requiring it forces a preflight that the server
-     * then fails. The server enforces it on POST/PUT/PATCH only (app.py:220-227),
-     * but sending it everywhere keeps one code path.
+     * Sent on EVERY request, including GETs. A CSRF control, not a parsing
+     * convenience: the CORS "simple" content types can be sent cross-origin
+     * with no preflight, while ``application/json`` cannot. The server
+     * enforces it on POST/PUT/PATCH only; sending it everywhere keeps one
+     * code path.
      */
     'Content-Type': 'application/json',
   };
@@ -58,10 +53,9 @@ export async function request(path: string, options: RequestOptions = {}): Promi
   };
 
   // Assigned conditionally rather than passed as `undefined`: under
-  // exactOptionalPropertyTypes an explicit undefined is not the same as an
-  // absent key, and `body: undefined` on a GET is a type error rather than a
-  // no-op. `!== undefined` and not a truthiness check, because `{}` is
-  // exactly the body /api/auth and /api/downloads/cancel send.
+  // exactOptionalPropertyTypes an explicit undefined is not an absent key.
+  // `!== undefined` and not a truthiness check, because `{}` is exactly the
+  // body /api/auth and /api/downloads/cancel send.
   if (options.body !== undefined) init.body = JSON.stringify(options.body);
   if (options.signal) init.signal = options.signal;
 

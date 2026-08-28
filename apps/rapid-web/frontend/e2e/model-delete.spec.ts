@@ -4,11 +4,8 @@ import { startStub, type Scenario } from './stub-server';
 /**
  * Deleting a downloaded model from the model sheet.
  *
- * The trash lives on the row rather than behind a `···` menu: the sheet has
- * exactly one secondary action, and a menu holding a single item is a tap the
- * user pays for nothing. What has to hold is that it appears only where there
- * is something to delete, that it never doubles as a row selection, and that
- * it asks first.
+ * What has to hold: the trash appears only where there is something to delete,
+ * never doubles as a row selection, and asks first.
  */
 
 type Stub = Awaited<ReturnType<typeof startStub>>;

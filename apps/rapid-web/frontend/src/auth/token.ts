@@ -3,19 +3,16 @@ import { setToken } from '@/api/client';
 /**
  * Token acquisition.
  *
- * The token arrives in the URL FRAGMENT, never the query string. A fragment is
- * not transmitted to the server, so it cannot reach an access log, a proxy
- * log, or the tunnel provider's request history — all of which a `?token=`
- * would. The CLI generates the link that way (cli.py:148-163) and the page's
- * job is to consume it and get it out of the address bar immediately, so it
- * does not linger in browser history or in a screenshot of the URL.
+ * The token arrives in the URL FRAGMENT, never the query string: a fragment is
+ * not sent to the server, so it cannot reach an access log or a tunnel
+ * provider's history. The page consumes it and strips it from the address bar
+ * immediately, so it does not linger in history or a screenshot.
  */
 
 /**
- * Keeps the pre-rename spelling on purpose — see the note on `HISTORY_KEY`
- * in state/migrate.ts. Renaming this one costs less than the history key
- * (a signed-in phone would just be asked for its token again), but it is the
- * same mistake, and the two keys are only discoverable together.
+ * Keeps the pre-rename spelling on purpose — see `HISTORY_KEY` in
+ * state/migrate.ts. Renaming this costs less (a phone is just asked for its
+ * token again) but is the same mistake.
  */
 export const TOKEN_KEY = 'rapid-mlx-web.token';
 

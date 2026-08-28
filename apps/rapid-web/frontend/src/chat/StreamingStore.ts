@@ -3,26 +3,21 @@ import { advance, emptyLexState, type LexState } from '@/markdown/lex';
 /**
  * The live text of the answer currently streaming.
  *
- * This is the hot path, and the reason the rewrite exists. The old page
- * re-parsed the ENTIRE accumulated buffer into `innerHTML` once per animation
- * frame (index.html:1744-1755): O(n²) over a turn, and it destroyed every
- * open `<details>`, the text selection and each `<pre>`'s scroll position
- * sixty times a second. A naive React port would be strictly worse, adding
- * reconciliation of the whole subtree on top of the re-parse.
+ * The hot path, and the reason the rewrite exists: the old page re-parsed the
+ * entire accumulated buffer into `innerHTML` once per animation frame — O(n²)
+ * over a turn, destroying every open `<details>`, the selection and each
+ * `<pre>`'s scroll position sixty times a second.
  *
  * Four things keep it cheap:
  *
- * 1. The accumulator is a field on a plain object, NOT React state. The SSE
- *    reader appends per token and does zero React work.
- * 2. Commits are coalesced on a timer, not on `requestAnimationFrame`. rAF
- *    fires 60-120x a second — six to twelve times more often than needed —
- *    and iOS Safari throttles it during momentum scrolling and pauses it
- *    entirely in a background tab, which are exactly the moments a user is
- *    watching a long answer arrive.
- * 3. Lexing is incremental, so each commit costs the current block rather
- *    than the whole buffer (see markdown/lex.ts).
- * 4. Frozen tokens keep their identity, so a memoised block component skips
- *    reconciliation for everything above the tail.
+ * 1. The accumulator is a plain field, NOT React state, so the SSE reader
+ *    does zero React work per token.
+ * 2. Commits coalesce on a timer, not `requestAnimationFrame` — rAF fires 6-12x
+ *    more often than needed, and iOS Safari throttles it during momentum
+ *    scrolling and pauses it in background tabs.
+ * 3. Lexing is incremental, so a commit costs the current block rather than
+ *    the whole buffer (see markdown/lex.ts).
+ * 4. Frozen tokens keep their identity, so memoised blocks skip reconciliation.
  */
 
 /**

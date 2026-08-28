@@ -71,24 +71,16 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
     void refresh(true);
   }, [open, refresh]);
 
-  // Poll the current download. Re-attaches to a job that was already running,
-  // so reopening the sheet mid-download shows real progress rather than
-  // nothing.
+  // Poll the current download, re-attaching to a job already running so
+  // reopening the sheet mid-download shows real progress. A poll rather than a
+  // stream because trycloudflare buffers the SSE feed this replaced — see
+  // `fetchDownload`.
   //
-  // A poll rather than a stream because trycloudflare buffers the SSE feed
-  // this replaced indefinitely — see `fetchDownload` for the measurements.
-  //
-  // It runs in exactly two situations, and stops otherwise:
-  //
-  // * `null` — we do not know yet. One discovery request on open, which is
-  //   what re-attaches to a pull started before this page loaded.
-  // * `running` — there is progress to follow.
-  //
-  // A terminal job is NOT polled. The server retains the last finished job
-  // indefinitely, so asking again can only ever return the same answer; the
-  // old loop kept requesting once a second for the life of the sheet. Both
-  // places that start a pull put a `running` job in the store, so this effect
-  // re-runs and resumes on its own when the next download begins.
+  // Runs in exactly two situations: `null` (discovery on open, which is what
+  // re-attaches to a pull started before this page loaded) and `running`. A
+  // terminal job is NOT polled — the server retains the last finished job
+  // forever, so asking again returns the same answer. Both places that start a
+  // pull put a `running` job in the store, so this effect resumes on its own.
   useEffect(() => {
     if (!open || !allowDownloads) return;
     if (downloadState !== null && downloadState !== 'running') return;

@@ -11,23 +11,18 @@ import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
  *
  * Built on the dialog primitives rather than components/ui/sheet.tsx, which
  * only knows the four fixed edges and cannot change side at a breakpoint.
- *
- * Radix supplies the focus trap and Escape handling. The old page's sheets
- * were divs toggled by a `hidden` class, so content behind them stayed
- * reachable and Escape closed all of them at once.
+ * Radix supplies the focus trap and Escape handling.
  */
 
 /**
  * The desktop footprint shared by every modal window.
  *
  * Exported because the search palette is built on `CommandDialog`, not on this
- * component, and the two must not drift — a literal copied into both is
- * exactly how they would.
+ * component, and a literal copied into both is how the two would drift.
  *
- * A DEFINITE size, not a ceiling (`h`/`w`, never `max-h`). With a ceiling each
- * window sized to its own content — Settings ran to 630px while the model
- * picker sat at 259px — so opening one after another made the dialog jump.
- * The picker's content is unbounded anyway: a real catalog is ~179 aliases.
+ * A DEFINITE size, not a ceiling (`h`/`w`, never `max-h`): with a ceiling each
+ * window sized to its own content — Settings 630px, the model picker 259px —
+ * so opening one after another made the dialog jump.
  *
  * `sm:`-scoped throughout. On a phone these stay content-sized bottom sheets;
  * a fixed height there would push a two-row picker over most of the screen.

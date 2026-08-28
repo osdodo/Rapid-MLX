@@ -3,25 +3,17 @@ import temml from 'temml';
 /**
  * LaTeX to MathML, via Temml.
  *
- * WHY TEMML AND NOT KATEX. KaTeX's default HTML output needs roughly 1 MB of
- * woff2 across ~60 files; data-URI'd into a single-file bundle that is ~1.3 MB
- * of base64, several times the rest of the app, re-sent on every page load
- * over a tunnel. KaTeX with `output: 'mathml'` drops the fonts but keeps the
- * JS — measured at 271 KB, including an HTML builder and font-metrics tables
- * that would go unused. Temml is MathML-only by design: no HTML builder, no
- * metrics table, and no required font (its optional 15 KB Temml.woff2 is not
- * shipped). Measured at 212 KB — well over the 120 KB this was planned at, but
- * still the smaller of the two, and the browser's own math font does the
- * rendering.
+ * NOT KaTeX: its default HTML output needs ~1 MB of woff2, and even
+ * `output: 'mathml'` keeps a 271 KB JS payload with an HTML builder and
+ * font-metrics tables that go unused. Temml is MathML-only by design —
+ * measured at 212 KB, with the browser's own math font doing the rendering.
  *
  * MathML Core has shipped in Safari since 14.1 and Chrome since 109, and the
- * audience here is overwhelmingly iOS Safari. `probeMathMLSupport` covers the
- * rest.
+ * audience is overwhelmingly iOS Safari. `probeMathMLSupport` covers the rest.
  *
- * THE ONE `dangerouslySetInnerHTML` IN THE APP. Everything else in the
- * markdown pipeline produces React elements from tokens, so this is the single
- * place markup is injected as a string, and the only XSS surface. It is
- * covered by dedicated fixtures, and any Temml version bump must re-run them.
+ * THE ONE `dangerouslySetInnerHTML` IN THE APP, and so the only XSS surface —
+ * everything else produces React elements from tokens. Covered by dedicated
+ * fixtures; any Temml bump must re-run them.
  */
 
 const OPTIONS = {
@@ -77,12 +69,11 @@ export function renderMath(latex: string, display: boolean): string {
  * Does this browser actually render MathML?
  *
  * An old Android WebView parses MathML but lays it out as flattened text, so a
- * fraction renders as "12" rather than as one over two. That is not a crash,
- * it is worse: it is silently wrong output that looks like the model's fault.
+ * fraction renders as "12" rather than one over two — silently wrong output
+ * that looks like the model's fault.
  *
  * The probe renders a fraction off-screen and compares its height to a plain
- * identifier. Real MathML layout makes the fraction taller; a browser that
- * flattens it makes them equal.
+ * identifier: real layout makes the fraction taller.
  */
 export function probeMathMLSupport(): boolean {
   if (typeof document === 'undefined') return false;

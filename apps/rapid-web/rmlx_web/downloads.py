@@ -1,27 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model downloads, driven through ``rapid-mlx pull``.
 
-Progress is **not** scraped from tqdm. ``rapid-mlx pull`` emits a
+Progress is not scraped from tqdm. ``rapid-mlx pull`` emits a
 machine-readable heartbeat on stdout whenever stdout is not a TTY::
 
       [bytes] 5750583/649378984
 
-``vllm_mlx/_mirror.py`` documents this as a contract the desktop app's
-progress parser already depends on, and picks the mode from
-``isatty()`` alone — a captured pipe always gets the machine form. Since
-this module captures stdout, the heartbeat is guaranteed.
+``vllm_mlx/_mirror.py`` picks the mode from ``isatty()`` alone, so a
+captured pipe always gets the machine form. Interleaved human status
+lines are ignored, and the authoritative completion signal is the exit
+code — a failed partial transfer prints status lines too.
 
-Interleaved with it are human status lines (``[3/11] config.json R2``),
-which are ignored. The authoritative completion signal is the process
-exit code, not any line of output: the pull prints a summary on success,
-but a partial transfer that failed can print status lines too.
-
-Why downloads are gated at all — the endpoint that reaches this module
-is remotely reachable the moment a tunnel is attached, and a download is
-the one operation here that consumes an unbounded amount of somebody
-else's disk. Three gates, all enforced by the caller in ``app.py``:
-off unless enabled, refused unless the size is known and fits, and
-restricted to catalog aliases.
+Downloads are gated because this endpoint is remotely reachable once a
+tunnel is attached and consumes an unbounded amount of somebody else's
+disk. Three gates, all enforced by the caller in ``app.py``: off unless
+enabled, refused unless the size is known and fits, and restricted to
+catalog aliases.
 """
 
 from __future__ import annotations
@@ -36,24 +30,21 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
-# Free space that must remain after the download completes. A disk
-# filled to the last byte takes the whole Mac down with it, not just
-# this feature — the OS needs room for swap and the engine writes a
+# Must remain free after the download. A disk filled to the last byte
+# takes the whole Mac down: the OS needs swap and the engine writes a
 # Metal shader cache on first load.
 DISK_HEADROOM_BYTES = 10 * 1024**3
 
-# HuggingFace stages a blob then moves it into place, so the peak
-# footprint exceeds the final size. 1.15 is a rough allowance; it does
-# not need to be exact because DISK_HEADROOM_BYTES dominates.
+# HuggingFace stages a blob then moves it, so peak exceeds final size.
+# Rough — DISK_HEADROOM_BYTES dominates.
 _TRANSFER_OVERHEAD = 1.15
 
 # ``  [bytes] 5750583/649378984``
 _BYTES_RE = re.compile(r"^\s*\[bytes\]\s+(\d+)\s*/\s*(\d+)\s*$")
 
-# Grace period between SIGTERM and SIGKILL on cancel. huggingface_hub
-# unwinds a partial blob on the way out; killing instantly strands an
-# ``.incomplete`` file that nothing else collects until the next pull of
-# the same repo reaps it.
+# SIGTERM→SIGKILL grace on cancel. huggingface_hub unwinds a partial blob
+# on the way out; killing instantly strands an ``.incomplete`` file that
+# nothing collects until the next pull of the same repo.
 _TERM_GRACE_S = 10.0
 
 _OUTPUT_TAIL_LINES = 40
@@ -98,14 +89,12 @@ class DownloadJob:
 def free_disk_bytes(path: str | None = None) -> int:
     """Bytes available on the filesystem holding the HF cache.
 
-    Measured where the download will actually land, not on ``/``: a
-    ``HF_HOME`` on an external volume is common, and checking the wrong
-    filesystem gives an answer that is confidently wrong in either
-    direction.
+    Measured where the download lands, not on ``/``: an ``HF_HOME`` on an
+    external volume is common, and the wrong filesystem gives an answer
+    that is confidently wrong in either direction.
     """
     target = path or _hf_cache_root()
-    # Walk up to the nearest existing ancestor — the cache directory may
-    # not exist yet on a fresh install.
+    # Nearest existing ancestor — the cache dir may not exist yet.
     while target and not os.path.exists(target):
         parent = os.path.dirname(target)
         if parent == target:
@@ -128,12 +117,9 @@ def _hf_cache_root() -> str:
 def check_disk_budget(size_bytes: int | None) -> str | None:
     """Reject a download that does not fit. Returns a reason, or None.
 
-    **Fails closed on an unknown size.** ``model_sizes.json`` has no
-    entry for every repo (``size_bytes`` returns ``None`` for e.g.
-    ``google/embeddinggemma-300m-6bit``), and "unknown" must not be read
-    as "small". Guessing here is how a publicly reachable endpoint fills
-    the host's disk, so an unmeasurable model is refused and the user is
-    told to pull it from the Mac instead.
+    **Fails closed on an unknown size.** ``model_sizes.json`` has no entry
+    for every repo (``None`` for e.g. ``google/embeddinggemma-300m-6bit``),
+    and guessing is how a publicly reachable endpoint fills the host's disk.
     """
     if not size_bytes or size_bytes <= 0:
         return (
@@ -167,11 +153,9 @@ def parse_progress(line: str) -> tuple[int, int] | None:
 class DownloadManager:
     """Runs at most one ``rapid-mlx pull`` at a time.
 
-    One at a time is a policy choice, not a limitation: concurrent
-    multi-GB pulls contend for the same bandwidth and disk, so two
-    together finish no sooner than two in sequence while doubling the
-    peak disk footprint — and the footprint is what the budget check
-    above is defending.
+    A policy choice: concurrent multi-GB pulls contend for the same
+    bandwidth and disk, finishing no sooner than in sequence while
+    doubling the peak footprint that the budget check defends.
     """
 
     def __init__(self, binary: str) -> None:
@@ -207,8 +191,8 @@ class DownloadManager:
                     alias,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
-                    # Own process group so cancel reaches the whole tree.
-                    # The pull spawns transfer workers; signalling only
+                    # Own process group so cancel reaches the whole tree:
+                    # the pull spawns transfer workers, and signalling only
                     # the leader leaves them downloading with no parent.
                     start_new_session=True,
                 )
@@ -230,9 +214,9 @@ class DownloadManager:
             try:
                 raw = await process.stdout.readline()
             except (ValueError, OSError):
-                # An over-long line without a newline raises ValueError.
-                # Stop reading rather than kill the drain: leaving the
-                # pipe unread would block the child on its next write.
+                # ValueError on an over-long line without a newline. Stop
+                # reading rather than kill the drain — an unread pipe would
+                # block the child on its next write.
                 break
             if not raw:
                 break
@@ -244,9 +228,8 @@ class DownloadManager:
             progress = parse_progress(line)
             if progress is not None and job is not None:
                 done, total = progress
-                # Never let the bar go backwards. Workers heartbeat
-                # concurrently, so a slightly stale line can arrive after
-                # a fresher one.
+                # Never let the bar go backwards: workers heartbeat
+                # concurrently, so a stale line can arrive after a fresher.
                 job.done_bytes = max(job.done_bytes, done)
                 if total > 0:
                     job.total_bytes = total
@@ -260,13 +243,13 @@ class DownloadManager:
 
         if job is not None:
             if job.state is DownloadState.CANCELLED:
-                # Already recorded by cancel(); a cancelled pull exits
-                # non-zero, which must not be relabelled as a failure.
+                # Recorded by cancel(); a cancelled pull exits non-zero,
+                # which must not be relabelled as a failure.
                 pass
             elif code == 0:
                 job.state = DownloadState.DONE
-                # Snap to 100%: the last heartbeat can land slightly
-                # short of the total, leaving a bar stuck at 99%.
+                # Snap to 100%: the last heartbeat can land short of the
+                # total, leaving a bar stuck at 99%.
                 if job.total_bytes:
                     job.done_bytes = job.total_bytes
             else:
@@ -310,9 +293,8 @@ class DownloadManager:
     async def shutdown(self) -> None:
         """Stop any running pull at process exit.
 
-        A download left running past the supervisor would keep writing
-        to the cache with nothing watching it, and the user has no way
-        to stop it short of finding the PID.
+        A download left running would keep writing to the cache with
+        nothing watching it, and no way to stop it short of the PID.
         """
         await self.cancel()
         if self._task is not None:

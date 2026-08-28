@@ -5,21 +5,16 @@ import type { Conversation, MessageNode, PersistedStore } from './types';
 /**
  * Writing the store to localStorage, under caps.
  *
- * The caps are not housekeeping. localStorage is roughly 5 MB per origin and
- * THROWS on overflow, so an unbounded store does not degrade — it silently
- * stops persisting anything at all, including the conversation the user is
- * having right now.
+ * The caps are not housekeeping: localStorage is ~5 MB per origin and THROWS
+ * on overflow, so an unbounded store does not degrade — it silently stops
+ * persisting anything, including the conversation in progress.
  *
- * The old page capped 30 conversations and `messages.slice(-200)`
- * (index.html:996-1015). Both dimensions survive here, re-expressed on a tree.
- *
- * Caps apply AT WRITE TIME and never mutate the in-memory store. A user who
- * has scrolled into an old branch must keep seeing it for the rest of the
- * session even if it is not what gets persisted.
+ * Caps apply AT WRITE TIME and never mutate the in-memory store: a user who
+ * scrolled into an old branch keeps seeing it for the session.
  */
 
 export const MAX_CONVERSATIONS = 30;
-/** Nodes on the visible path. The direct translation of `slice(-200)`. */
+/** Nodes on the visible path. */
 export const MAX_ACTIVE_PATH = 200;
 /** Nodes in total, including every off-path alternative. */
 export const MAX_NODES = 400;
@@ -27,19 +22,15 @@ export const MAX_NODES = 400;
 const QUOTA_RETRIES = 5;
 
 /**
- * Trim one conversation's node bag.
- *
- * Order matters:
+ * Trim one conversation's node bag. Order matters:
  *
  *   1. The active path is capped first and RE-ROOTED, so the visible
- *      transcript is always whole. Same information loss as the old
- *      `slice(-200)`, expressed on a tree.
+ *      transcript is always whole.
  *   2. Everything reachable from a retained node is retained with it, so a
- *      branch the user can still switch to does not lose its continuation.
- *   3. If that is still too much, whole off-path subtrees go, oldest first.
- *      Never split a subtree: half a branch is a conversation that never
- *      happened.
- *   4. Stale `branchChoices` are pruned last, once the survivors are known.
+ *      switchable branch does not lose its continuation.
+ *   3. If still too large, whole off-path subtrees go, oldest first. Never
+ *      split one — half a branch is a conversation that never happened.
+ *   4. Stale `branchChoices` are pruned last, once survivors are known.
  */
 export function capConversation(conversation: Conversation): Conversation {
   const { nodes, activeLeafId, branchChoices } = conversation;

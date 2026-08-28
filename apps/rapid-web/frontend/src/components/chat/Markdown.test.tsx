@@ -21,11 +21,9 @@ function draw(source: string, options: { streaming?: boolean; math?: 'mathml' | 
 /**
  * Find a MathML root.
  *
- * `querySelector('math')` does NOT match. Temml's output is injected as a
- * string, so jsdom parses it into the HTML namespace, where `math` is an
- * unknown element rather than the MathML element a tag selector expects.
- * Comparing tag names sidesteps the namespace, and answers the question the
- * assertions actually ask: did the markup reach the DOM at all.
+ * `querySelector('math')` does NOT match: Temml's output is injected as a
+ * string, so jsdom parses it into the HTML namespace where `math` is an
+ * unknown element. Comparing tag names sidesteps the namespace.
  */
 function mathRoot(container: HTMLElement): Element | null {
   return (

@@ -19,29 +19,23 @@ import {
  *   v3  { v: 3, conversations: Conversation[],             (this build)
  *        folders: Folder[], activeId }
  *
- * v3 is the first shape to carry its own version, which is why detection has
- * to sniff the older two structurally.
+ * v3 is the first shape to carry its own version, so the older two have to be
+ * sniffed structurally.
  *
- * THE MIGRATION IS ONE-WAY AND NOT BACKWARDS COMPATIBLE. Once v3 is written,
- * an older build reads an object with a `v` field and no
- * `conversations[].messages`, and its loader (index.html:1033-1035) returns an
- * empty store — so the history APPEARS deleted on a downgrade. The data is
- * still there. This was a deliberate call; the README says so, and the JSON
- * export is the backup path.
+ * THE MIGRATION IS ONE-WAY. Once v3 is written an older build reads an object
+ * with a `v` field and no `conversations[].messages` and returns an empty
+ * store, so history APPEARS deleted on a downgrade. The data is still there;
+ * the README says so and the JSON export is the backup path.
  *
- * Pure, and deliberately not a store middleware: it needs to be callable from
- * a test without standing up a store, and it is the piece most likely to be
- * wrong in a way that costs a user their transcripts.
+ * Pure, and deliberately not a store middleware: it must be callable from a
+ * test without standing up a store.
  */
 
 /**
  * NOT renamed when the package became `rmlx-web`, and must never be. A
- * localStorage key is not a label — it is where an existing user's
- * transcripts already live. Renaming it does not move them; it makes the
- * app read an empty slot and every saved conversation appears deleted, with
- * no migration path back because the old key is no longer read. The v1→v3
- * chain below exists precisely to avoid that class of loss, so introducing
- * it at the key level would defeat the whole file.
+ * localStorage key is where an existing user's transcripts already live —
+ * renaming it does not move them, it makes the app read an empty slot with no
+ * path back, which is the exact class of loss the chain below exists to avoid.
  */
 export const HISTORY_KEY = 'rapid-mlx-web.history';
 /** Where an unparseable blob is copied before anything overwrites it. */
@@ -89,11 +83,10 @@ export function detect(parsed: unknown): DetectedVersion {
 /**
  * Derive a title from the first user message.
  *
- * Must run AT CONSTRUCTION for a migrated conversation. A transcript brought
- * forward from v1 never passes through the "touch on write" path, so leaving
- * the title empty labelled a restored conversation "New chat" in the drawer
- * despite it having messages. That bug was found in a browser, not by any
- * unit test (PLAN.md:217-220) — hence the test that pins it here.
+ * Must run AT CONSTRUCTION for a migrated conversation: a transcript brought
+ * forward from v1 never passes through the "touch on write" path, so an empty
+ * title labelled a restored conversation "New chat" despite it having
+ * messages. Found in a browser, not by a unit test — hence the test below.
  */
 export function deriveTitle(nodes: Array<{ role: Role; content: string }>): string {
   for (const node of nodes) {

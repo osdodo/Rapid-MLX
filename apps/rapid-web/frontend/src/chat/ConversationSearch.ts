@@ -7,14 +7,11 @@ import { dateGroupOf, type DateGroup } from '@/lib/format';
  * Ported from `apps/rapid-mac/Sources/Rapid/Chat/ConversationSearch.swift`,
  * including the two decisions that are easy to get wrong:
  *
- *   - **All terms, anywhere.** Whitespace-delimited terms each match the
- *     title OR any message. They may land in different messages, which is
- *     what makes "swift cache" useful when the two words came from different
- *     turns.
- *   - **Every branch, not just the visible path.** Search is how you find a
- *     conversation you half-remember, and an answer you regenerated away is
- *     exactly what you come back looking for. Matching only the active path
- *     would report "no results" for text the app is still holding.
+ *   - **All terms, anywhere.** Each whitespace-delimited term matches the
+ *     title OR any message, and they may land in different messages — which is
+ *     what makes "swift cache" useful across two turns.
+ *   - **Every branch, not just the visible path.** An answer you regenerated
+ *     away is exactly what you come back looking for.
  *
  * Search stays local: it reads the already-loaded history and sends nothing.
  */
