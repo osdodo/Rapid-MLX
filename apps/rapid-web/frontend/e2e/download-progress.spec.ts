@@ -1,5 +1,5 @@
 import { expect, test as base } from '@playwright/test';
-import { startStub, type Scenario } from './stub-server';
+import { openModelList, startStub, type Scenario } from './stub-server';
 
 /**
  * Download progress reaches the UI by POLLING, not by a stream.
@@ -26,10 +26,7 @@ const test = base.extend<{ scenario: Partial<Scenario>; stub: Stub }>({
 async function openSheet(page: import('@playwright/test').Page, baseURL: string) {
   await page.goto(baseURL);
   await expect(page.getByLabel('Message')).toBeVisible();
-  const drawer = page.getByLabel('Open sidebar');
-  if (await drawer.isVisible()) await drawer.click();
-  await page.getByRole('button', { name: /Choose a model/ }).click();
-  return page.getByRole('dialog', { name: 'Model' });
+  return openModelList(page);
 }
 
 test.describe('a download already in flight', () => {

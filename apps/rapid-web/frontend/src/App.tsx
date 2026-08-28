@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { requestJson, requestPublic, setToken } from '@/api/client';
 import { asApiError } from '@/api/errors';
-import { fetchStatus, loadModel, pullModel } from '@/api/models';
-import type { AuthResponse, ConfigResponse } from '@/api/types';
+import { fetchModels, fetchStatus, pullModel } from '@/api/models';
+import { startModel } from '@/state/startModel';
+import type { AuthResponse, ConfigResponse, ModelKind } from '@/api/types';
 import { Gate } from '@/components/common/Gate';
 import { consumeFragmentToken, rememberToken, storedToken } from '@/auth/token';
 import { branchPosition, editAndResend, retry, send, stopTurn, switchBranch } from '@/chat/turn';
@@ -10,6 +11,7 @@ import { deleteConfirmationTitle, deletionImpact, subtree } from '@/chat/Message
 import { formatBytes } from '@/lib/format';
 import { probeMathMLSupport } from '@/markdown/math';
 import { LifecycleBand } from '@/components/models/LifecycleBand';
+import { ComposerModelPicker } from '@/components/models/ComposerModelPicker';
 import {
   composerPlaceholder,
   emptyStateHint,
@@ -25,17 +27,28 @@ import { useActiveConversation, useActivePath, useStore } from '@/state/store';
 import { Composer } from '@/components/chat/Composer';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { ChatBar } from '@/components/chat/ChatBar';
-import { ModelButton } from '@/components/models/ModelButton';
-import { Sidebar, SidebarDrawer, useWideLayout } from '@/components/conversations/Sidebar';
+import {
+  Sidebar,
+  SidebarDrawer,
+  useWideLayout,
+  type Surface,
+} from '@/components/conversations/Sidebar';
 import { SearchPalette, useSearchShortcut } from '@/components/conversations/SearchPalette';
 import { MessageRow } from '@/components/chat/MessageRow';
 import { LiveRegion, Transcript } from '@/components/chat/Transcript';
-import { ModelSheet } from '@/components/models/ModelSheet';
+import { ImagesView } from '@/components/images/ImagesView';
+import { AudioView } from '@/components/audio/AudioView';
 import { NoticeStack } from '@/components/common/Notice';
 import { noticeFor } from '@/state/notices';
-import { SettingsSheet } from '@/components/common/SettingsSheet';
+import { SettingsSheet, type SettingsCategory } from '@/components/common/SettingsSheet';
 
 type Phase = { kind: 'booting' } | { kind: 'gate'; initial: string } | { kind: 'ready' };
+
+/** Bar titles for the non-chat surfaces; chat uses the conversation's own. */
+const SURFACE_TITLES: Partial<Record<Surface, string>> = {
+  images: 'Images',
+  audio: 'Audio',
+};
 
 export function App() {
   const [phase, setPhase] = useState<Phase>({ kind: 'booting' });
@@ -119,7 +132,6 @@ function Chat() {
   const settings = useStore((state) => state.settings);
   const status = useStore((state) => state.status);
   const statusFailures = useStore((state) => state.statusFailures);
-  const selectedAlias = useStore((state) => state.selectedAlias);
   const models = useStore((state) => state.models);
   const catalogLoaded = useStore((state) => state.catalogLoaded);
   const download = useStore((state) => state.download);
@@ -127,7 +139,17 @@ function Chat() {
   const attentionToken = useStore((state) => state.attentionToken);
   const pushNotice = useStore((state) => state.pushNotice);
 
-  const [sheet, setSheet] = useState<'none' | 'models' | 'settings'>('none');
+  // One window, opened on the category the caller means: the model button
+  // and the footer button are both "settings", but they are asking for
+  // different pages of it.
+  const [settingsPage, setSettingsPage] = useState<SettingsCategory | null>(null);
+  const [surface, setSurface] = useState<Surface>('chat');
+
+  // The model is per surface, so choosing one for images must not retarget
+  // the chat — and a failure on one must not be reported by the other.
+  const kind: ModelKind = surface === 'images' ? 'image' : 'text';
+  const selectedAlias = useStore((state) => state.selectedByKind[kind]);
+
   const wide = useWideLayout();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -144,6 +166,7 @@ function Chat() {
   useThemeAttribute(settings.theme);
   useMathProbe();
   useStatusPolling();
+  useCatalogOnBoot();
 
   // A commit inside the streaming store does not change the app store, so the
   // transcript needs its own signal to re-run the scroll-follow effect.
@@ -164,6 +187,18 @@ function Chat() {
     if (!entry) return 'notInCatalog';
     return entry.cached ? 'onDisk' : 'notOnDisk';
   }, [catalogLoaded, models, selectedAlias]);
+
+  // Is the engine currently busy with a model of THIS surface's kind? The
+  // engine is shared, so its state — a failure most of all — must not be
+  // reported by the surface it does not concern.
+  const statusIsForThisKind = useMemo(() => {
+    const serving = status?.model ?? null;
+    if (serving === null) return true;
+    const entry = models.find((model) => model.alias === serving);
+    // Unknown alias: no reason to suppress. Better a stale statement than a
+    // silently blank surface.
+    return entry === undefined || entry.kind === kind;
+  }, [status, models, kind]);
 
   const readiness = useMemo(
     () =>
@@ -186,8 +221,19 @@ function Chat() {
             : null,
         turnError: lastFailure(path),
         canSwitch,
+        statusIsForThisKind,
       }),
-    [status, statusFailures, selectedAlias, cacheState, models, download, path, canSwitch],
+    [
+      status,
+      statusFailures,
+      selectedAlias,
+      cacheState,
+      models,
+      download,
+      path,
+      canSwitch,
+      statusIsForThisKind,
+    ],
   );
 
   const canSend = sendAllowed(readiness) && !streaming;
@@ -202,13 +248,16 @@ function Chat() {
               break;
             case 'start':
             case 'retry':
-              await loadModel(action.alias);
+              // `startModel`, not `loadModel`: it adopts the server's answer,
+              // without which the band keeps offering Start for the whole
+              // load. See state/startModel.ts.
+              await startModel(action.alias);
               break;
             case 'reconnect':
               await fetchStatus();
               break;
             case 'chooseModel':
-              setSheet('models');
+              setSettingsPage('models');
               break;
           }
         } catch (cause) {
@@ -223,46 +272,61 @@ function Chat() {
     send(text);
   }, []);
 
-  const newChat = useCallback(() => useStore.getState().createConversation(), []);
+  // Also returns to the chat surface: "New Chat" is the way back from Images,
+  // and starting one while the images view stays on screen would look like it
+  // had done nothing.
+  const newChat = useCallback(() => {
+    setSurface('chat');
+    useStore.getState().createConversation();
+  }, []);
   const openSearch = useCallback(() => setSearchOpen(true), []);
   useSearchShortcut(openSearch);
 
-  // One instance, handed to whichever shell is on screen. Building it here
-  // rather than twice keeps the two paths from drifting.
-  const modelSelector = (
-    <ModelButton
-      readiness={readiness}
-      alias={selectedAlias}
-      canSwitch={canSwitch}
-      onClick={() => setSheet('models')}
-    />
+  // The model picker lives in the composer, not the sidebar: it is a property
+  // of the message about to be sent. Selecting one goes through the same
+  // `onAction` path as the readiness banner, so a switch is refused for the
+  // same reasons in both places.
+  const chooseModel = useCallback(
+    (alias: string) => {
+      const entry = useStore.getState().models.find((model) => model.alias === alias);
+      // Select FIRST, and against the model's OWN kind rather than the
+      // current surface: `readiness` derives from the selection, so without
+      // this the band keeps reporting the previous model for the whole load.
+      useStore.getState().selectAlias(entry?.kind ?? 'text', alias);
+      onAction(
+        entry && !entry.cached ? { kind: 'download', alias } : { kind: 'start', alias },
+      );
+    },
+    [onAction],
   );
+
+  const shellProps = {
+    onNewChat: newChat,
+    onOpenSettings: () => setSettingsPage('chat'),
+    onSearch: openSearch,
+    surface,
+    onSelectSurface: setSurface,
+  };
 
   return (
     <div className="relative flex h-dvh">
       {wide ? (
         <Sidebar
-          header={modelSelector}
-          onNewChat={newChat}
-          onOpenSettings={() => setSheet('settings')}
-          onSearch={openSearch}
+          {...shellProps}
           collapsed={railCollapsed}
           onToggleCollapsed={() => setRailCollapsed((value) => !value)}
         />
       ) : (
         <SidebarDrawer
+          {...shellProps}
           open={drawerOpen}
           onClose={() => setDrawerOpen(false)}
-          header={modelSelector}
-          onNewChat={newChat}
-          onOpenSettings={() => setSheet('settings')}
-          onSearch={openSearch}
         />
       )}
 
       <div className="relative flex h-dvh min-w-0 flex-1 flex-col">
         <ChatBar
-          title={conversationTitle(conversation)}
+          title={SURFACE_TITLES[surface] ?? conversationTitle(conversation)}
           onOpenSidebar={
             wide
               ? railCollapsed
@@ -270,58 +334,91 @@ function Chat() {
                 : null
               : () => setDrawerOpen(true)
           }
-          onNewChat={newChat}
+          onNewChat={surface === 'chat' ? newChat : null}
         />
 
         <NoticeStack />
 
-        <Transcript revision={revision} streaming={streaming}>
-          {path.length === 0 ? (
-            <EmptyState readiness={readiness} />
-          ) : (
-            path.map((node) => (
-              <MessageRow
-                key={node.id}
-                node={node}
-                mathRendering={settings.mathRendering}
-                branch={conversation ? branchPosition(node.id, conversation.nodes) : null}
-                onBranch={(direction) => switchBranch(node.id, direction)}
-                onRetry={() => retry(node.id)}
-                onEdit={(text) => editAndResend(node.id, text)}
-                onDelete={() =>
-                  setPendingDelete({
-                    id: node.id,
-                    impact: conversation ? deletionImpact(node.id, conversation.nodes) : 1,
-                  })
-                }
-                busy={streaming}
+        {surface === 'audio' ? (
+          <AudioView />
+        ) : surface === 'images' ? (
+          <ImagesView
+            onChooseModel={() => setSettingsPage('models')}
+            onSelectModel={chooseModel}
+            // The same lifecycle surface the chat uses, so a model that is
+            // downloading, starting or failed reports itself identically on
+            // both. Built here rather than inside ImagesView so there is one
+            // `readiness` value for the whole app.
+            band={
+              <LifecycleBand
+                readiness={readiness}
+                attentionToken={attentionToken}
+                onAction={onAction}
               />
-            ))
-          )}
-        </Transcript>
+            }
+          />
+        ) : (
+          <>
+            <Transcript revision={revision} streaming={streaming}>
+              {path.length === 0 ? (
+                <EmptyState readiness={readiness} />
+              ) : (
+                path.map((node) => (
+                  <MessageRow
+                    key={node.id}
+                    node={node}
+                    mathRendering={settings.mathRendering}
+                    branch={conversation ? branchPosition(node.id, conversation.nodes) : null}
+                    onBranch={(direction) => switchBranch(node.id, direction)}
+                    onRetry={() => retry(node.id)}
+                    onEdit={(text) => editAndResend(node.id, text)}
+                    onDelete={() =>
+                      setPendingDelete({
+                        id: node.id,
+                        impact: conversation ? deletionImpact(node.id, conversation.nodes) : 1,
+                      })
+                    }
+                    busy={streaming}
+                  />
+                ))
+              )}
+            </Transcript>
 
-        <LifecycleBand readiness={readiness} attentionToken={attentionToken} onAction={onAction} />
+            <LifecycleBand
+              readiness={readiness}
+              attentionToken={attentionToken}
+              onAction={onAction}
+            />
 
-        <Composer
-          placeholder={composerPlaceholder(readiness)}
-          sendTooltip={sendTooltip(readiness)}
-          canSend={canSend}
-          streaming={streaming}
-          onSend={runSend}
-          onStop={stopTurn}
-          onBlocked={() => useStore.getState().flagBlockedSend()}
-        />
+            <Composer
+              placeholder={composerPlaceholder(readiness)}
+              sendTooltip={sendTooltip(readiness)}
+              canSend={canSend}
+              streaming={streaming}
+              onSend={runSend}
+              onStop={stopTurn}
+              onBlocked={() => useStore.getState().flagBlockedSend()}
+              picker={
+                <ComposerModelPicker
+                  kind="text"
+                  onManage={() => setSettingsPage('models')}
+                  onSelect={(model) => chooseModel(model.alias)}
+                />
+              }
+            />
 
-        <LiveRegion message={headline(readiness)} />
+            <LiveRegion message={headline(readiness)} />
+          </>
+        )}
       </div>
 
       <SearchPalette open={searchOpen} onOpenChange={setSearchOpen} onNewChat={newChat} />
 
-      <ModelSheet open={sheet === 'models'} onClose={() => setSheet('none')} />
       <SettingsSheet
-        open={sheet === 'settings'}
-        onClose={() => setSheet('none')}
+        open={settingsPage !== null}
+        onClose={() => setSettingsPage(null)}
         engineInfo={engineInfoOf(status)}
+        initialCategory={settingsPage ?? 'models'}
       />
 
       <ConfirmDialog
@@ -401,6 +498,14 @@ function useMathProbe() {
  * cellular radio pays for every request in battery.
  */
 function useStatusPolling() {
+  // Keyed on the engine state so a TRANSITION restarts the loop. Pacing off
+  // the fetched snapshot alone is not enough: a load adopts `starting`
+  // between polls (see state/startModel.ts) with a settled 15 s timer
+  // already pending, leaving that start unwatched for a quarter of a minute
+  // — so a failure took that long to reach the band. Transitions are rare
+  // and are exactly when the user is watching, so the extra request is cheap.
+  const state = useStore((store) => store.status?.state ?? null);
+
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -423,6 +528,26 @@ function useStatusPolling() {
       cancelled = true;
       clearTimeout(timer);
     };
+  }, [state]);
+}
+
+/**
+ * Read the catalog once at boot.
+ *
+ * The model list used to be fetched only when the picker opened, which is
+ * enough for a picker but not for anything that needs to know what KIND the
+ * loaded model is — the images surface cannot tell whether it is usable until
+ * the catalog has arrived. Failures are swallowed: the picker re-reads on
+ * open and reports its own errors there.
+ */
+function useCatalogOnBoot() {
+  useEffect(() => {
+    void fetchModels()
+      .then((response) => {
+        useStore.getState().setModels(response.models);
+        useStore.getState().setCapabilities(response.can_switch, response.allow_downloads);
+      })
+      .catch(() => undefined);
   }, []);
 }
 

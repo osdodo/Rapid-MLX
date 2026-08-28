@@ -98,6 +98,17 @@ describe('readyDescribesSelection (strict, send-enabling)', () => {
     expect(readyDescribesSelection('a', null)).toBe(false);
     expect(readyDescribesSelection(null, 'a')).toBe(false);
   });
+
+  it('accepts a co-resident model that is not the primary', () => {
+    // A hot load leaves the engine holding several models at once. Comparing
+    // against the primary alone would tell the images surface to start a
+    // model the engine is already running.
+    expect(readyDescribesSelection('chat', 'image', ['chat', 'image'])).toBe(true);
+  });
+
+  it('still refuses a selection the engine is not holding', () => {
+    expect(readyDescribesSelection('chat', 'other', ['chat', 'image'])).toBe(false);
+  });
 });
 
 describe('failureApplies', () => {
@@ -219,6 +230,27 @@ describe('resolveReadiness — precedence', () => {
     });
   });
 
+  it('does not blame this selection for another model’s engine failure', () => {
+    // ONE engine serves chat and images alike, so a failed image model would
+    // otherwise be reported by the chat as its own — with a Retry that
+    // switches the engine to a model the chat cannot use.
+    const r = resolveReadiness(
+      input({
+        status: status('failed', 'flux2-klein-4b', 'needs the image extra'),
+        selectedAlias: 'qwen3-4b',
+        cacheState: 'onDisk',
+      }),
+    );
+    expect(r).toEqual({ kind: 'needsStart', alias: 'qwen3-4b' });
+  });
+
+  it('still reports an engine failure naming nothing when nothing is selected', () => {
+    const r = resolveReadiness(
+      input({ status: status('failed', null, 'the engine stopped'), selectedAlias: null }),
+    );
+    expect(r.kind).toBe('failed');
+  });
+
   it('shows a turn error attributed to the selected model', () => {
     const r = resolveReadiness(
       input({
@@ -248,6 +280,75 @@ describe('resolveReadiness — precedence', () => {
       kind: 'noModel',
       canSwitch: true,
     });
+  });
+});
+
+describe('resolveReadiness — two models resident at once', () => {
+  /**
+   * A hot `POST /v1/models/load` leaves a chat model and an image model in
+   * one engine. `status.model` names only the PRIMARY (the assistant-group
+   * model), so every rule that reasoned from it alone had to learn about the
+   * `resident` set.
+   */
+  const shared = {
+    state: 'ready',
+    model: 'chat-model',
+    detail: null,
+    resident: ['chat-model', 'image-model'],
+  };
+
+  it('reports the non-primary image model as ready on the images surface', () => {
+    const r = resolveReadiness(
+      input({
+        status: shared,
+        selectedAlias: 'image-model',
+        cacheState: 'onDisk',
+        // The primary is a TEXT model, so the images surface is told the
+        // engine's state is not about it.
+        statusIsForThisKind: false,
+      }),
+    );
+    expect(r).toEqual({ kind: 'ready', alias: 'image-model' });
+  });
+
+  it('reports the primary as ready on the chat surface', () => {
+    expect(
+      resolveReadiness(input({ status: shared, selectedAlias: 'chat-model', cacheState: 'onDisk' })),
+    ).toEqual({ kind: 'ready', alias: 'chat-model' });
+  });
+
+  it('still asks to start a model the engine is NOT holding', () => {
+    // The whole point of keying on `resident` rather than just relaxing the
+    // rule: an unloaded model must still offer its Start button.
+    expect(
+      resolveReadiness(
+        input({
+          status: shared,
+          selectedAlias: 'third-model',
+          cacheState: 'onDisk',
+          statusIsForThisKind: false,
+        }),
+      ),
+    ).toEqual({ kind: 'needsStart', alias: 'third-model' });
+  });
+
+  it('does not blame a resident model for another model\u2019s failure', () => {
+    // The engine failed on something else while holding my pick. Reporting
+    // that as mine would offer a Retry that restarts the engine underneath a
+    // model that is working.
+    const r = resolveReadiness(
+      input({
+        status: {
+          state: 'failed',
+          model: 'other-model',
+          detail: 'boom',
+          resident: ['image-model'],
+        },
+        selectedAlias: 'image-model',
+        cacheState: 'onDisk',
+      }),
+    );
+    expect(r.kind).not.toBe('failed');
   });
 });
 

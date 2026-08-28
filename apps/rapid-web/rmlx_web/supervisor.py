@@ -31,6 +31,28 @@ import httpx
 # the large models people most want to run.
 DEFAULT_READY_TIMEOUT_S = 900.0
 
+# Evict an idle unpinned secondary model after half an hour, matching the
+# Mac app's spawn flags.
+_RESIDENT_IDLE_TTL_S = 1800
+
+
+def resident_memory_ceiling_gb() -> int:
+    """The engine's resident-model ceiling, in GiB.
+
+    80% of physical RAM, floored, with a 4 GiB minimum — the same rule as
+    ``ModelSizing.residentMemoryCeilingGB`` in the Mac app, so the two
+    surfaces do not disagree about how much of this machine is usable.
+
+    Passed on every spawn because the engine's default is 0, which disables
+    the ceiling entirely: ``/v1/models/residency`` then reports a limit of
+    zero and the page has a numerator with no denominator.
+    """
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 4
+    return max(4, int(total / 1024**3 * 0.80))
+
 # The child is doing GPU work; polling tightly buys nothing.
 _READY_POLL_INTERVAL_S = 1.0
 
@@ -46,6 +68,23 @@ class ChildState(str, Enum):
     STARTING = "starting"
     READY = "ready"
     FAILED = "failed"
+
+
+class ResidencyOutcome(str, Enum):
+    """What a hot ``POST /v1/models/load`` did.
+
+    Only ``LOADED`` avoids a respawn. The rest are all "fall back to
+    restarting the child", but they are distinguished because the caller
+    surfaces different copy for a capacity refusal than for a transport
+    error, and because ``UNSUPPORTED`` must not be reported to the user at
+    all — it is the ordinary path on an older engine.
+    """
+
+    LOADED = "loaded"
+    #: The engine refused: 507 over the ceiling, 409 busy, 500 modality.
+    REJECTED = "rejected"
+    #: No such route (old engine), or the engine was unreachable.
+    UNSUPPORTED = "unsupported"
 
 
 class SupervisorError(RuntimeError):
@@ -65,6 +104,10 @@ class ChildStatus:
     port: int | None = None
     detail: str | None = None
     recent_output: list[str] = field(default_factory=list)
+    #: Aliases loaded into this child, INCLUDING ``model``. More than one
+    #: once a hot load succeeds — a chat model and an image model can be
+    #: resident together, and the page needs both to consider each usable.
+    resident: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +115,7 @@ class ChildStatus:
             "model": self.model,
             "port": self.port,
             "detail": self.detail,
+            "resident": list(self.resident),
         }
 
 
@@ -97,6 +141,44 @@ def find_rapid_mlx_binary(explicit: str | None = None) -> str:
             "`pip install rapid-mlx`, or pass --rapid-mlx-bin /path/to/rapid-mlx."
         )
     return found
+
+
+def _replacement_group(modality: str) -> str:
+    """The engine's replacement group for a modality.
+
+    Mirrors ``resident_models._replacement_group``: text and vision share
+    the single-slot ``assistant`` group, every media modality owns its own.
+    That is precisely why a chat model and an image model can be resident
+    together while two chat models cannot.
+    """
+    return "assistant" if modality in ("text", "vision") else modality
+
+
+def _residency_refusal(response: httpx.Response) -> str | None:
+    """The engine's explanation for refusing a resident load.
+
+    Its 507 body carries a ``replacement_projection`` naming exactly which
+    models it would have had to evict — worth surfacing verbatim, since no
+    message composed here knows that. FastAPI nests a dict ``detail``, so
+    the engine's ``{"error": {...}}`` envelope arrives one level down.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+
+    detail = body.get("detail", body)
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        error = detail.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str):
+            return error
+    return None
 
 
 def pick_free_port() -> int:
@@ -136,6 +218,14 @@ class EngineSupervisor:
         self._port: int | None = None
         self._state = ChildState.STOPPED
         self._detail: str | None = None
+        # Aliases this child holds. Reset by a respawn (a new process holds
+        # nothing), appended to by a successful hot load. `_model` stays the
+        # PRIMARY — the one the child was spawned for and the one the engine
+        # falls back to for an unrouted request.
+        self._resident: list[str] = []
+        # Modality per resident alias, so the group arithmetic above does not
+        # have to re-consult the catalog.
+        self._modalities: dict[str, str] = {}
         # Startup failures (bad alias, OOM, missing checkpoint) are
         # explained in the child's stderr and nowhere else. Bounded
         # because a long-running server logs every request.
@@ -163,19 +253,118 @@ class EngineSupervisor:
             port=self._port,
             detail=self._detail,
             recent_output=list(self._output_tail),
+            resident=list(self._resident),
         )
 
-    async def start(self, model: str) -> None:
-        """Spawn the child for ``model`` and wait until it is ready."""
+    async def start(self, model: str, *, modality: str = "text") -> None:
+        """Spawn the child for ``model`` and wait until it is ready.
+
+        ``modality`` only groups the spawned model for later hot loads; the
+        engine detects the real one itself from the checkpoint.
+        """
         async with self._lock:
             await self._stop_locked()
-            await self._start_locked(model)
+            await self._start_locked(model, modality)
+
+    async def residency_load(
+        self,
+        model: str,
+        *,
+        modality: str,
+        size_bytes: int | None = None,
+        image_mode: str | None = None,
+    ) -> tuple[ResidencyOutcome, str | None]:
+        """Load ``model`` into the RUNNING child, without respawning.
+
+        This is what lets a chat model and an image model be resident at
+        once: the engine groups ``text``/``vision`` into one single-slot
+        ``assistant`` group and gives every media modality its own, so a
+        second text model evicts the first while an image model coexists.
+
+        Returns the outcome and, on a refusal, the engine's own explanation
+        — it names the models it would have to evict, which no message
+        composed here could.
+
+        The whole call is best-effort by design: every failure mode maps to
+        "restart the child instead", which is what this package did
+        unconditionally before.
+        """
+        base_url = self.base_url
+        if base_url is None:
+            return ResidencyOutcome.UNSUPPORTED, None
+
+        payload: dict[str, object] = {"model": model}
+        # The catalog's byte count, never a name-parsed estimate. The
+        # engine's own fallback regexes a parameter count out of the alias
+        # and sizes `embeddinggemma-300m-6bit` to zero — passing a measured
+        # size is what stops a correct load being refused over the ceiling.
+        if size_bytes is not None and size_bytes > 0:
+            payload["estimated_size_gb"] = round(size_bytes / 1024**3, 3)
+        # Only `assistant` is accepted on the wire; media groups are derived
+        # by the engine and are implicitly single-slot already.
+        if modality in ("text", "vision"):
+            payload["replace_group"] = "assistant"
+        if image_mode is not None:
+            payload["image_mode"] = image_mode
+
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        try:
+            # No read timeout: a resident load is a real model load, minutes
+            # on a cold cache. Bounded connect so a dead child fails fast.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
+            ) as client:
+                response = await client.post(
+                    f"{base_url}/v1/models/load", json=payload, headers=headers
+                )
+        except httpx.HTTPError:
+            return ResidencyOutcome.UNSUPPORTED, None
+
+        if response.status_code == 200:
+            self._record_resident(model, modality)
+            return ResidencyOutcome.LOADED, None
+        # 404/405 is an engine predating the route — the ordinary path on an
+        # older install, and not something to report as a failure.
+        if response.status_code in (404, 405):
+            return ResidencyOutcome.UNSUPPORTED, None
+        return ResidencyOutcome.REJECTED, _residency_refusal(response)
+
+    def _record_resident(self, model: str, modality: str) -> None:
+        """Mirror the engine's group bookkeeping after a successful load.
+
+        Mirrored rather than re-read from ``/v1/models/residency`` because
+        that reports the engine's canonical ids (``mlx-community/…``) while
+        every other surface here speaks catalog aliases, and mapping between
+        them needs an alias list the snapshot does not always carry.
+
+        The engine's grouping is what is reproduced: ``text``/``vision``
+        share one single-slot ``assistant`` group, and each media modality
+        gets its own. So a second text model REPLACES the first, while an
+        image model joins it.
+        """
+        group = _replacement_group(modality)
+        self._resident = [
+            alias
+            for alias in self._resident
+            if alias != model
+            and _replacement_group(self._modalities.get(alias, "text")) != group
+        ]
+        self._resident.append(model)
+        self._modalities[model] = modality
+        # The primary is whichever assistant-group model is loaded: the
+        # engine promotes a replacement to primary, and an unrouted request
+        # falls back to it.
+        if group == "assistant":
+            self._model = model
 
     async def stop(self) -> None:
         async with self._lock:
             await self._stop_locked()
 
-    async def _start_locked(self, model: str) -> None:
+    async def _start_locked(self, model: str, modality: str = "text") -> None:
         port = pick_free_port()
         argv = [
             self._binary,
@@ -185,6 +374,20 @@ class EngineSupervisor:
             "127.0.0.1",
             "--port",
             str(port),
+            # Mount ``/v1/audio/*`` on EVERY child, so speech runs beside the
+            # primary model in the same process. The gate short-circuits on
+            # this flag before it looks at the model, so a text server gets
+            # the lane too — and the STT/TTS engines stay lazy, loading only
+            # on the first audio request. Same reasoning as the Mac app,
+            # which passes it unconditionally (ServerManager.swift).
+            "--enable-audio",
+            # Without a ceiling the engine's residency snapshot reports a
+            # limit of 0, and the memory panel has nothing to measure
+            # against.
+            "--resident-memory-limit-gb",
+            str(resident_memory_ceiling_gb()),
+            "--resident-model-idle-ttl",
+            str(_RESIDENT_IDLE_TTL_S),
         ] + self._serve_args
 
         env = dict(os.environ)
@@ -198,6 +401,11 @@ class EngineSupervisor:
         self._port = port
         self._detail = None
         self._output_tail = []
+        # Nothing is resident until the child is READY. Recording the alias
+        # here instead would claim a model is loaded in a process that may
+        # still fail to spawn — and the page would enable Send against it.
+        self._resident = []
+        self._modalities = {}
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -220,14 +428,37 @@ class EngineSupervisor:
 
         try:
             await self._await_ready(process, port)
-        except SupervisorError:
+        except SupervisorError as exc:
             self._state = ChildState.FAILED
+            # Recorded, not just raised: `start` is called as a detached task
+            # (app.py `_boot`/`_switch` swallow the exception), so without
+            # this `/api/status` reports `failed` with a null detail and the
+            # page has nothing to show but "unknown error".
+            self._detail = self._failure_reason() or str(exc)
             # A half-started child may still hold GPU memory, which the
             # next start would then contend with.
             await self._stop_locked(preserve_failure=True)
             raise
 
         self._state = ChildState.READY
+        # The child bound its port, so the model it was spawned for is now
+        # genuinely loaded and can be reported as resident.
+        self._resident = [model]
+        self._modalities = {model: modality}
+
+    def _failure_reason(self) -> str | None:
+        """The engine's own explanation, pulled out of its output.
+
+        The CLI prints a single ``  Error: …`` line for the failures a user
+        can act on — a missing extra, a partial download, an unusable alias —
+        and then a page of unrelated banner text. Reporting the last few
+        lines instead buries the one line that says what to do.
+        """
+        for line in reversed(self._output_tail):
+            stripped = line.strip()
+            if stripped.startswith("Error:"):
+                return stripped.removeprefix("Error:").strip()
+        return None
 
     async def _await_ready(
         self, process: asyncio.subprocess.Process, port: int
@@ -245,6 +476,18 @@ class EngineSupervisor:
         async with httpx.AsyncClient(timeout=5.0) as client:
             while True:
                 if process.returncode is not None:
+                    # The drain task may still be reading the last of the
+                    # child's output, and the `Error:` line explaining WHY it
+                    # exited is typically the final thing written. Give the
+                    # pipe a moment to close, or the detail is empty exactly
+                    # when it is most needed.
+                    if self._drain_task is not None:
+                        with contextlib.suppress(
+                            asyncio.TimeoutError, asyncio.CancelledError
+                        ):
+                            await asyncio.wait_for(
+                                asyncio.shield(self._drain_task), timeout=2.0
+                            )
                     raise SupervisorError(
                         "the engine exited during startup "
                         f"(code {process.returncode}). "
@@ -328,6 +571,9 @@ class EngineSupervisor:
 
         self._process = None
         self._port = None
+        # The child is gone, so nothing is resident regardless of why.
+        self._resident = []
+        self._modalities = {}
         if not preserve_failure:
             self._state = ChildState.STOPPED
             self._model = None
@@ -361,7 +607,7 @@ class AttachedEngine:
         # to be repeated anyway.
         return ChildStatus(state=ChildState.READY, model=None, port=None)
 
-    async def start(self, model: str) -> None:
+    async def start(self, model: str, *, modality: str = "text") -> None:
         raise SupervisorError("cannot switch models in --attach mode")
 
     async def stop(self) -> None:

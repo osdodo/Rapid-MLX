@@ -1,5 +1,11 @@
 import { request, requestJson } from './client';
-import type { DownloadJob, ModelsResponse, RemovalResult, StatusResponse } from './types';
+import type {
+  DownloadJob,
+  ModelsResponse,
+  RemovalResult,
+  ResidencySnapshot,
+  StatusResponse,
+} from './types';
 
 export function fetchStatus(signal?: AbortSignal): Promise<StatusResponse> {
   return requestJson<StatusResponse>('/api/status', signal ? { signal } : {});
@@ -60,4 +66,14 @@ export async function cancelDownload(): Promise<void> {
  */
 export function fetchDownload(signal?: AbortSignal): Promise<DownloadJob> {
   return requestJson<DownloadJob>('/api/downloads/status', signal ? { signal } : {});
+}
+
+/**
+ * What the engine is holding in memory, and against what ceiling.
+ *
+ * The route answers an empty snapshot rather than an error when the engine
+ * is unreachable, so a switch does not need special handling here.
+ */
+export function fetchResidency(signal?: AbortSignal): Promise<ResidencySnapshot> {
+  return requestJson<ResidencySnapshot>('/api/residency', signal ? { signal } : {});
 }

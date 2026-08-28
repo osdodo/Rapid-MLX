@@ -121,14 +121,24 @@ export function serveStateSpeaksForSelection(
 /**
  * Strict rule for the send-enabling `ready` state.
  *
- * `ready` may describe the selection ONLY when a real serving model equals a
- * real selected model. Otherwise Send stays gated rather than enabling against
- * an alias the send path is not holding.
+ * `ready` may describe the selection ONLY when a real selected model is one
+ * the engine is actually holding. Otherwise Send stays gated rather than
+ * enabling against an alias the send path is not holding.
+ *
+ * `resident` is the whole set the engine has loaded, which is more than one
+ * once a hot load succeeds — a chat model and an image model are usable
+ * together, so comparing against the primary alone would tell the second
+ * surface to start a model that is already running.
  */
-export function readyDescribesSelection(serving: string | null, selected: string | null): boolean {
-  const s = displayable(serving);
+export function readyDescribesSelection(
+  serving: string | null,
+  selected: string | null,
+  resident: string[] = [],
+): boolean {
   const p = displayable(selected);
-  return s !== null && p !== null && s === p;
+  if (p === null) return false;
+  if (displayable(serving) === p) return true;
+  return resident.some((alias) => displayable(alias) === p);
 }
 
 /**
@@ -150,7 +160,12 @@ export function failureApplies(failedAlias: string | null, selectedAlias: string
 
 export interface ResolveInput {
   /** Latest `/api/status`, or null if it has never succeeded. */
-  status: { state: string; model: string | null; detail: string | null } | null;
+  status: {
+    state: string;
+    model: string | null;
+    detail: string | null;
+    resident?: string[];
+  } | null;
   /** Consecutive `/api/status` failures. */
   statusFailures: number;
   /** What the user last picked, falling back to what the server is serving. */
@@ -169,6 +184,18 @@ export interface ResolveInput {
   turnError: { message: string; alias: string | null } | null;
   /** False in --attach mode. Changes what `noModel` is allowed to promise. */
   canSwitch: boolean;
+  /**
+   * Does `/api/status` describe a model of THIS surface's kind?
+   *
+   * One engine serves chat and images alike, so its state is not necessarily
+   * about the surface asking. False means "the engine is busy with something
+   * else" — its readiness, and especially its failures, belong to the other
+   * surface and must not be reported here.
+   *
+   * Optional and defaulting to true: a caller that does not distinguish
+   * surfaces gets the original single-surface behaviour.
+   */
+  statusIsForThisKind?: boolean;
 }
 
 /**
@@ -184,8 +211,20 @@ const UNREACHABLE_THRESHOLD = 2;
  * and reordering changes behaviour in ways the cases alone do not show.
  */
 export function resolveReadiness(input: ResolveInput): ModelReadiness {
-  const { status, statusFailures, cacheState, sizeText, download, turnError } = input;
+  const { statusFailures, cacheState, sizeText, download, turnError } = input;
   const selected = displayable(input.selectedAlias);
+  // Is THIS surface's pick one of the models the engine is actually holding?
+  // Once a hot load succeeds the engine holds several, so the primary naming
+  // another kind no longer means this surface is unserved.
+  const selectionIsResident =
+    selected !== null &&
+    (input.status?.resident ?? []).some((alias) => displayable(alias) === selected);
+  // The engine is shared. When it is serving a model of another kind AND is
+  // not holding this surface's pick, its state says nothing here — so it is
+  // dropped rather than reasoned about, and the fall-through below describes
+  // the selection on its own terms.
+  const status =
+    input.statusIsForThisKind === false && !selectionIsResident ? null : input.status;
 
   // 1. Reachability first: a stale "ready" would enable Send against a server
   //    that is gone.
@@ -215,13 +254,21 @@ export function resolveReadiness(input: ResolveInput): ModelReadiness {
   }
 
   // 3. Ready, under the STRICT selection rule. The only send-enabling state.
-  if (status?.state === 'ready' && readyDescribesSelection(status.model, input.selectedAlias)) {
-    return { kind: 'ready', alias: displayable(status.model) as string };
+  if (
+    status?.state === 'ready' &&
+    readyDescribesSelection(status.model, input.selectedAlias, status.resident ?? [])
+  ) {
+    return { kind: 'ready', alias: selected as string };
   }
 
   // 4. The engine itself failed. Outranks a turn error: if the child is down,
   //    that is why the turn failed, and it is the more actionable statement.
-  if (status?.state === 'failed') {
+  //
+  //    Only when the failure is about THIS surface's selection. The engine is
+  //    shared — one `serve` child for chat and images alike — so a failed
+  //    image model would otherwise be reported by the chat as its own, with a
+  //    Retry that switches the engine to a model the chat cannot use.
+  if (status?.state === 'failed' && failureApplies(displayable(status.model), selected)) {
     const failedAlias = displayable(status.model) ?? selected;
     return {
       kind: 'failed',

@@ -53,6 +53,7 @@ export async function runTurn({ assistantId, path, alias }: RunOptions): Promise
   try {
     const deltas = streamChat({
       turns: wireTurns(path, store.settings.system),
+      model: alias,
       temperature: store.settings.temperature,
       topP: store.settings.topP,
       maxTokens: store.settings.maxTokens,
@@ -166,7 +167,7 @@ export function send(text: string): void {
   const store = useStore.getState();
   if (store.activeId === null) store.createConversation();
 
-  const alias = store.selectedAlias;
+  const alias = store.selectedByKind.text;
   useStore.getState().appendNode({
     parentId: currentLeaf(),
     role: 'user',
@@ -215,7 +216,7 @@ export function retry(nodeId: string): void {
   void runTurn({
     assistantId,
     path: pathExcluding(assistantId),
-    alias: store.selectedAlias,
+    alias: store.selectedByKind.text,
   });
 }
 
@@ -252,7 +253,7 @@ export function editAndResend(nodeId: string, text: string): void {
   void runTurn({
     assistantId,
     path: pathExcluding(assistantId),
-    alias: store.selectedAlias,
+    alias: store.selectedByKind.text,
   });
 }
 

@@ -16,7 +16,7 @@ function node(id: string, content: string): MessageNode {
     content,
     createdAt: 0,
     status: 'complete',
-  } as MessageNode;
+  };
 }
 
 function conversation(overrides: Partial<Conversation> & { id: string }): Conversation {

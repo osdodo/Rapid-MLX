@@ -1,5 +1,5 @@
 import { expect, test as base } from '@playwright/test';
-import { startStub, type Scenario } from './stub-server';
+import { openModelList, startStub, type Scenario } from './stub-server';
 
 /**
  * The notice's shape on a wide window. Asserted by MEASUREMENT — a class name
@@ -37,7 +37,7 @@ test('a notice is capped well short of a wide window', async ({ page, stub }) =>
 
   // Provoke a real notice through the delete path rather than injecting one:
   // this is the exact notice the screenshot showed.
-  await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
+  await openModelList(page);
   await page.getByRole('button', { name: 'Delete qwen3-4b' }).click();
   await page.getByRole('alertdialog').getByRole('button', { name: 'Delete' }).click();
 
@@ -54,7 +54,7 @@ test('a notice is capped well short of a wide window', async ({ page, stub }) =>
 test('a notice has no tone-coloured stripe', async ({ page, stub }) => {
   await page.goto(stub.baseURL);
 
-  await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
+  await openModelList(page);
   await page.getByRole('button', { name: 'Delete qwen3-4b' }).click();
   await page.getByRole('alertdialog').getByRole('button', { name: 'Delete' }).click();
 

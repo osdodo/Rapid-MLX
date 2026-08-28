@@ -123,6 +123,120 @@ async def proxy_unary(
     )
 
 
+async def proxy_get(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    path: str,
+    api_key: str,
+    params: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> httpx.Response:
+    """Relay a small read-only GET, such as image progress.
+
+    Its own bounded timeout rather than :data:`_STREAM_TIMEOUT`: this is
+    polled while a render runs, and a poll that can hang forever stacks
+    up behind the render it is reporting on.
+    """
+    url = f"{base_url.rstrip('/')}{path}"
+    return await client.get(
+        url,
+        params=params or {},
+        headers=upstream_headers(api_key),
+        timeout=timeout,
+    )
+
+
+async def proxy_post_query(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    path: str,
+    api_key: str,
+    params: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> httpx.Response:
+    """POST with the arguments in the query string and no body.
+
+    ``/v1/images/cancel`` is shaped this way. Sent bodyless rather than
+    with ``{}``: the engine reads only the query, and a JSON body on a
+    route that declares none is silently discarded, which reads as a
+    working call that cancels nothing.
+    """
+    url = f"{base_url.rstrip('/')}{path}"
+    return await client.post(
+        url,
+        params=params or {},
+        headers=upstream_headers(api_key),
+        timeout=timeout,
+    )
+
+
+# Speech synthesis and transcription are both minutes of GPU work on a cold
+# lane (measured: 47 s for a first Kokoro request, 104 s for a first Whisper
+# one), so they get the streaming leg's unbounded read timeout.
+_AUDIO_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=120.0, pool=10.0)
+
+
+async def proxy_audio_json(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    path: str,
+    payload: dict,
+    api_key: str,
+) -> httpx.Response:
+    """POST JSON and expect BYTES back, not JSON.
+
+    ``/v1/audio/speech`` answers with the audio itself plus the real
+    ``Content-Type``, so the response must not be decoded here.
+    """
+    url = f"{base_url.rstrip('/')}{path}"
+    return await client.post(
+        url,
+        json=payload,
+        headers=upstream_headers(api_key),
+        timeout=_AUDIO_TIMEOUT,
+    )
+
+
+async def proxy_multipart(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    path: str,
+    api_key: str,
+    filename: str,
+    content: bytes,
+    fields: dict[str, str],
+    field: str = "file",
+    content_type: str = "application/octet-stream",
+) -> httpx.Response:
+    """POST a file upload built HERE, not relayed from the client.
+
+    The browser sends the file as base64 inside a JSON body and this
+    rebuilds the multipart. That is deliberate: the middleware's CSRF
+    control rejects the CORS-simple content types, and ``multipart/
+    form-data`` is one of them — so relaying the client's own multipart
+    would need a second, weaker policy for one route. Re-encoding costs
+    ~33% on the wire and keeps one rule.
+
+    ``Content-Type`` is omitted from the headers so httpx can set the
+    multipart boundary itself.
+    """
+    url = f"{base_url.rstrip('/')}{path}"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return await client.post(
+        url,
+        files={field: (filename, content, content_type)},
+        data=fields,
+        headers=headers,
+        timeout=_AUDIO_TIMEOUT,
+    )
+
+
 def _describe_upstream_error(status_code: int, body: bytes) -> str:
     """Turn the engine's error body into one line for the page.
 

@@ -1,10 +1,19 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useEffect, useState, type ReactNode } from 'react';
-import { PanelLeft, Plus, Search, Settings as SettingsIcon, X } from 'lucide-react';
+import {
+  AudioLines,
+  Image as ImageIcon,
+  PanelLeft,
+  Search,
+  Settings as SettingsIcon,
+  SquarePen,
+  X,
+} from 'lucide-react';
 import { ConversationList } from './ConversationList';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
+import { ResidencyPanel } from '@/components/models/ResidencyPanel';
 import { Wordmark } from '@/components/common/Wordmark';
 
 /**
@@ -16,21 +25,24 @@ import { Wordmark } from '@/components/common/Wordmark';
  * transcript and must be a real modal.
  */
 
+export type Surface = 'chat' | 'images' | 'audio';
+
 export interface SidebarProps {
-  /** Rendered at the top of the rail — the model selector lives here. */
-  header: ReactNode;
   onNewChat(): void;
   onOpenSettings(): void;
   onSearch(): void;
+  surface: Surface;
+  onSelectSurface(next: Surface): void;
   collapsed: boolean;
   onToggleCollapsed(): void;
 }
 
 export function Sidebar({
-  header,
   onNewChat,
   onOpenSettings,
   onSearch,
+  surface,
+  onSelectSurface,
   collapsed,
   onToggleCollapsed,
 }: SidebarProps) {
@@ -50,10 +62,13 @@ export function Sidebar({
         icon={<PanelLeft />}
         onSearch={onSearch}
       />
-      {header}
-      <NewChatButton onClick={onNewChat} />
+      <SurfaceNav
+        surface={surface}
+        onNewChat={onNewChat}
+        onSelectSurface={onSelectSurface}
+      />
       <ListRegion>
-        <ConversationList />
+        {surface === 'chat' ? <ConversationList /> : <SurfaceNote surface={surface} />}
       </ListRegion>
       <SidebarFooter onOpenSettings={onOpenSettings} />
     </aside>
@@ -63,17 +78,19 @@ export function Sidebar({
 export function SidebarDrawer({
   open,
   onClose,
-  header,
   onNewChat,
   onOpenSettings,
   onSearch,
+  surface,
+  onSelectSurface,
 }: {
   open: boolean;
   onClose(): void;
-  header: ReactNode;
   onNewChat(): void;
   onOpenSettings(): void;
   onSearch(): void;
+  surface: Surface;
+  onSelectSurface(next: Surface): void;
 }) {
   return (
     <DialogPrimitive.Root open={open} onOpenChange={(next) => !next && onClose()}>
@@ -98,15 +115,23 @@ export function SidebarDrawer({
               setTimeout(onSearch, 320);
             }}
           />
-          {header}
-          <NewChatButton
-            onClick={() => {
+          <SurfaceNav
+            surface={surface}
+            onNewChat={() => {
               onNewChat();
+              onClose();
+            }}
+            onSelectSurface={(next) => {
+              onSelectSurface(next);
               onClose();
             }}
           />
           <ListRegion>
-            <ConversationList onNavigate={onClose} />
+            {surface === 'chat' ? (
+              <ConversationList onNavigate={onClose} />
+            ) : (
+              <SurfaceNote surface={surface} />
+            )}
           </ListRegion>
           <SidebarFooter
             onOpenSettings={() => {
@@ -117,6 +142,90 @@ export function SidebarDrawer({
         </DialogPrimitive.Content>
       </DialogPortal>
     </DialogPrimitive.Root>
+  );
+}
+
+/**
+ * The rail's primary navigation: one row per destination.
+ *
+ * "New Chat" is both the chat destination and the action, as its label says —
+ * returning to an EXISTING conversation is what the list below is for, so a
+ * separate "Chat" row would be a second way to do nothing.
+ */
+function SurfaceNav({
+  surface,
+  onNewChat,
+  onSelectSurface,
+}: {
+  surface: Surface;
+  onNewChat(): void;
+  onSelectSurface(next: Surface): void;
+}) {
+  return (
+    <nav className="flex shrink-0 flex-col gap-0.5 px-3 pb-2" aria-label="Views">
+      <NavRow icon={<SquarePen />} label="New Chat" onClick={onNewChat} />
+      <NavRow
+        icon={<ImageIcon />}
+        label="Images"
+        current={surface === 'images'}
+        onClick={() => onSelectSurface('images')}
+      />
+      <NavRow
+        icon={<AudioLines />}
+        label="Audio"
+        current={surface === 'audio'}
+        onClick={() => onSelectSurface('audio')}
+      />
+    </nav>
+  );
+}
+
+function NavRow({
+  icon,
+  label,
+  current,
+  disabled,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  current?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      // `aria-current="page"`, not `aria-selected`: this is navigation, not a
+      // tablist/listbox role the component does not claim.
+      aria-current={current ? 'page' : undefined}
+      disabled={disabled}
+      title={disabled ? `${label} is not available yet` : undefined}
+      className={cn(
+        'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm font-medium transition-colors outline-none',
+        'focus-visible:ring-ring/50 focus-visible:ring-[3px]',
+        'disabled:pointer-events-none disabled:opacity-40',
+        current
+          ? 'bg-background text-foreground shadow-xs'
+          : 'text-foreground hover:bg-accent',
+        '[&_svg]:text-muted-foreground [&_svg]:size-4 [&_svg]:shrink-0',
+      )}
+      onClick={onClick}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+/** Neither non-chat surface keeps a history, so the list area explains why. */
+function SurfaceNote({ surface }: { surface: Surface }) {
+  return (
+    <p className="text-muted-foreground m-0 px-4 py-3 text-xs leading-relaxed">
+      {surface === 'images'
+        ? 'Images are not saved between visits. Use Save to keep one.'
+        : 'Speech runs on whichever model is loaded — no separate model to start.'}
+    </p>
   );
 }
 
@@ -162,19 +271,6 @@ function SidebarTop({
   );
 }
 
-function NewChatButton({ onClick }: { onClick(): void }) {
-  return (
-    <Button
-      variant="outline"
-      className="mx-3 mt-1 mb-2.5 w-[calc(100%-24px)] shrink-0 justify-start"
-      onClick={onClick}
-    >
-      <Plus className="text-muted-foreground" />
-      New chat
-    </Button>
-  );
-}
-
 /** The only thing that scrolls, so the header and footer stay put. */
 function ListRegion({ children }: { children: ReactNode }) {
   return <div className="min-h-0 flex-1 overflow-y-auto">{children}</div>;
@@ -182,16 +278,19 @@ function ListRegion({ children }: { children: ReactNode }) {
 
 function SidebarFooter({ onOpenSettings }: { onOpenSettings(): void }) {
   return (
-    <div className="border-sidebar-border shrink-0 border-t px-3 pt-2 pb-[calc(env(safe-area-inset-bottom)+10px)]">
-      <Button
-        variant="ghost"
-        className="text-muted-foreground hover:text-foreground w-full justify-start"
-        onClick={onOpenSettings}
-      >
-        <SettingsIcon />
-        Settings
-      </Button>
-    </div>
+    <>
+      <ResidencyPanel />
+      <div className="border-sidebar-border shrink-0 border-t px-3 pt-2 pb-[calc(env(safe-area-inset-bottom)+10px)]">
+        <Button
+          variant="ghost"
+          className="text-muted-foreground hover:text-foreground w-full justify-start"
+          onClick={onOpenSettings}
+        >
+          <SettingsIcon />
+          Settings
+        </Button>
+      </div>
+    </>
   );
 }
 

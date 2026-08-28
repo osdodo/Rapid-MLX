@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { startStub } from './stub-server';
+import { openModelList, startStub } from './stub-server';
 
 /**
  * Probes the COMPUTED palette, not class names.
@@ -66,15 +66,22 @@ test('the dark: variant fires on the OS preference, not only the attribute', asy
     // A REAL element, not an injected probe div: Tailwind generates utilities
     // on demand by scanning the source, so a class invented in the test is
     // never in the bundle and would read as "the variant does not work".
-    // The outline button carries `dark:bg-input/30`.
-    const newChat = page.getByRole('button', { name: 'New chat' });
-    const background = () =>
-      newChat.evaluate((element) => getComputedStyle(element).backgroundColor);
-
+    //
+    // The model search field is a shadcn `Input`, which carries
+    // `dark:bg-input/30`. It needs the settings window open, which is worth
+    // the two clicks: the elements permanently on screen are the composer (a
+    // bare `textarea`, transparent) and the sidebar's nav rows (plain
+    // buttons), and neither carries a `dark:` utility at all.
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.emulateMedia({ colorScheme: 'light' });
     await page.goto(stub.baseURL);
-    await expect(newChat).toBeVisible();
+    await expect(page.getByLabel('Message')).toBeVisible();
+    await openModelList(page);
+
+    const probe = page.getByLabel('Search models');
+    await expect(probe).toBeVisible();
+    const background = () =>
+      probe.evaluate((element) => getComputedStyle(element).backgroundColor);
     const light = await background();
 
     // No attribute set — this is the OS branch alone.

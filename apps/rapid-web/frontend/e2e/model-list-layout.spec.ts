@@ -1,5 +1,5 @@
 import { expect, test as base } from '@playwright/test';
-import { startStub, type Scenario } from './stub-server';
+import { openModelList, startStub, stubModel, type Scenario } from './stub-server';
 
 /**
  * The model list's alignment. Two defects, both invisible to a unit test and
@@ -14,27 +14,15 @@ import { startStub, type Scenario } from './stub-server';
 type Stub = Awaited<ReturnType<typeof startStub>>;
 
 const MODELS: Scenario['models'] = [
-  {
+  stubModel({
     alias: 'bonsai-1.7b-2bit',
-    hf_path: 'org/bonsai',
     size_bytes: 473_000_000,
     cached: true,
     cached_bytes: 473_000_000,
     tool_call_parser: 'hermes',
-    reasoning_parser: null,
-    is_text_only: true,
-  },
-  {
-    // Not cached, and with no badges at all — the row most likely to drift.
-    alias: 'gemma-27b',
-    hf_path: 'org/gemma',
-    size_bytes: 17_000_000_000,
-    cached: false,
-    cached_bytes: null,
-    tool_call_parser: null,
-    reasoning_parser: null,
-    is_text_only: true,
-  },
+  }),
+  // Not cached, and with no badges at all — the row most likely to drift.
+  stubModel({ alias: 'gemma-27b', size_bytes: 17_000_000_000 }),
 ];
 
 const test = base.extend<{ scenario: Partial<Scenario>; stub: Stub }>({
@@ -52,25 +40,16 @@ const test = base.extend<{ scenario: Partial<Scenario>; stub: Stub }>({
 async function openSheet(page: import('@playwright/test').Page, baseURL: string) {
   await page.goto(baseURL);
   // Wait for the app to mount before probing: `isVisible()` is a snapshot, not
-  // a wait, so on a cold page it reports false for everything and the branch
-  // below would take the wrong arm.
+  // a wait, so on a cold page it reports false for everything.
   await expect(page.getByLabel('Message')).toBeVisible();
 
-  // Above the layout breakpoint the sidebar is a permanent rail and there is
-  // no drawer to open; below it, the model button lives inside the drawer.
-  const drawerToggle = page.getByLabel('Open sidebar');
-  if (await drawerToggle.isVisible()) await drawerToggle.click();
-
-  await page.getByRole('button', { name: /Choose a model/ }).click();
-  const sheet = page.getByRole('dialog', { name: 'Model' });
+  const sheet = await openModelList(page);
   await expect(sheet).toBeVisible();
 
   // Wait for the slide-in to settle. The sheet animates its width, so a
   // measurement taken immediately reads a mid-animation value and every
   // "did this move?" assertion below would compare against a moving target.
-  await expect
-    .poll(async () => (await sheet.boundingBox())?.width ?? 0)
-    .toBeGreaterThan(0);
+  await expect.poll(async () => (await sheet.boundingBox())?.width ?? 0).toBeGreaterThan(0);
   let last = -1;
   await expect
     .poll(async () => {

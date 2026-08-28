@@ -28,12 +28,30 @@ export interface TranscriptProps {
  */
 export function Transcript({ children, revision, streaming }: TranscriptProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
 
   const onScroll = useCallback(() => {
     const element = ref.current;
     if (!element) return;
     setShowJump(!isAtBottom(element));
+  }, []);
+
+  // The transcript also resizes without a commit of its own: the readiness
+  // band and the notice stack are siblings, so one appearing shortens the
+  // scroller and one leaving lengthens it. Neither fires `scroll` nor bumps
+  // `revision`, so a stale `true` outlived the overflow that justified it —
+  // that is how the button came to hover over a transcript with nothing
+  // below the fold.
+  useEffect(() => {
+    const element = ref.current;
+    const content = inner.current;
+    if (!element || !content) return;
+
+    const observer = new ResizeObserver(() => setShowJump(!isAtBottom(element)));
+    observer.observe(element);
+    observer.observe(content);
+    return () => observer.disconnect();
   }, []);
 
   useLayoutEffect(() => {
@@ -76,7 +94,9 @@ export function Transcript({ children, revision, streaming }: TranscriptProps) {
       >
         {/* The SCROLL container stays full-width so the scrollbar sits at the
             window edge; only the column inside it is centred. */}
-        <div className={cn(READING_COLUMN, 'flex min-h-full flex-col gap-5')}>{children}</div>
+        <div ref={inner} className={cn(READING_COLUMN, 'flex min-h-full flex-col gap-5')}>
+          {children}
+        </div>
       </div>
 
       {showJump ? (

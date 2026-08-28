@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ArrowUp, Square } from 'lucide-react';
 import { READING_COLUMN } from '@/lib/layout';
 import { cn } from '@/lib/utils';
@@ -13,6 +13,8 @@ export interface ComposerProps {
   onStop(): void;
   /** Called when Return is pressed while sending is gated. */
   onBlocked(): void;
+  /** The model picker, rendered on the control row beside Send. */
+  picker?: ReactNode;
 }
 
 export function Composer({
@@ -23,6 +25,7 @@ export function Composer({
   onSend,
   onStop,
   onBlocked,
+  picker,
 }: ComposerProps) {
   const [draft, setDraft] = useState('');
   const field = useRef<HTMLTextAreaElement>(null);
@@ -62,12 +65,12 @@ export function Composer({
       <div
         className={cn(
           READING_COLUMN,
-          'bg-background focus-within:border-ring flex items-end gap-2 rounded-xl border py-[5px] pr-[5px] pl-3.5 shadow-xs transition-[color,box-shadow]',
+          'bg-background focus-within:border-ring flex flex-col rounded-xl border px-3.5 pt-2.5 pb-2 shadow-xs transition-[color,box-shadow]',
         )}
       >
         <textarea
           ref={field}
-          className="placeholder:text-muted-foreground max-h-[34vh] min-w-0 flex-1 resize-none border-none bg-transparent py-2 leading-[1.45] outline-none"
+          className="placeholder:text-muted-foreground max-h-[34vh] w-full resize-none border-none bg-transparent leading-[1.45] outline-none"
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -100,25 +103,31 @@ export function Composer({
           aria-label="Message"
         />
 
-        <Button
-          type="button"
-          size="icon"
-          variant={streaming ? 'secondary' : 'default'}
-          className={cn(
-            'size-8 rounded-full',
-            // An outline, never a dead grey fill: "nothing to send yet" must
-            // not read as "broken".
-            'disabled:border disabled:bg-transparent disabled:text-muted-foreground disabled:opacity-100',
-          )}
-          onClick={streaming ? onStop : submit}
-          // Never disabled while gated: a disabled button cannot explain
-          // itself. Disabled only with nothing to send.
-          disabled={idle}
-          title={streaming ? 'Stop' : sendTooltip}
-          aria-label={streaming ? 'Stop generating' : 'Send'}
-        >
-          {streaming ? <Square className="fill-current" /> : <ArrowUp />}
-        </Button>
+        {/* The control row. The model belongs here rather than in the
+            sidebar: it is a property of the message about to be sent. */}
+        <div className="mt-1 flex items-center gap-1">
+          <span className="min-w-0 flex-1" />
+          {picker}
+          <Button
+            type="button"
+            size="icon"
+            variant={streaming ? 'secondary' : 'default'}
+            className={cn(
+              'size-8 shrink-0 rounded-full',
+              // An outline, never a dead grey fill: "nothing to send yet" must
+              // not read as "broken".
+              'disabled:border disabled:bg-transparent disabled:text-muted-foreground disabled:opacity-100',
+            )}
+            onClick={streaming ? onStop : submit}
+            // Never disabled while gated: a disabled button cannot explain
+            // itself. Disabled only with nothing to send.
+            disabled={idle}
+            title={streaming ? 'Stop' : sendTooltip}
+            aria-label={streaming ? 'Stop generating' : 'Send'}
+          >
+            {streaming ? <Square className="fill-current" /> : <ArrowUp />}
+          </Button>
+        </div>
       </div>
     </footer>
   );

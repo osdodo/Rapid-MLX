@@ -6,26 +6,39 @@ on your Mac.
 A standalone command. It does not require the Rapid-MLX Desktop app, and it
 does not modify it.
 
-## Install
+## Run it locally
 
 ```sh
-brew install rapidmlx/tap/rmlx-web
+cd apps/rapid-web
+pip install rapid-mlx       # the engine, if you do not have it
+pip install -e '.[test]'    # this package
+rmlx-web                    # serves http://127.0.0.1:7788/
+pytest                      # stub engine — no MLX, model or rapid-mlx needed
 ```
 
-The formula depends on `rapid-mlx`, so Homebrew pulls the engine in as well —
-there is no Python environment to manage.
-
-From a checkout instead:
+The page is a React application in `frontend/`, built to `rmlx_web/static/`
+as a small shell plus content-hashed assets. **The build output is committed**
+and CI diffs it against a fresh build, so never hand-edit it.
 
 ```sh
-pip install rapid-mlx                 # the engine, if you do not have it
-pip install -e apps/rapid-web         # this package
+cd apps/rapid-web/frontend
+pnpm install --frozen-lockfile
+pnpm run test        # Vitest
+pnpm run build       # writes ../rmlx_web/static/
+pnpm run e2e         # Playwright, against the built page and a stub engine
 ```
 
-If you installed this before the rename, `pip uninstall rapid-mlx-web` first —
-pip treats the old name as a separate package, so both commands would stay on
-PATH pointing at different checkouts. Saved conversations and tokens are
-unaffected.
+**pnpm, not npm.** `.npmrc` sets `engine-strict` against an unsatisfiable
+`engines.npm`, so `npm install` fails rather than quietly writing a second
+lockfile — which would break the artifact diff above.
+
+For development against a live backend, run `rmlx-web` in one terminal and
+`pnpm run dev` in another. The dev server must proxy `/api` and `/v1`
+(`vite.config.ts` does): the server admits browser requests only when
+same-origin, so :5173 talking directly to :7788 gets `403 origin_refused`.
+
+`frontend/size-budget.json` records the measured bundle size. Assets are
+content-hashed and served immutable, so they cross the wire once per build.
 
 ## Use
 
@@ -33,24 +46,28 @@ unaffected.
 rmlx-web [alias]
 ```
 
-It prints a URL and, off loopback, an access token:
+It prints a URL:
 
 ```
   rmlx-web
   URL:   http://127.0.0.1:7788/
-  Token: 1A_h7Z7Z-x1cARbeh4yGthsVl4x2SMRo0cWCcxIWDLw
+  Auth:  none
 ```
 
 The alias is optional — without it the page starts with no model and you pick
 one there. The page is reachable immediately; a cold start can take several
 minutes and the header says when the model is ready.
 
-On loopback there is **no token**: the OS already guarantees the caller is a
-process on this Mac. Bind anywhere else and a token becomes mandatory. It
-travels in the URL fragment, which browsers never send to a server, so it
-cannot land in an access log or a tunnel provider's history. `--token` /
-`--new-token` force one on loopback too, which is worth doing when
-screen-sharing.
+There is **no access token by default**. Remote access here always goes
+through a tunnel you chose, and that tunnel is where authentication belongs —
+Cloudflare Access, a tailnet ACL, HTTP basic auth in front. A second secret
+would only mean retyping 43 characters on a phone.
+
+`--token` requires one anyway, which is worth doing when screen-sharing or on
+an open LAN. `--new-token` generates and stores one at `~/.rapid-mlx/web-token`.
+The token travels in the URL fragment of the printed sign-in link, which
+browsers never send to a server, so it cannot land in an access log or a
+tunnel provider's history.
 
 ### The page
 
@@ -85,9 +102,12 @@ cloudflared tunnel --url http://127.0.0.1:7788
 tailscale funnel 7788
 ```
 
+Put the tunnel's own access control in front of it — Cloudflare Access, a
+tailnet ACL — rather than exposing the URL and relying on nobody guessing it.
+
 `--host 0.0.0.0` works for LAN-only access, but on a cafe, hotel or office
-guest network the LAN is effectively public and the token is the only thing
-protecting the port.
+guest network the LAN is effectively public and nothing stands in front of the
+port; pass `--token` there.
 
 ## Options
 
@@ -97,8 +117,8 @@ protecting the port.
 | `--port` | Default `7788`. |
 | `--attach URL` | Use a `rapid-mlx serve` you started yourself instead of spawning one. |
 | `--attach-api-key` | Bearer for the `--attach` target, if it has one. |
-| `--token` | Use a specific access token instead of the stored one. |
-| `--new-token` | Rotate the stored token. Phones must re-enter it. |
+| `--token` | Require this access token. There is none by default. |
+| `--new-token` | Require a token, generating and storing one. Phones must re-enter it. |
 | `--allow-downloads` | Permit downloads when bound to a non-loopback address. |
 | `--rapid-mlx-bin` | Path to `rapid-mlx`, if it is not on `PATH`. |
 | `--serve-arg` | Extra argument passed through to `rapid-mlx serve`. Repeat per token. |
@@ -125,12 +145,13 @@ for its engine on every launch and no other process can obtain it.
 
 Attaching a tunnel puts this on the public internet, so:
 
-- **A token is required whenever the port is not loopback**, with no flag to
-  turn it off. Stored at `~/.rapid-mlx/web-token`, mode 0600, and persistent
-  so the phone is not logged out on every restart. On loopback the bearer is
-  skipped but nothing else is — the checks below are what stop a page you have
-  open from driving this port through your browser, which it can do because a
-  browser reaches loopback even when the network cannot.
+- **Authentication is the tunnel's job, not this tool's.** There is no token
+  unless `--token` asks for one; when it does, it is stored at
+  `~/.rapid-mlx/web-token`, mode 0600, and persistent so the phone is not
+  logged out on every restart. Everything below applies either way — those
+  checks are what stop a page you have open from driving this port through
+  your browser, which it can do because a browser reaches loopback even when
+  the network cannot.
 - **The web token and the engine's token are different secrets.** The proxy
   strips the client's `Authorization` and substitutes the engine's, so the web
   token never reaches the engine or its logs.
@@ -145,7 +166,8 @@ Attaching a tunnel puts this on the public internet, so:
   against free space (10 GiB headroom) and a model of unknown size is refused
   rather than guessed at. One download at a time.
 - **Deleting a model is not behind that flag** — it frees disk rather than
-  consuming it — but it is destructive, and anyone holding the token can do it.
+  consuming it — but it is destructive, and anyone who can reach the page can
+  do it.
 
 ## Limitations
 
@@ -161,36 +183,25 @@ Attaching a tunnel puts this on the public internet, so:
   reloading mid-download reconnects to the running pull.
 - `--attach` mode cannot list or switch models: listing needs the CLI and
   switching needs ownership of the engine process.
-- One user. One token, no sessions.
+- One user. No sessions, and at most one token.
 
-## Development
-
-```sh
-cd apps/rapid-web
-pip install -e '.[test]'
-pytest                      # stub engine — no MLX, model or rapid-mlx needed
-```
-
-The page is a React application in `frontend/`, built to `rmlx_web/static/`
-as a small shell plus content-hashed assets. **The build output is committed**
-and CI diffs it against a fresh build, so never hand-edit it.
+## Install
 
 ```sh
-cd apps/rapid-web/frontend
-pnpm install --frozen-lockfile
-pnpm run test        # Vitest
-pnpm run build       # writes ../rmlx_web/static/
-pnpm run e2e         # Playwright, against the built page and a stub engine
+brew install rapidmlx/tap/rmlx-web
 ```
 
-**pnpm, not npm.** `.npmrc` sets `engine-strict` against an unsatisfiable
-`engines.npm`, so `npm install` fails rather than quietly writing a second
-lockfile — which would break the artifact diff above.
+The formula depends on `rapid-mlx`, so Homebrew pulls the engine in as well —
+there is no Python environment to manage.
 
-For development against a live backend, run `rmlx-web` in one terminal and
-`pnpm run dev` in another. The dev server must proxy `/api` and `/v1`
-(`vite.config.ts` does): the server admits browser requests only when
-same-origin, so :5173 talking directly to :7788 gets `403 origin_refused`.
+From a checkout instead:
 
-`frontend/size-budget.json` records the measured bundle size. Assets are
-content-hashed and served immutable, so they cross the wire once per build.
+```sh
+pip install rapid-mlx                 # the engine, if you do not have it
+pip install -e apps/rapid-web         # this package
+```
+
+If you installed this before the rename, `pip uninstall rapid-mlx-web` first —
+pip treats the old name as a separate package, so both commands would stay on
+PATH pointing at different checkouts. Saved conversations and tokens are
+unaffected.

@@ -54,8 +54,46 @@ test('does not survive into a new, empty conversation', async ({ page, stub }) =
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
 
   // Start a new chat WITHOUT scrolling back down first.
-  await page.locator('aside').getByRole('button', { name: 'New chat' }).click();
+  await page.locator('aside').getByRole('button', { name: 'New Chat' }).click();
 
   // Nothing to jump to any more, so nothing to offer.
   await expect(page.getByRole('button', { name: 'Jump to latest' })).toHaveCount(0);
+});
+
+test('clears when a switch lands on an equally long but shorter conversation', async ({
+  page,
+  stub,
+}) => {
+  await page.goto(stub.baseURL);
+
+  // Conversation 1: two messages, and they fit.
+  stub.scenario.chatFrames = [chatFrame('Short.')];
+  await page.getByLabel('Message').fill('short one');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByText('Short.')).toBeVisible();
+
+  // Conversation 2: also two messages, but far taller than the viewport.
+  await page.locator('aside').getByRole('button', { name: 'New Chat' }).click();
+  stub.scenario.chatFrames = Array.from({ length: 40 }, (_, i) => chatFrame(`Line ${i}.\n\n`));
+  await page.getByLabel('Message').fill('long one');
+  await page.getByRole('button', { name: 'Send' }).click();
+
+  const log = page.getByRole('log');
+  await expect
+    .poll(() => log.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(200);
+
+  await log.evaluate((el) => {
+    el.scrollTop = 0;
+  });
+  const jump = page.getByRole('button', { name: 'Jump to latest' });
+  await expect(jump).toBeVisible();
+
+  // Back to the short one. Both paths are two messages long, so the
+  // `path.length` effect does not re-run and no scroll event fires — the
+  // transcript simply stops overflowing under a flag that still says it does.
+  await page.locator('aside').getByRole('button', { name: /short one/ }).click();
+  await expect(page.getByText('Short.')).toBeVisible();
+
+  await expect(jump).toHaveCount(0);
 });

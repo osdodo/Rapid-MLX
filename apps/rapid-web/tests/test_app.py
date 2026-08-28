@@ -9,6 +9,7 @@ subprocess rather than importing ``vllm_mlx``: the seam is mockable.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import re
@@ -18,10 +19,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rmlx_web import app as app_module
-from rmlx_web.app import WebConfig, create_app
+from rmlx_web.app import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, WebConfig, create_app
 from rmlx_web.catalog import CatalogError, ModelEntry, RemovalError
 from rmlx_web.downloads import DownloadError, DownloadJob, DownloadState
-from rmlx_web.supervisor import ChildState, ChildStatus
+from rmlx_web.supervisor import ChildState, ChildStatus, ResidencyOutcome
 
 TOKEN = "test-token-value"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -38,6 +39,12 @@ class FakeEngine:
         self.api_key = "engine-side-key"
         self.stopped = False
         self.started = []
+        #: Aliases hot-loaded via `residency_load`, in order.
+        self.hot_loaded = []
+        #: What the next `residency_load` returns. UNSUPPORTED by default,
+        #: so every existing test keeps exercising the respawn path.
+        self.residency_outcome = ResidencyOutcome.UNSUPPORTED
+        self.resident = []
 
     @property
     def base_url(self):
@@ -50,11 +57,22 @@ class FakeEngine:
             port=1234,
             detail="boom" if self._state is ChildState.FAILED else None,
             recent_output=["line one", "line two"],
+            resident=list(self.resident),
         )
 
-    async def start(self, model):
+    async def residency_load(self, model, *, modality, size_bytes=None, image_mode=None):
+        self.hot_loaded.append((model, modality, size_bytes, image_mode))
+        if self.residency_outcome is ResidencyOutcome.LOADED:
+            self.resident.append(model)
+            return ResidencyOutcome.LOADED, None
+        if self.residency_outcome is ResidencyOutcome.REJECTED:
+            return ResidencyOutcome.REJECTED, "would exceed the ceiling"
+        return ResidencyOutcome.UNSUPPORTED, None
+
+    async def start(self, model, *, modality="text"):
         self.started.append(model)
         self._model = model
+        self.resident = [model]
 
     async def stop(self):
         self.stopped = True
@@ -89,25 +107,25 @@ class FakeCatalog:
         self.invalidated = 0
         self.removed = []
 
-    async def list_chat_models(self, *, force=False):
+    async def list_models(self, *, force=False):
         if self.error:
             raise self.error
         self.forced.append(force)
         return self.entries
 
-    async def is_known_chat_alias(self, alias):
-        return await self.chat_profile(alias) is not None
+    async def list_chat_models(self, *, force=False):
+        return [e for e in await self.list_models(force=force) if e.kind == "text"]
 
-    async def chat_profile(self, alias):
+    async def is_known_chat_alias(self, alias):
+        entry = await self.profile(alias)
+        return entry is not None and entry.kind == "text"
+
+    async def profile(self, alias):
         if self.error:
             raise self.error
         for entry in self.entries:
             if entry.alias == alias:
-                return {
-                    "alias": alias,
-                    "hf_path": entry.hf_path,
-                    "size_bytes": entry.size_bytes,
-                }
+                return entry
         return None
 
     def invalidate_cache(self):
@@ -123,7 +141,7 @@ class FakeCatalog:
                 self.removed.append(alias)
                 self.invalidated += 1
                 return entry.cached_bytes
-        raise RemovalError(f"unknown chat model alias: {alias}")
+        raise RemovalError(f"unknown model alias: {alias}")
 
 
 def build_client(
@@ -204,6 +222,18 @@ class TestSecurityHeaders:
         assert "default-src 'self'" in csp
         assert "frame-ancestors 'none'" in csp
         assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+    def test_media_src_allows_blob_for_synthesised_speech(self):
+        with build_client() as client:
+            response = client.get("/")
+        csp = response.headers["Content-Security-Policy"]
+        # Generated speech reaches `<audio>` as an object URL. Without its
+        # own directive `media-src` falls back to `default-src 'self'`,
+        # which does not cover `blob:` — the element then fails with
+        # MediaError 4 and sits at 0:00/0:00, while the identical URL still
+        # downloads fine, so the bytes look correct and the audio takes the
+        # blame.
+        assert "media-src 'self' blob:" in csp
 
 
 class TestIndexIsSelfContained:
@@ -380,6 +410,515 @@ class TestProxyForwarding:
         assert captured["url"].endswith("/v1/chat/completions")
 
 
+class TestImageGeneration:
+    def test_generation_is_relayed_with_the_engine_key(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers", {})
+            captured["json"] = kwargs.get("json")
+            return httpx.Response(
+                200,
+                json={"created": 1, "data": [{"b64_json": "aGk="}], "cancelled": False},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/v1/images/generations",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat", "size": "512x512"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"][0]["b64_json"] == "aGk="
+        assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
+        assert captured["url"].endswith("/v1/images/generations")
+
+    @pytest.mark.asyncio
+    async def test_generation_counts_as_a_stream_so_a_switch_is_refused(
+        self, monkeypatch
+    ):
+        """A render is minutes of GPU work with no resume.
+
+        Switching restarts the engine, so a load arriving mid-render must
+        refuse exactly as it does mid-chat. Patched at ``proxy_unary``
+        rather than on ``httpx.AsyncClient`` — the async test client is
+        itself an ``AsyncClient``, so patching the class would replace
+        the test's own transport. Same reasoning as
+        ``TestSwitchBlockedByActiveStream``.
+        """
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def fake_unary(client, **kwargs):
+            started.set()
+            await release.wait()
+            return httpx.Response(
+                200,
+                json={"data": []},
+                request=httpx.Request("POST", "http://engine.invalid"),
+            )
+
+        monkeypatch.setattr(app_module.proxy, "proxy_unary", fake_unary)
+
+        engine = FakeEngine()
+        app = create_app(WebConfig(token=TOKEN, engine=engine, catalog=FakeCatalog()))
+        app.state.http = httpx.AsyncClient()
+        app.state.boot = None
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            render = asyncio.create_task(
+                client.post(
+                    "/v1/images/generations",
+                    headers={**AUTH, **JSON_CT},
+                    json={"prompt": "a cat"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=10)
+
+            blocked = await client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "bonsai-1.7b-2bit"},
+            )
+            assert blocked.status_code == 409
+            assert blocked.json()["error"]["type"] == "busy_streaming"
+            # Restarting the engine here would destroy the render.
+            assert engine.started == []
+
+            release.set()
+            await render
+
+        await app.state.http.aclose()
+
+    def test_generation_before_a_model_is_loaded_is_503(self):
+        engine = FakeEngine(state=ChildState.STARTING)
+        with build_client(engine) as client:
+            response = client.post(
+                "/v1/images/generations",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
+            )
+        assert response.status_code == 503
+        assert response.json()["error"]["type"] == "engine_unavailable"
+
+    def test_progress_is_relayed(self, monkeypatch):
+        async def fake_get(self, url, **kwargs):
+            return httpx.Response(
+                200,
+                json={"running": True, "step": 3, "total": 8, "elapsed_ms": 900},
+                request=httpx.Request("GET", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            body = client.get("/api/images/progress", headers=AUTH).json()
+
+        assert body == {"running": True, "step": 3, "total": 8, "elapsed_ms": 900}
+
+    def test_progress_reports_idle_rather_than_failing_when_unreachable(
+        self, monkeypatch
+    ):
+        """A dropped poll is not itself a render failure.
+
+        The poller's job is to report the render; surfacing a transport
+        error would put a red banner over a render that is still fine.
+        """
+
+        async def fake_get(self, url, **kwargs):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            response = client.get("/api/images/progress", headers=AUTH)
+
+        assert response.status_code == 200
+        assert response.json()["running"] is False
+
+    def test_progress_with_no_engine_reports_idle(self):
+        engine = FakeEngine(state=ChildState.STOPPED)
+        with build_client(engine) as client:
+            body = client.get("/api/images/progress", headers=AUTH).json()
+
+        assert body["running"] is False
+
+    def test_cancel_sends_the_model_in_the_query_string(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            captured["json"] = kwargs.get("json")
+            return httpx.Response(
+                200, json={"ok": True}, request=httpx.Request("POST", url)
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/api/images/cancel",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "flux2-klein-4b"},
+            )
+
+        assert response.status_code == 200
+        # The engine reads only the query here. A JSON body would be
+        # discarded silently, which reads as a call that cancels nothing.
+        assert captured["params"] == {"model": "flux2-klein-4b"}
+        assert captured["json"] is None
+
+    def test_image_routes_require_a_token(self):
+        with build_client() as client:
+            assert client.get("/api/images/progress").status_code == 401
+            assert (
+                client.post(
+                    "/v1/images/generations", headers=JSON_CT, json={"prompt": "x"}
+                ).status_code
+                == 401
+            )
+            assert (
+                client.post(
+                    "/api/images/edits", headers=JSON_CT, json={"prompt": "x"}
+                ).status_code
+                == 401
+            )
+
+
+class TestImageEditing:
+    """Base64 in, multipart out — the same shape as transcription.
+
+    The middleware's CSRF control rejects the CORS-simple content types, and
+    ``multipart/form-data`` is one of them, so the browser's own multipart
+    cannot be relayed without a second, weaker policy for one route.
+    """
+
+    def test_an_edit_is_rebuilt_as_multipart(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["url"] = url
+            captured["files"] = kwargs.get("files")
+            captured["data"] = kwargs.get("data")
+            captured["headers"] = kwargs.get("headers", {})
+            return httpx.Response(
+                200,
+                json={"created": 1, "data": [{"b64_json": "aGk="}], "cancelled": False},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/api/images/edits",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "image": base64.b64encode(b"\x89PNGfake").decode(),
+                    "prompt": "make it night",
+                    "model": "flux2-klein-4b",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"][0]["b64_json"] == "aGk="
+        assert captured["url"].endswith("/v1/images/edits")
+        # The engine's field is `image`, not the `file` transcription uses.
+        assert captured["files"]["image"][1] == b"\x89PNGfake"
+        assert captured["data"]["prompt"] == "make it night"
+        assert captured["data"]["model"] == "flux2-klein-4b"
+        # `size` is deliberately absent: the edit backends derive their canvas
+        # from the input image, and the engine discards it anyway.
+        assert "size" not in captured["data"]
+        # No Content-Type of our own, or httpx cannot set the boundary.
+        assert "Content-Type" not in captured["headers"]
+        assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
+
+    def test_an_empty_prompt_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/images/edits",
+                headers={**AUTH, **JSON_CT},
+                json={"image": base64.b64encode(b"x").decode(), "prompt": "  "},
+            )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_body"
+
+    def test_a_non_base64_image_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/images/edits",
+                headers={**AUTH, **JSON_CT},
+                json={"image": "not base64!!", "prompt": "make it night"},
+            )
+        assert response.status_code == 400
+
+    def test_an_oversize_image_is_refused_here(self):
+        oversize = base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()
+        with build_client() as client:
+            response = client.post(
+                "/api/images/edits",
+                headers={**AUTH, **JSON_CT},
+                json={"image": oversize, "prompt": "make it night"},
+            )
+        # Refused before the relay rather than after another hop.
+        assert response.status_code == 413
+
+    def test_an_edit_before_a_model_is_loaded_is_503(self):
+        engine = FakeEngine(state=ChildState.STARTING)
+        with build_client(engine) as client:
+            response = client.post(
+                "/api/images/edits",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "image": base64.b64encode(b"x").decode(),
+                    "prompt": "make it night",
+                },
+            )
+        assert response.status_code == 503
+        assert response.json()["error"]["type"] == "engine_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_an_edit_counts_as_a_stream_so_a_switch_is_refused(self, monkeypatch):
+        """An edit is minutes of GPU work with no resume, exactly like a
+        render, so a load arriving mid-edit must refuse rather than restart
+        the engine doing it."""
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def fake_multipart(client, **kwargs):
+            started.set()
+            await release.wait()
+            return httpx.Response(
+                200,
+                json={"data": []},
+                request=httpx.Request("POST", "http://engine.invalid"),
+            )
+
+        monkeypatch.setattr(app_module.proxy, "proxy_multipart", fake_multipart)
+
+        engine = FakeEngine()
+        app = create_app(WebConfig(token=TOKEN, engine=engine, catalog=FakeCatalog()))
+        app.state.http = httpx.AsyncClient()
+        app.state.boot = None
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            edit = asyncio.create_task(
+                client.post(
+                    "/api/images/edits",
+                    headers={**AUTH, **JSON_CT},
+                    json={
+                        "image": base64.b64encode(b"x").decode(),
+                        "prompt": "make it night",
+                    },
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=10)
+
+            blocked = await client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "bonsai-1.7b-2bit"},
+            )
+            assert blocked.status_code == 409
+            assert blocked.json()["error"]["type"] == "busy_streaming"
+            assert engine.started == []
+
+            release.set()
+            await edit
+
+        await app.state.http.aclose()
+
+
+class TestAudio:
+    """The audio lane rides on whatever model is loaded.
+
+    The child is spawned with ``--enable-audio``, and the engine's gate
+    short-circuits on that flag before it looks at the model — so speech
+    works while a CHAT model is loaded, with no switch.
+    """
+
+    def test_voices_are_relayed(self, monkeypatch):
+        async def fake_get(self, url, **kwargs):
+            return httpx.Response(
+                200,
+                json={"voices": ["af_heart", "am_adam"]},
+                request=httpx.Request("GET", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            body = client.get("/api/audio/voices?model=kokoro", headers=AUTH).json()
+
+        assert body["voices"] == ["af_heart", "am_adam"]
+
+    def test_speech_returns_audio_bytes_not_json(self, monkeypatch):
+        async def fake_post(self, url, **kwargs):
+            return httpx.Response(
+                200,
+                content=b"RIFF....WAVEfmt ",
+                headers={"Content-Type": "audio/wav"},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/speech",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "kokoro", "input": "hello", "voice": "af_heart"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.content.startswith(b"RIFF")
+
+    def test_a_speech_failure_still_arrives_as_json(self, monkeypatch):
+        async def fake_post(self, url, **kwargs):
+            return httpx.Response(
+                503,
+                json={"error": {"message": "espeak-ng missing", "type": "api_error"}},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/speech",
+                headers={**AUTH, **JSON_CT},
+                json={"input": "hello"},
+            )
+
+        # Branching on the STATUS, not the content type: the engine's
+        # actionable "install X" message must reach the page rather than
+        # being handed over as unplayable bytes.
+        assert response.status_code == 503
+        assert "espeak-ng" in response.json()["error"]["message"]
+
+    def test_transcription_takes_base64_and_sends_multipart(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["url"] = url
+            captured["files"] = kwargs.get("files")
+            captured["data"] = kwargs.get("data")
+            captured["headers"] = kwargs.get("headers", {})
+            return httpx.Response(
+                200,
+                json={"text": "hello there", "language": "en", "duration": 1.2},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/transcriptions",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "audio": base64.b64encode(b"RIFFfake").decode(),
+                    "model": "whisper-large-v3-turbo",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["text"] == "hello there"
+        # Base64 in, multipart out: the middleware's CSRF control rejects
+        # multipart from the browser, so it is rebuilt here.
+        assert captured["files"]["file"][1] == b"RIFFfake"
+        assert captured["data"]["model"] == "whisper-large-v3-turbo"
+        # No Content-Type of our own, or httpx cannot set the boundary.
+        assert "Content-Type" not in captured["headers"]
+        assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
+
+    def test_a_non_base64_body_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/transcriptions",
+                headers={**AUTH, **JSON_CT},
+                json={"audio": "not base64!!"},
+            )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_body"
+
+    def test_an_empty_recording_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/transcriptions",
+                headers={**AUTH, **JSON_CT},
+                json={"audio": ""},
+            )
+        assert response.status_code == 400
+
+    def test_an_oversize_recording_is_refused_here(self):
+        oversize = base64.b64encode(b"x" * (MAX_AUDIO_BYTES + 1)).decode()
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/transcriptions",
+                headers={**AUTH, **JSON_CT},
+                json={"audio": oversize},
+            )
+        # Refused before the relay rather than after another hop.
+        assert response.status_code == 413
+
+    def test_a_caller_supplied_filename_cannot_be_arbitrary(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["files"] = kwargs.get("files")
+            return httpx.Response(200, json={"text": ""}, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            client.post(
+                "/api/audio/transcriptions",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "audio": base64.b64encode(b"x").decode(),
+                    "filename": 'evil"; name="model',
+                },
+            )
+
+        # The name is advisory (the engine spools to a .wav temp file
+        # regardless), so a header-splitting attempt falls back rather than
+        # being sanitised into something almost-right.
+        assert captured["files"]["file"][0] == "recording.wav"
+
+    def test_audio_before_a_model_is_loaded_is_503(self):
+        engine = FakeEngine(state=ChildState.STARTING)
+        with build_client(engine) as client:
+            speech = client.post(
+                "/api/audio/speech", headers={**AUTH, **JSON_CT}, json={"input": "x"}
+            )
+            voices = client.get("/api/audio/voices", headers=AUTH)
+        assert speech.status_code == 503
+        assert voices.status_code == 503
+
+    def test_audio_routes_require_a_token(self):
+        with build_client() as client:
+            assert client.get("/api/audio/voices").status_code == 401
+            assert (
+                client.post(
+                    "/api/audio/speech", headers=JSON_CT, json={"input": "x"}
+                ).status_code
+                == 401
+            )
+
+
 class TestListModels:
     def test_returns_entries_with_the_loaded_alias(self):
         with build_client() as client:
@@ -427,6 +966,86 @@ class TestListModels:
     def test_listing_requires_a_token(self):
         with build_client() as client:
             assert client.get("/api/models").status_code == 401
+
+
+class TestModelKinds:
+    """Image and audio rows reach the picker; only some can be loaded."""
+
+    @staticmethod
+    def _catalog():
+        return FakeCatalog(
+            entries=[
+                ModelEntry(
+                    alias="qwen3.5-9b-4bit",
+                    hf_path="mlx-community/Qwen3.5-9B-4bit",
+                    size_bytes=5977075377,
+                    cached=True,
+                    cached_bytes=5977075377,
+                ),
+                ModelEntry(
+                    alias="flux2-klein-4b",
+                    hf_path="Runpod/FLUX.2-klein-4B-mflux-4bit",
+                    size_bytes=4619695783,
+                    cached=True,
+                    kind="image",
+                    cached_bytes=4619695783,
+                ),
+                ModelEntry(
+                    alias="whisper-large-v3",
+                    hf_path="mlx-community/whisper-large-v3",
+                    size_bytes=None,
+                    cached=False,
+                    kind="audio",
+                    audio_kind="stt",
+                    family="whisper",
+                ),
+            ]
+        )
+
+    def test_every_kind_is_listed_with_its_tag(self):
+        with build_client(catalog=self._catalog()) as client:
+            models = client.get("/api/models", headers=AUTH).json()["models"]
+
+        by_alias = {m["alias"]: m for m in models}
+        assert by_alias["qwen3.5-9b-4bit"]["kind"] == "text"
+        assert by_alias["flux2-klein-4b"]["kind"] == "image"
+        assert by_alias["whisper-large-v3"]["kind"] == "audio"
+
+    def test_loadable_is_reported_per_entry(self):
+        with build_client(catalog=self._catalog()) as client:
+            models = client.get("/api/models", headers=AUTH).json()["models"]
+
+        by_alias = {m["alias"]: m for m in models}
+        assert by_alias["flux2-klein-4b"]["loadable"] is True
+        # Audio too: the CLI has a dedicated audio-serve fork.
+        assert by_alias["whisper-large-v3"]["loadable"] is True
+
+    def test_an_image_model_can_be_loaded(self):
+        engine = FakeEngine()
+        with build_client(engine, catalog=self._catalog()) as client:
+            response = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "flux2-klein-4b"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["state"] == "starting"
+
+    def test_an_audio_model_can_be_loaded(self):
+        engine = FakeEngine()
+        with build_client(engine, catalog=self._catalog()) as client:
+            response = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "whisper-large-v3"},
+            )
+
+        # `serve <audio-alias>` boots in audio mode and reports ready, so
+        # refusing here left the Audio page with no way to make speech work
+        # on an idle engine — it could only say "start something else".
+        assert response.status_code == 200
+        assert response.json()["state"] == "starting"
 
 
 class TestLoadModel:
@@ -1090,7 +1709,7 @@ class TestDownloadStatus:
 
 
 class TestNoAuthMode:
-    """``token=None`` disables the bearer, for a loopback bind only.
+    """``token=None`` disables the bearer, which is the default.
 
     The thing worth pinning here is what does *not* get disabled with
     it. Without a token, the Origin and content-type checks become the
@@ -1186,3 +1805,203 @@ class TestPublicConfig:
         # what the catalog holds, or anything about the host.
         assert list(body.keys()) == ["auth_required"]
         assert "secret-model-name" not in json.dumps(body)
+
+
+class TestResidency:
+    """``/api/residency`` — the sidebar's memory panel.
+
+    A read-only relay of the engine's ``/v1/models/residency``.
+    """
+
+    def test_the_snapshot_is_relayed(self, monkeypatch):
+        snapshot = {
+            "memory_limit_bytes": 26843545600,
+            "memory_used_bytes": 9750000000,
+            "models": [
+                {
+                    "id": "org/qwen3-4b",
+                    "aliases": ["qwen3-4b"],
+                    "state": "resident",
+                    "pinned": True,
+                    "estimated_bytes": 6340000000,
+                    "measured_bytes": 5900000000,
+                }
+            ],
+        }
+
+        async def fake_get(self, url, **kwargs):
+            assert url.endswith("/v1/models/residency")
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            body = client.get("/api/residency", headers=AUTH).json()
+
+        assert body == snapshot
+
+    def test_an_unreachable_engine_reports_an_empty_snapshot(self, monkeypatch):
+        """Not an error: the panel describes the machine, and a poll dropped
+        during a model switch is not a failure worth surfacing."""
+
+        async def fake_get(self, url, **kwargs):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            response = client.get("/api/residency", headers=AUTH)
+
+        assert response.status_code == 200
+        assert response.json()["models"] == []
+
+    def test_no_engine_reports_an_empty_snapshot(self):
+        engine = FakeEngine(state=ChildState.STOPPED)
+        with build_client(engine) as client:
+            body = client.get("/api/residency", headers=AUTH).json()
+
+        assert body == {
+            "memory_limit_bytes": 0,
+            "memory_used_bytes": 0,
+            "models": [],
+        }
+
+    def test_an_engine_without_the_route_reports_an_empty_snapshot(self, monkeypatch):
+        """An older engine 404s here. That is a missing feature, not a fault."""
+
+        async def fake_get(self, url, **kwargs):
+            return httpx.Response(
+                404, json={"detail": "Not Found"}, request=httpx.Request("GET", url)
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            body = client.get("/api/residency", headers=AUTH).json()
+
+        assert body["models"] == []
+
+    def test_requires_the_bearer(self):
+        with build_client() as client:
+            assert client.get("/api/residency").status_code == 401
+
+
+class TestHotModelLoading:
+    """Switching loads into the RUNNING engine before it respawns one.
+
+    This is what lets a chat model and an image model be usable at once:
+    the engine keeps text/vision in a single-slot ``assistant`` group and
+    gives each media modality its own. A respawn can only ever serve the
+    one model it was started for.
+    """
+
+    def _catalog(self):
+        return FakeCatalog(
+            entries=[
+                ModelEntry(
+                    alias="chat-model",
+                    hf_path="org/chat-model",
+                    size_bytes=2_000_000_000,
+                    cached=True,
+                    kind="text",
+                ),
+                ModelEntry(
+                    alias="image-model",
+                    hf_path="org/image-model",
+                    size_bytes=4_600_000_000,
+                    cached=True,
+                    kind="image",
+                ),
+            ]
+        )
+
+    def test_a_hot_load_does_not_restart_the_engine(self):
+        engine = FakeEngine(model="chat-model")
+        engine.residency_outcome = ResidencyOutcome.LOADED
+
+        with build_client(engine, catalog=self._catalog()) as client:
+            response = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "image-model"},
+            )
+            assert response.status_code == 200
+
+        # The whole point: the chat model kept running.
+        assert engine.started == []
+        assert engine.hot_loaded[0][0] == "image-model"
+
+    def test_the_image_kind_becomes_the_engines_own_modality(self):
+        engine = FakeEngine(model="chat-model")
+        engine.residency_outcome = ResidencyOutcome.LOADED
+
+        with build_client(engine, catalog=self._catalog()) as client:
+            client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "image-model"},
+            )
+
+        alias, modality, size, image_mode = engine.hot_loaded[0]
+        assert modality == "image-gen"
+        # The catalog's measured size, not a name-parsed guess.
+        assert size == 4_600_000_000
+        assert image_mode == "generation"
+
+    def test_a_refused_hot_load_falls_back_to_restarting(self):
+        # The engine is over its ceiling. Restarting still gets the user the
+        # model they asked for — just without co-residency.
+        engine = FakeEngine(model="chat-model")
+        engine.residency_outcome = ResidencyOutcome.REJECTED
+
+        with build_client(engine, catalog=self._catalog()) as client:
+            response = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "image-model"},
+            )
+            assert response.status_code == 200
+
+        assert engine.started == ["image-model"]
+
+    def test_an_older_engine_falls_back_to_restarting(self):
+        engine = FakeEngine(model="chat-model")
+        engine.residency_outcome = ResidencyOutcome.UNSUPPORTED
+
+        with build_client(engine, catalog=self._catalog()) as client:
+            client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "image-model"},
+            )
+
+        assert engine.started == ["image-model"]
+
+    def test_an_already_resident_model_is_a_no_op(self):
+        # It is loaded and the engine routes by the request's `model` field,
+        # so restarting would throw away a working model for nothing.
+        engine = FakeEngine(model="chat-model")
+        engine.resident = ["chat-model", "image-model"]
+
+        with build_client(engine, catalog=self._catalog()) as client:
+            body = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "image-model"},
+            ).json()
+
+        assert body == {"ok": True, "model": "image-model", "state": "ready"}
+        assert engine.started == []
+        assert engine.hot_loaded == []
+
+    def test_status_reports_every_resident_alias(self):
+        # The page needs the whole set: with two models loaded, the surface
+        # whose pick is NOT the primary must still read as ready.
+        engine = FakeEngine(model="chat-model")
+        engine.resident = ["chat-model", "image-model"]
+
+        with build_client(engine) as client:
+            body = client.get("/api/status", headers=AUTH).json()
+
+        assert body["model"] == "chat-model"
+        assert body["resident"] == ["chat-model", "image-model"]

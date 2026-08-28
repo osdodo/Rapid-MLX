@@ -1,9 +1,7 @@
 import { useMemo, useState } from 'react';
-import { Archive, MoreHorizontal, Pencil, Pin, Trash2 } from 'lucide-react';
-import { activePath } from '@/chat/MessageTree';
+import { Archive, ChevronRight, MoreHorizontal, Pencil, Pin, Trash2 } from 'lucide-react';
 import { groupConversations } from '@/chat/ConversationSearch';
 import { useMidnightTick } from '@/lib/useMidnightTick';
-import { formatRelativeTime } from '@/lib/format';
 import { useStore } from '@/state/store';
 import type { Conversation } from '@/state/types';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
@@ -34,10 +32,18 @@ export function ConversationList({ onNavigate }: { onNavigate?: () => void }) {
   const remove = useStore((state) => state.deleteConversation);
 
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
+  // Collapsed by default: archiving is how a conversation is put out of the
+  // way, so expanding the archive on every visit undoes what it is for.
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const now = useMidnightTick();
 
-  // Archived conversations are hidden from this list but NOT from search —
-  // that is what lets the archive exist without a mode toggle beside it.
+  const archived = useMemo(
+    () => conversations.filter((conversation) => conversation.isArchived),
+    [conversations],
+  );
+
+  // Archived conversations are hidden from the grouped list but NOT from
+  // search — that is what lets the archive exist without a mode toggle.
   const grouped = useMemo(
     () =>
       groupConversations(
@@ -47,10 +53,23 @@ export function ConversationList({ onNavigate }: { onNavigate?: () => void }) {
     [conversations, now],
   );
 
+  const renderRow = (conversation: Conversation) => (
+    <Row
+      key={conversation.id}
+      conversation={conversation}
+      current={conversation.id === activeId}
+      onOpen={() => {
+        setActive(conversation.id);
+        onNavigate?.();
+      }}
+      onDelete={() => setPendingDelete(conversation)}
+    />
+  );
+
   return (
     <>
       <div className="px-2.5 pt-1 pb-3">
-        {grouped.length === 0 ? (
+        {grouped.length === 0 && archived.length === 0 ? (
           <p className="text-muted-foreground m-0 px-3.5 py-6 text-center text-sm">
             No conversations yet.
           </p>
@@ -63,24 +82,31 @@ export function ConversationList({ onNavigate }: { onNavigate?: () => void }) {
               {/* A gap between rows, not padding inside them: the selected
                   row's fill should stay tight to its own text rather than
                   growing to meet its neighbours. */}
-              <div className="flex flex-col gap-1">
-                {section.rows.map((conversation) => (
-                  <Row
-                    key={conversation.id}
-                    conversation={conversation}
-                    current={conversation.id === activeId}
-                    now={now}
-                    onOpen={() => {
-                      setActive(conversation.id);
-                      onNavigate?.();
-                    }}
-                    onDelete={() => setPendingDelete(conversation)}
-                  />
-                ))}
-              </div>
+              <div className="flex flex-col gap-1">{section.rows.map(renderRow)}</div>
             </section>
           ))
         )}
+
+        {archived.length > 0 ? (
+          <section>
+            <h3 className="mt-3 mb-1">
+              <button
+                type="button"
+                className="text-muted-foreground hover:text-foreground flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-medium tracking-wide uppercase transition-colors outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                onClick={() => setArchiveOpen((open) => !open)}
+                aria-expanded={archiveOpen}
+              >
+                <ChevronRight
+                  className={cn('size-3 shrink-0 transition-transform', archiveOpen && 'rotate-90')}
+                />
+                Archived ({archived.length})
+              </button>
+            </h3>
+            {archiveOpen ? (
+              <div className="flex flex-col gap-1">{archived.map(renderRow)}</div>
+            ) : null}
+          </section>
+        ) : null}
       </div>
 
       <ConfirmDialog
@@ -102,25 +128,17 @@ export function ConversationList({ onNavigate }: { onNavigate?: () => void }) {
 function Row({
   conversation,
   current,
-  now,
   onOpen,
   onDelete,
 }: {
   conversation: Conversation;
   current: boolean;
-  now: number;
   onOpen(): void;
   onDelete(): void;
 }) {
   const update = useStore((state) => state.updateConversation);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(conversation.title);
-
-  const turns = activePath(
-    conversation.nodes,
-    conversation.activeLeafId,
-    conversation.branchChoices,
-  ).length;
 
   if (renaming) {
     return (
@@ -165,14 +183,10 @@ function Row({
     >
       <button
         type="button"
-        className="flex min-w-0 flex-1 flex-col gap-px py-1.5 text-left"
+        className="flex min-w-0 flex-1 py-2 text-left"
         onClick={onOpen}
       >
         <span className="truncate text-sm">{titleOf(conversation)}</span>
-        <span className="text-muted-foreground text-xs">
-          {turns} {turns === 1 ? 'message' : 'messages'} ·{' '}
-          {formatRelativeTime(conversation.updatedAt, now)}
-        </span>
       </button>
 
       {/* Hidden until hover on a pointer device; always shown on touch,

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { startStub } from './stub-server';
+import { openModelList, startStub } from './stub-server';
 
 /**
  * The brand mark in the sidebar header.
@@ -91,9 +91,9 @@ test.describe('sheet chrome', () => {
     try {
       await page.goto(stub.baseURL);
       await expect(page.getByLabel('Message')).toBeVisible();
-      await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
+      await openModelList(page);
 
-      const sheet = page.getByRole('dialog', { name: 'Model' });
+      const sheet = page.getByRole('dialog', { name: 'Settings' });
       await expect(sheet).toBeVisible();
       // No visible "Done" text, but the control is still reachable by name.
       await expect(sheet.getByText('Done', { exact: true })).toHaveCount(0);
@@ -131,31 +131,58 @@ test.describe('sheet chrome', () => {
         return dialog.boundingBox();
       };
 
-      await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
-      const model = await settledBox('Model');
-      await page.keyboard.press('Escape');
-      await expect(page.getByRole('dialog', { name: 'Model' })).toBeHidden();
-
-      await page.getByRole('button', { name: 'Settings' }).click();
-      const settings = await settledBox('Settings');
+      // The settings window opens on either the model list or the chat
+      // preferences depending on which control was used. Both are the same
+      // dialog now, so the comparison that still matters is against the
+      // search palette — built on `CommandDialog`, NOT on `Sheet`, so it is
+      // the one most likely to drift. It shipped at 512 x 310 against the
+      // sheets' 640 x 720, and shares the size through `SHEET_DESKTOP_SIZE`.
+      await openModelList(page);
+      const models = await settledBox('Settings');
       await page.keyboard.press('Escape');
       await expect(page.getByRole('dialog', { name: 'Settings' })).toBeHidden();
 
-      // The search palette is built on `CommandDialog`, NOT on `Sheet`, so it
-      // is the one most likely to drift — it shipped at 512 x 310 against the
-      // sheets' 640 x 720. It shares the size through `SHEET_DESKTOP_SIZE`.
       await page.getByRole('button', { name: 'Search conversations' }).click();
       const search = await settledBox('Search conversations');
 
-      expect(model).not.toBeNull();
-      for (const [label, box] of [
-        ['settings', settings],
-        ['search', search],
-      ] as const) {
-        expect(box, label).not.toBeNull();
-        expect(box!.width, label).toBe(model!.width);
-        expect(box!.height, label).toBe(model!.height);
-      }
+      expect(models).not.toBeNull();
+      expect(search).not.toBeNull();
+      expect(search!.width).toBe(models!.width);
+      expect(search!.height).toBe(models!.height);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test('the settings window does not resize when the category changes', async ({ page }) => {
+    // The panel area is one scroll container whose content is swapped, so a
+    // short panel cannot shrink the window under a tall one. With a `max-h`
+    // each sized to its own content and switching made the dialog jump.
+    const stub = await startStub({ engineState: 'ready', model: 'qwen3-4b' });
+    try {
+      await page.goto(stub.baseURL);
+      await expect(page.getByLabel('Message')).toBeVisible();
+      await openModelList(page);
+
+      const dialog = page.getByRole('dialog', { name: 'Settings' });
+      await expect(dialog).toBeVisible();
+      let last = -1;
+      await expect
+        .poll(async () => {
+          const height = (await dialog.boundingBox())?.height ?? 0;
+          const stable = height === last;
+          last = height;
+          return stable;
+        })
+        .toBe(true);
+      const onModels = await dialog.boundingBox();
+
+      await dialog.getByRole('button', { name: 'Appearance' }).click();
+      await expect(dialog.getByText('Engine')).toBeVisible();
+      const onAppearance = await dialog.boundingBox();
+
+      expect(onAppearance!.height).toBe(onModels!.height);
+      expect(onAppearance!.width).toBe(onModels!.width);
     } finally {
       await stub.close();
     }
@@ -166,9 +193,9 @@ test.describe('sheet chrome', () => {
     try {
       await page.goto(stub.baseURL);
       await expect(page.getByLabel('Message')).toBeVisible();
-      await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
+      await openModelList(page);
 
-      const sheet = page.getByRole('dialog', { name: 'Model' });
+      const sheet = page.getByRole('dialog', { name: 'Settings' });
       await expect(sheet).toBeVisible();
       // Opening the sheet forces a catalog re-read instead, so the button was
       // a manual step for something that now happens on its own.
@@ -186,14 +213,13 @@ test.describe('sheet chrome', () => {
     try {
       await page.goto(stub.baseURL);
       await expect(page.getByLabel('Message')).toBeVisible();
-      await page.getByLabel('Open sidebar').click();
-      await page.getByRole('button', { name: /^qwen3-4b/ }).first().click();
+      await openModelList(page);
 
-      const box = await page.getByRole('dialog', { name: 'Model' }).boundingBox();
+      const box = await page.getByRole('dialog', { name: 'Settings' }).boundingBox();
       expect(box).not.toBeNull();
-      // Full-bleed and short — not the desktop's 720px block.
+      // Full-bleed — not the desktop's fixed block.
       expect(box!.width).toBe(390);
-      expect(box!.height).toBeLessThan(500);
+      expect(box!.height).toBeLessThan(664);
     } finally {
       await stub.close();
     }

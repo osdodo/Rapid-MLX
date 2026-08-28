@@ -65,13 +65,18 @@ class TestBanner:
         # Whatever else changes, the banner stays short enough to read.
         assert len(out.splitlines()) < 15
 
-    def test_warns_on_a_non_loopback_bind(self, capsys, monkeypatch):
+    def test_warns_on_an_unprotected_non_loopback_bind(self, capsys, monkeypatch):
         monkeypatch.setattr(cli, "_display_host", lambda host: "192.168.1.5")
-        cli._print_banner(host="0.0.0.0", port=7788, token="tok", loopback=False)
+        cli._print_banner(host="0.0.0.0", port=7788, token=None, loopback=False)
         out = capsys.readouterr().out
 
         assert "WARNING" in out
-        assert "token is the only thing protecting it" in out
+        assert "--token" in out
+
+    def test_no_warning_when_a_token_protects_the_bind(self, capsys, monkeypatch):
+        monkeypatch.setattr(cli, "_display_host", lambda host: "192.168.1.5")
+        cli._print_banner(host="0.0.0.0", port=7788, token="tok", loopback=False)
+        assert "WARNING" not in capsys.readouterr().out
 
     def test_no_warning_on_loopback(self, capsys, monkeypatch):
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
@@ -109,28 +114,29 @@ class TestDisplayHost:
 class TestTokenDecision:
     """When a bearer is created at all.
 
-    The rule: loopback needs none, anything else always does. Getting
-    this wrong in the permissive direction would put an unauthenticated
-    inference endpoint on the network.
+    The rule: only when asked for. Remote access always goes through a
+    tunnel the user chose, and that tunnel is where access control
+    belongs — a second secret only means retyping it on a phone.
     """
 
     @staticmethod
     def _needs_token(*, loopback, token=None, new_token=False):
         # Mirrors the expression in main(); kept in one place so the test
         # asserts the rule rather than re-deriving it.
-        return (not loopback) or bool(token) or new_token
+        return bool(token) or new_token
 
     def test_loopback_needs_no_token(self):
         assert self._needs_token(loopback=True) is False
 
-    def test_non_loopback_always_needs_a_token(self):
-        assert self._needs_token(loopback=False) is True
+    def test_a_non_loopback_bind_does_not_force_one(self):
+        # --host 0.0.0.0 warns instead: the tunnel or the LAN's own
+        # access control is the gate, not a token this tool invents.
+        assert self._needs_token(loopback=False) is False
 
-    def test_an_explicit_token_opts_back_in_on_loopback(self):
-        # There is still a way to have one when sharing a screen.
+    def test_an_explicit_token_opts_in(self):
         assert self._needs_token(loopback=True, token="chosen") is True
 
-    def test_rotating_opts_back_in_on_loopback(self):
+    def test_rotating_opts_in(self):
         assert self._needs_token(loopback=True, new_token=True) is True
 
     def test_the_rule_matches_the_cli_source(self):
@@ -139,9 +145,7 @@ class TestTokenDecision:
         import inspect
 
         source = inspect.getsource(cli.main)
-        assert "needs_token = (not loopback) or bool(args.token) or args.new_token" in (
-            source
-        )
+        assert "needs_token = bool(args.token) or args.new_token" in source
 
 
 class TestBannerWithoutToken:

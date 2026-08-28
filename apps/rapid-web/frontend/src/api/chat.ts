@@ -11,6 +11,10 @@ export interface WireTurn {
 
 export interface ChatRequest {
   turns: WireTurn[];
+  /** Which resident model answers. Omitting it routes to the engine's primary,
+   *  which is whatever was loaded last — an image model there answers a chat
+   *  request with a 500. */
+  model: string | null;
   temperature: number;
   topP: number;
   maxTokens: number;
@@ -48,6 +52,7 @@ export async function* streamChat(options: ChatRequest): AsyncGenerator<ChatDelt
     method: 'POST',
     signal: options.signal,
     body: {
+      ...(options.model ? { model: options.model } : {}),
       messages: options.turns,
       stream: true,
       temperature: options.temperature,

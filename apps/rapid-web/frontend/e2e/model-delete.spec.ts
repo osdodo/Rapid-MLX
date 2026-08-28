@@ -1,5 +1,5 @@
 import { expect, test as base } from '@playwright/test';
-import { startStub, type Scenario } from './stub-server';
+import { openModelList, startStub, type Scenario } from './stub-server';
 
 /**
  * Deleting a downloaded model from the model sheet.
@@ -23,9 +23,8 @@ const test = base.extend<{ scenario: Partial<Scenario>; stub: Stub }>({
 
 async function openModelSheet(page: import('@playwright/test').Page, baseURL: string) {
   await page.goto(baseURL);
-  await page.getByLabel('Open sidebar').click();
-  await page.getByRole('button', { name: /Choose a model|qwen3-4b|llama-8b/ }).click();
-  return page.getByRole('dialog', { name: 'Model' });
+  await expect(page.getByLabel('Message')).toBeVisible();
+  return openModelList(page);
 }
 
 test('only a downloaded model offers a delete', async ({ page, stub }) => {

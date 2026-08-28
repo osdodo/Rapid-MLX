@@ -72,12 +72,18 @@ test('an action taken from the menu applies', async ({ page, stub }) => {
   await drawer.getByRole('button', { name: 'Conversation actions' }).first().click();
   await page.getByRole('menuitem', { name: 'Archive' }).click();
 
-  // Archived rows leave the default list, so the empty state is the proof.
-  await expect(drawer).toContainText('No conversations yet.');
+  // Archived rows leave the default list for a collapsed section: the row is
+  // out of the way but still accounted for.
+  await expect(drawer.getByRole('button', { name: 'Archived (1)' })).toBeVisible();
+  await expect(drawer).not.toContainText('a seeded conversation');
 
-  // And it is archived rather than deleted. There is no "show archived"
-  // toggle any more — search is the archive's recovery path, which is the
-  // whole reason the toggle could go.
+  // Collapsed by DEFAULT — archiving is how a conversation is put out of the
+  // way, so expanding it on every visit would undo what it is for.
+  await drawer.getByRole('button', { name: 'Archived (1)' }).click();
+  await expect(drawer).toContainText('a seeded conversation');
+
+  // And it is archived rather than deleted. Search also still reaches it,
+  // which is the archive's other recovery path.
   await drawer.getByRole('button', { name: 'Search conversations' }).click();
   await page.getByPlaceholder('Search conversations').fill('seeded');
   await expect(page.getByRole('dialog')).toContainText('a seeded conversation');

@@ -4,15 +4,19 @@
 Threat model: the moment the user attaches a tunnel this port is on the
 public internet, so nothing here may assume the tunnel protects it.
 
-Two independent gates:
+Two gates, independent and separately optional:
 
-1. **Bearer token** — stops anyone without the secret.
-2. **Origin / fetch-metadata** — stops a browser the user already has
-   open from being a confused deputy. Any page they visit can ``fetch()``
-   a loopback port; it cannot read the response cross-origin, but it can
+1. **Bearer token** — opt-in via ``--token``. Stops anyone without the
+   secret. Off by default: remote access here always goes through a
+   tunnel the user chose, and that tunnel is where access control
+   belongs.
+2. **Origin / fetch-metadata** — always on, and the one that matters
+   when there is no token. It stops a browser the user already has open
+   from being a confused deputy: any page they visit can ``fetch()`` a
+   loopback port; it cannot read the response cross-origin, but it can
    cause the side effect (start a multi-GB download, switch the model).
-   The bearer alone does not close this, since a malicious page could be
-   told the token by a user who pasted it somewhere.
+   A bearer would not close this on its own, since a malicious page
+   could be told the token by a user who pasted it somewhere.
 """
 
 from __future__ import annotations
@@ -47,10 +51,11 @@ def load_or_create_token(
 ) -> str:
     """Resolve the bearer for this run.
 
-    The token is **persisted**, not rotated per launch: one party is a
-    phone browser holding it in ``localStorage``, so rotating on every
-    start would silently log the user out and the recovery path (walk to
-    the Mac, read the new token, retype it) defeats remote access.
+    Only reached when the user asked for a token. It is **persisted**,
+    not rotated per launch: one party is a phone browser holding it in
+    ``localStorage``, so rotating on every start would silently log the
+    user out and the recovery path (walk to the Mac, read the new token,
+    retype it) defeats remote access.
 
     Precedence: explicit ``override`` > existing file > freshly created.
     ``rotate`` forces a new secret even if the file exists.

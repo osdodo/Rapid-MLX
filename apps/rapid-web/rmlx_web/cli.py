@@ -74,14 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--token",
         metavar="TOKEN",
         help=(
-            "Access token for the web UI. Defaults to a persistent token at "
-            "~/.rapid-mlx/web-token, created on first run."
+            "Require this access token. There is none by default — put your "
+            "tunnel's access control in front instead."
         ),
     )
     parser.add_argument(
         "--new-token",
         action="store_true",
-        help="Rotate the stored access token. Existing phones must re-enter it.",
+        help=(
+            "Require an access token, generating and storing one at "
+            "~/.rapid-mlx/web-token. Reuse it on later runs with --token. "
+            "Repeating this rotates it, and existing phones must re-enter it."
+        ),
     )
     parser.add_argument(
         "--allow-downloads",
@@ -171,7 +175,7 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
     if token is not None:
         print(f"  Token: {token}")
     else:
-        print("  Auth:  none (loopback only)")
+        print("  Auth:  none")
     print()
 
     # No QR code: a 25-row block pushed everything above it — including
@@ -182,12 +186,12 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
         print(f"  {login_url}")
         print()
 
-    if not loopback:
+    if not loopback and token is None:
         print(
-            "  WARNING: bound to a non-loopback address. Anyone on this "
-            "network can reach this port."
+            "  WARNING: bound to a non-loopback address with no token. "
+            "Anyone on this network can reach this port."
         )
-        print("  The access token is the only thing protecting it.")
+        print("  Pass --token to require one.")
         print()
     # stdout is block-buffered when not a TTY, so under `rmlx-web > log &`
     # the token would not appear until the buffer filled.
@@ -231,15 +235,14 @@ def main(argv: list[str] | None = None) -> int:
     if not loopback and args.allow_downloads:
         print(
             "  NOTE: downloads are enabled on a non-loopback address. "
-            "Anyone with the token can fill this Mac's disk.\n",
+            "Anyone who can reach this port can fill this Mac's disk.\n",
             file=sys.stderr,
         )
 
-    # No bearer on a loopback bind — the OS already guarantees the caller
-    # is a process on this Mac. NOT skipped once the port is on a network,
-    # where it is the only thing protecting inference and downloads.
-    # --token / --new-token opts back in for screen-sharing.
-    needs_token = (not loopback) or bool(args.token) or args.new_token
+    # Opt-in, never forced. Every remote-access path here is a tunnel the
+    # user chose, and tunnels carry their own access control — a second
+    # secret in front of it only means retyping 43 characters on a phone.
+    needs_token = bool(args.token) or args.new_token
 
     token: str | None = None
     if needs_token:

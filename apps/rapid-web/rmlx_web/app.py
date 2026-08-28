@@ -11,9 +11,12 @@ engine's log tail.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -35,6 +38,7 @@ from .supervisor import (
     AttachedEngine,
     ChildState,
     EngineSupervisor,
+    ResidencyOutcome,
     SupervisorError,
 )
 
@@ -42,6 +46,34 @@ STATIC_DIR = Path(__file__).parent / "static"
 ASSETS_DIR = STATIC_DIR / "assets"
 
 _IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+# Matches the engine's own ceiling (``MAX_AUDIO_UPLOAD_SIZE``), so an upload
+# that would be refused there is refused here instead of after another hop.
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+
+# The engine's ``_MAX_EDIT_IMAGE_BYTES``, for the same reason.
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+# Filenames reaching a multipart part. Restricted rather than sanitised: the
+# name is advisory (the engine spools every upload to a ``.wav`` temp file
+# regardless), so there is nothing to gain by accepting a caller's arbitrary
+# string in a header.
+_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# What ``/api/residency`` answers when the engine is not reachable. A limit
+# of 0 is the engine's own "no ceiling" spelling, which the page reads as
+# "nothing to show" rather than "0 bytes used".
+_EMPTY_RESIDENCY = {
+    "memory_limit_bytes": 0,
+    "memory_used_bytes": 0,
+    "models": [],
+}
+
+
+def _upload_filename(candidate: object) -> str:
+    if isinstance(candidate, str) and _UPLOAD_NAME_RE.match(candidate):
+        return candidate
+    return "recording.wav"
 
 
 class _HashedAssets(StaticFiles):
@@ -84,7 +116,7 @@ class StreamTracker:
 class WebConfig:
     """Everything the HTTP layer needs that is decided at startup."""
 
-    # ``None`` disables the bearer entirely (loopback binds only). Not a
+    # ``None`` disables the bearer entirely, which is the default. Not a
     # boolean beside a token: two fields could disagree, and that failure
     # mode is "auth silently off".
     token: str | None
@@ -99,6 +131,13 @@ class WebConfig:
     # ``None`` when downloads are disabled — also the single source of
     # truth for whether they are allowed.
     downloads: DownloadManager | None = None
+
+
+# Catalog kind -> the engine's own modality vocabulary. `audio` never
+# reaches a resident load (its lane rides on the served model), so it is
+# absent and the caller's `.get(..., "text")` default is never exercised
+# for it.
+_ENGINE_MODALITY = {"text": "text", "image": "image-gen"}
 
 
 def _json_error(status: int, message: str, code: str) -> JSONResponse:
@@ -120,10 +159,40 @@ async def _boot(config: WebConfig) -> None:
         await config.engine.start(config.initial_model)
 
 
-async def _switch(config: WebConfig, alias: str) -> None:
-    """Restart the engine on ``alias``. Failures swallowed as in :func:`_boot`."""
+async def _switch(config: WebConfig, alias: str, entry=None) -> None:
+    """Make ``alias`` usable, hot if the engine allows it.
+
+    A hot ``POST /v1/models/load`` is tried FIRST because it is the only
+    way two models are usable at once: the engine keeps text/vision in one
+    single-slot group and gives each media modality its own, so loading an
+    image model beside a chat model leaves the chat model running. A
+    respawn, by contrast, can only ever serve the one model it was started
+    for.
+
+    Every failure falls back to the respawn this package did
+    unconditionally before, so the worst case is the old behaviour.
+    Failures are swallowed as in :func:`_boot` — this is a detached task,
+    and ``/api/status`` is what the page reads.
+    """
+    # Duck-typed rather than an isinstance check: the engine is the one seam
+    # this package mocks, and `--attach` mode never reaches here (the route
+    # refuses on `can_switch` first).
+    hot = entry is not None and hasattr(config.engine, "residency_load")
+    modality = _ENGINE_MODALITY.get(entry.kind, "text") if entry is not None else "text"
+    if hot:
+        outcome, _refusal = await config.engine.residency_load(
+            alias,
+            modality=modality,
+            size_bytes=entry.size_bytes,
+            image_mode="generation" if entry.kind == "image" else None,
+        )
+        if outcome is ResidencyOutcome.LOADED:
+            if config.catalog is not None:
+                config.catalog.invalidate_cache()
+            return
+
     with contextlib.suppress(SupervisorError):
-        await config.engine.start(alias)
+        await config.engine.start(alias, modality=modality)
     # The engine's own downloader may have just pulled these weights.
     if config.catalog is not None:
         config.catalog.invalidate_cache()
@@ -202,11 +271,11 @@ def create_app(config: WebConfig) -> FastAPI:
                 "unsupported_media_type",
             )
 
-        # The bearer is skipped only on a loopback bind. The Origin and
-        # content-type checks above are NOT skipped with it: without a
-        # token they become the only thing between this port and any web
-        # page the user happens to have open, since a browser can reach a
-        # loopback port.
+        # There is usually no bearer: it is opt-in via --token. The Origin
+        # and content-type checks above are NOT tied to it, and without a
+        # token they are the only thing between this port and any web page
+        # the user happens to have open, since a browser can reach a
+        # loopback port even when the network cannot.
         if config.token is not None:
             presented = auth.extract_bearer(request.headers.get("authorization"))
             if not auth.token_matches(config.token, presented):
@@ -274,10 +343,11 @@ def create_app(config: WebConfig) -> FastAPI:
 
     @app.get("/api/models")
     async def list_models(refresh: bool = False) -> JSONResponse:
-        """Chat-capable aliases, with on-disk state.
+        """Every alias, tagged with its kind.
 
-        Image, video and audio aliases have no chat surface, so listing
-        them would offer a multi-GB download that dead-ends on first send.
+        Image and audio rows are included so the model manager can show
+        them, and each carries ``loadable`` — audio has no ``serve`` lane
+        here, so the picker must not offer to start one.
         """
         if config.catalog is None:
             return _json_error(
@@ -286,7 +356,7 @@ def create_app(config: WebConfig) -> FastAPI:
                 "catalog_unavailable",
             )
         try:
-            entries = await config.catalog.list_chat_models(force=refresh)
+            entries = await config.catalog.list_models(force=refresh)
         except CatalogError as exc:
             return _json_error(503, str(exc), "catalog_error")
 
@@ -327,12 +397,18 @@ def create_app(config: WebConfig) -> FastAPI:
         # argument: an arbitrary string would let a remote caller name any
         # `org/repo`, turning a model picker into a general-purpose fetch.
         try:
-            known = await config.catalog.is_known_chat_alias(alias)
+            entry = await config.catalog.profile(alias)
         except CatalogError as exc:
             return _json_error(503, str(exc), "catalog_error")
-        if not known:
+        if entry is None:
+            return _json_error(404, f"unknown model alias: {alias}", "unknown_model")
+        if not entry.loadable:
+            # Only `video` today: its lane needs extras a plain install
+            # does not ship, which is also why the catalog omits it.
             return _json_error(
-                404, f"unknown chat model alias: {alias}", "unknown_model"
+                409,
+                f"{alias} cannot be loaded as the served model.",
+                "kind_not_loadable",
             )
 
         # Switching restarts the engine, destroying any generation in
@@ -357,9 +433,14 @@ def create_app(config: WebConfig) -> FastAPI:
                 "busy_loading",
             )
 
+        # Already resident from an earlier hot load — the engine routes by
+        # the request's `model` field, so there is nothing to do.
+        if alias in snapshot.resident and snapshot.state is ChildState.READY:
+            return JSONResponse({"ok": True, "model": alias, "state": "ready"})
+
         # Detached, answering immediately: a load takes minutes, far past
         # any phone browser's fetch timeout. The page polls /api/status.
-        app.state.boot = asyncio.create_task(_switch(config, alias))
+        app.state.boot = asyncio.create_task(_switch(config, alias, entry))
         return JSONResponse({"ok": True, "model": alias, "state": "starting"})
 
     @app.post("/api/models/pull")
@@ -387,23 +468,19 @@ def create_app(config: WebConfig) -> FastAPI:
         # Same reasoning as the switch route: an unvalidated alias reaching
         # a subprocess argument is a remote fetch primitive.
         try:
-            profile = await config.catalog.chat_profile(alias)
+            entry = await config.catalog.profile(alias)
         except CatalogError as exc:
             return _json_error(503, str(exc), "catalog_error")
-        if profile is None:
-            return _json_error(
-                404, f"unknown chat model alias: {alias}", "unknown_model"
-            )
+        if entry is None:
+            return _json_error(404, f"unknown model alias: {alias}", "unknown_model")
 
         # Fails closed when the size is unknown — see check_disk_budget.
-        reason = check_disk_budget(profile.get("size_bytes"))
+        reason = check_disk_budget(entry.size_bytes)
         if reason is not None:
             return _json_error(507, reason, "insufficient_storage")
 
         try:
-            job = await config.downloads.start(
-                alias, total_bytes=profile.get("size_bytes")
-            )
+            job = await config.downloads.start(alias, total_bytes=entry.size_bytes)
         except DownloadError as exc:
             return _json_error(409, str(exc), "download_conflict")
 
@@ -571,6 +648,393 @@ def create_app(config: WebConfig) -> FastAPI:
             headers=proxy.filtered_response_headers(upstream.headers),
         )
 
+    @app.post("/v1/images/generations")
+    async def image_generations(request: Request):
+        """Render an image on the loaded image model.
+
+        A plain relay, with one addition: the request is counted as a
+        stream so a concurrent ``/api/models/load`` refuses rather than
+        killing the engine mid-render. A render is minutes of GPU work
+        and has no resume.
+        """
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+        if not isinstance(payload, dict):
+            return _json_error(
+                400, "request body must be a JSON object", "invalid_json"
+            )
+
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+
+        with streams.track():
+            try:
+                upstream = await proxy.proxy_unary(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/images/generations",
+                    payload=payload,
+                    api_key=engine.api_key,
+                )
+            except httpx.HTTPError as exc:
+                return _json_error(
+                    502, f"connection to the engine failed: {exc}", "engine_transport"
+                )
+
+        return JSONResponse(
+            status_code=upstream.status_code,
+            content=_decode_json_body(upstream),
+            headers=proxy.filtered_response_headers(upstream.headers),
+        )
+
+    @app.post("/api/images/edits")
+    async def image_edits(request: Request):
+        """Instruction-edit an image the user supplied.
+
+        JSON with the source as base64, rebuilt into the multipart the
+        engine's ``/v1/images/edits`` expects — the middleware's CSRF
+        control rejects ``multipart/form-data``, so relaying the browser's
+        own would need a second, weaker policy. Same reasoning as
+        ``/api/audio/transcriptions``.
+
+        ``size`` is deliberately not forwarded: the edit backends derive
+        their canvas from the input image and the engine discards it.
+        """
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+        if not isinstance(payload, dict):
+            return _json_error(
+                400, "request body must be a JSON object", "invalid_json"
+            )
+
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return _json_error(400, "`prompt` must not be empty", "invalid_body")
+
+        encoded = payload.get("image")
+        if not isinstance(encoded, str) or not encoded:
+            return _json_error(
+                400, "`image` must be a base64-encoded string", "invalid_body"
+            )
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            return _json_error(400, "`image` was not valid base64", "invalid_body")
+        if not content:
+            return _json_error(400, "the image was empty", "invalid_body")
+        if len(content) > MAX_IMAGE_BYTES:
+            return _json_error(
+                413,
+                f"that image is larger than {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
+                "payload_too_large",
+            )
+
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+
+        fields = {"prompt": prompt, "n": "1", "response_format": "b64_json"}
+        model = payload.get("model")
+        if isinstance(model, str) and model:
+            fields["model"] = model
+
+        # Counted like a render: an edit is minutes of GPU work with no
+        # resume, and a concurrent switch would kill the engine doing it.
+        with streams.track():
+            try:
+                upstream = await proxy.proxy_multipart(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/images/edits",
+                    api_key=engine.api_key,
+                    field="image",
+                    # The engine sniffs the real format from the bytes; the
+                    # name and type here only have to be well-formed.
+                    filename="input.png",
+                    content_type="image/png",
+                    content=content,
+                    fields=fields,
+                )
+            except httpx.HTTPError as exc:
+                return _json_error(
+                    502, f"connection to the engine failed: {exc}", "engine_transport"
+                )
+
+        return JSONResponse(
+            status_code=upstream.status_code, content=_decode_json_body(upstream)
+        )
+
+    @app.get("/api/images/progress")
+    async def image_progress(model: str = ""):
+        """Denoise progress for the single in-flight render.
+
+        Polled, like the download feed and for the same reason: a sparse
+        SSE body is buffered indefinitely by a tunnel. Diffusion has a
+        fixed step count, so ``step / total`` is a true fraction rather
+        than an estimate.
+
+        An unreachable engine answers ``running: false`` rather than an
+        error — the poller's job is to report the render, and a dropped
+        poll mid-render is not itself a failure.
+        """
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            return JSONResponse({"running": False, "step": 0, "total": 0})
+        try:
+            upstream = await proxy.proxy_get(
+                app.state.http,
+                base_url=base_url,
+                path="/v1/images/progress",
+                api_key=engine.api_key,
+                params={"model": model} if model else None,
+            )
+        except httpx.HTTPError:
+            return JSONResponse({"running": False, "step": 0, "total": 0})
+        if upstream.status_code >= 400:
+            return JSONResponse({"running": False, "step": 0, "total": 0})
+        return JSONResponse(_decode_json_body(upstream))
+
+    @app.post("/api/images/cancel")
+    async def image_cancel(request: Request):
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            return _json_error(503, "no model is loaded", "engine_unavailable")
+
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            payload = {}
+        model = payload.get("model") if isinstance(payload, dict) else None
+
+        try:
+            upstream = await proxy.proxy_post_query(
+                app.state.http,
+                base_url=base_url,
+                path="/v1/images/cancel",
+                api_key=engine.api_key,
+                params={"model": model} if isinstance(model, str) and model else None,
+            )
+        except httpx.HTTPError as exc:
+            return _json_error(
+                502, f"connection to the engine failed: {exc}", "engine_transport"
+            )
+        return JSONResponse(
+            status_code=upstream.status_code, content=_decode_json_body(upstream)
+        )
+
+    @app.get("/api/residency")
+    async def residency():
+        """Resident models and process memory against the engine's ceiling.
+
+        Polled while the page is open, so an unreachable engine answers an
+        EMPTY snapshot rather than an error: the panel's job is to describe
+        the machine, and a dropped poll during a model switch is not a
+        failure worth putting a banner over.
+        """
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            return JSONResponse(_EMPTY_RESIDENCY)
+        try:
+            upstream = await proxy.proxy_get(
+                app.state.http,
+                base_url=base_url,
+                path="/v1/models/residency",
+                api_key=engine.api_key,
+            )
+        except httpx.HTTPError:
+            return JSONResponse(_EMPTY_RESIDENCY)
+        if upstream.status_code >= 400:
+            return JSONResponse(_EMPTY_RESIDENCY)
+        return JSONResponse(_decode_json_body(upstream))
+
+    # ---------------------------------------------------------------- audio
+    #
+    # The audio lane rides on WHATEVER model the engine is serving: the
+    # child is spawned with ``--enable-audio``, and the engine's gate
+    # short-circuits on that flag before it looks at the model. So speech
+    # works while a chat model is loaded, and no model switch is needed.
+
+    @app.get("/api/audio/voices")
+    async def audio_voices(model: str = ""):
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+        try:
+            upstream = await proxy.proxy_get(
+                app.state.http,
+                base_url=base_url,
+                path="/v1/audio/voices",
+                api_key=engine.api_key,
+                params={"model": model} if model else None,
+                # The first call loads the TTS registry, not the weights,
+                # but a cold import is still slower than a status poll.
+                timeout=60.0,
+            )
+        except httpx.HTTPError as exc:
+            return _json_error(
+                502, f"connection to the engine failed: {exc}", "engine_transport"
+            )
+        return JSONResponse(
+            status_code=upstream.status_code, content=_decode_json_body(upstream)
+        )
+
+    @app.post("/api/audio/speech")
+    async def audio_speech(request: Request):
+        """Synthesise speech, answering with the audio bytes.
+
+        Counted as a stream: a cold Kokoro request measured 47 s, and a
+        model switch mid-synthesis would kill the engine doing it.
+        """
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+        if not isinstance(payload, dict):
+            return _json_error(
+                400, "request body must be a JSON object", "invalid_json"
+            )
+
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+
+        with streams.track():
+            try:
+                upstream = await proxy.proxy_audio_json(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/audio/speech",
+                    payload=payload,
+                    api_key=engine.api_key,
+                )
+            except httpx.HTTPError as exc:
+                return _json_error(
+                    502, f"connection to the engine failed: {exc}", "engine_transport"
+                )
+
+        # A failure is JSON; a success is audio. Branch on the status, not
+        # on the content type, so an engine that mislabels still surfaces
+        # its error rather than handing the page unplayable bytes.
+        if upstream.status_code >= 400:
+            return JSONResponse(
+                status_code=upstream.status_code, content=_decode_json_body(upstream)
+            )
+        return Response(
+            content=upstream.content,
+            media_type=upstream.headers.get("content-type", "audio/wav"),
+            headers=proxy.filtered_response_headers(upstream.headers),
+        )
+
+    @app.post("/api/audio/transcriptions")
+    async def audio_transcriptions(request: Request):
+        """Transcribe an upload sent as base64 inside a JSON body.
+
+        JSON rather than a relayed multipart because the middleware's CSRF
+        control rejects the CORS-simple content types, and
+        ``multipart/form-data`` is one of them. Re-encoding here keeps one
+        policy instead of carving an exception for a single route.
+        """
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+        if not isinstance(payload, dict):
+            return _json_error(
+                400, "request body must be a JSON object", "invalid_json"
+            )
+
+        encoded = payload.get("audio")
+        if not isinstance(encoded, str) or not encoded:
+            return _json_error(
+                400, "`audio` must be a base64-encoded string", "invalid_body"
+            )
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            return _json_error(400, "`audio` was not valid base64", "invalid_body")
+        if not content:
+            return _json_error(400, "the recording was empty", "invalid_body")
+        # Checked before the relay so an oversize upload is refused here
+        # rather than after being pushed across another hop.
+        if len(content) > MAX_AUDIO_BYTES:
+            return _json_error(
+                413,
+                f"that recording is larger than {MAX_AUDIO_BYTES // (1024 * 1024)} MB",
+                "payload_too_large",
+            )
+
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+
+        fields = {"response_format": "json"}
+        for key in ("model", "language", "context"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                fields[key] = value
+
+        with streams.track():
+            try:
+                upstream = await proxy.proxy_multipart(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/audio/transcriptions",
+                    api_key=engine.api_key,
+                    # Advisory: the engine spools to a ``.wav`` temp file and
+                    # decodes the CONTAINER, so a name cannot make an
+                    # undecodable upload readable. The page transcodes to WAV
+                    # before sending — libsndfile reads neither mp4 nor webm.
+                    filename=_upload_filename(payload.get("filename")),
+                    content=content,
+                    fields=fields,
+                )
+            except httpx.HTTPError as exc:
+                return _json_error(
+                    502, f"connection to the engine failed: {exc}", "engine_transport"
+                )
+
+        return JSONResponse(
+            status_code=upstream.status_code, content=_decode_json_body(upstream)
+        )
+
     # After the API routes: a mount matches on prefix and swallows
     # everything beneath it. check_dir=False so a checkout that never ran the
     # frontend build still starts.
@@ -608,6 +1072,14 @@ def _apply_security_headers(response) -> None:
 
     ``'unsafe-inline'`` stays on style-src: Radix's scroll lock injects a
     ``<style>`` tag at runtime and is silently ignored without it.
+
+    ``media-src`` must name ``blob:`` explicitly. Synthesised speech is
+    handed to ``<audio>`` as an object URL, and without its own directive
+    ``media-src`` falls back to ``default-src 'self'`` — which does not
+    cover ``blob:``. The element then fails with ``MediaError`` code 4 and
+    a player stuck at ``0:00 / 0:00``, while the identical URL still
+    downloads fine (a download is not governed by a fetch directive), so
+    the bytes look correct and the fault appears to be in the audio.
     """
     response.headers.setdefault(
         "Content-Security-Policy",
@@ -616,6 +1088,7 @@ def _apply_security_headers(response) -> None:
         "style-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
+        "media-src 'self' blob:; "
         "frame-ancestors 'none'; "
         "base-uri 'none'",
     )

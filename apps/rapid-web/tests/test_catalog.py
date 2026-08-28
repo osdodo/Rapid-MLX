@@ -13,7 +13,12 @@ import time
 
 import pytest
 
-from rmlx_web.catalog import CatalogError, ModelCatalog, RemovalError
+from rmlx_web.catalog import (
+    CatalogError,
+    ModelCatalog,
+    RemovalError,
+    _image_capability,
+)
 
 # Trimmed from the real payload. `flux2-klein-4b` is retained on purpose:
 # it is an image-gen alias that can be present, cached and "ok", and it
@@ -55,7 +60,15 @@ AVAILABLE = {
             "modality": "video-gen",
         }
     ],
-    "audio": [{"alias": "whisper-large-v3", "hf_id": "x/y", "modality": "audio"}],
+    "audio": [
+        {
+            "alias": "whisper-large-v3",
+            "hf_id": "mlx-community/whisper-large-v3",
+            "kind": "stt",
+            "family": "whisper",
+            "modality": "audio",
+        }
+    ],
 }
 
 CACHED = {
@@ -84,9 +97,20 @@ CACHED = {
             "state": "incomplete",
             "external": False,
         },
+        {
+            # Complete and usable, but not in the TEXT alias registry —
+            # which is what every downloaded audio repo looks like, since
+            # audio aliases live in their own registry the cached scan
+            # does not consult.
+            "alias": None,
+            "repo": "mlx-community/whisper-large-v3",
+            "size_bytes": 1610000000,
+            "state": "unmapped",
+            "external": False,
+        },
     ],
-    "count": 3,
-    "total_bytes": 10597780784,
+    "count": 4,
+    "total_bytes": 12207780784,
 }
 
 
@@ -124,6 +148,95 @@ def fake_cli(tmp_path):
     return script, calls
 
 
+class TestListModels:
+    @pytest.mark.asyncio
+    async def test_text_image_and_audio_are_listed_and_tagged(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+
+        assert entries["qwen3.5-9b-4bit"].kind == "text"
+        assert entries["flux2-klein-4b"].kind == "image"
+        assert entries["whisper-large-v3"].kind == "audio"
+
+    @pytest.mark.asyncio
+    async def test_video_is_omitted(self, fake_cli):
+        script, _ = fake_cli
+        entries = await ModelCatalog(str(script)).list_models()
+
+        # The video lane needs extras a plain install does not ship, so a
+        # 64 GiB download that cannot be served would be a trap.
+        assert "wan-2.2-t2v" not in [e.alias for e in entries]
+
+    @pytest.mark.asyncio
+    async def test_audio_is_loadable_too(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+
+        assert entries["qwen3.5-9b-4bit"].loadable is True
+        assert entries["flux2-klein-4b"].loadable is True
+        # `serve <audio-alias>` has a dedicated fork in the CLI
+        # (`_serve_audio_mode`): the child binds, `/health/ready` reports
+        # ready, and `/v1/models` describes it as `modality: audio`.
+        # Verified live 2026-08-28 with `serve kokoro`. It is the last
+        # resort, not the normal path — with any model already serving,
+        # the `--enable-audio` lane answers from that process — but the
+        # catalog's job is to say what CAN be served, and this can.
+        assert entries["whisper-large-v3"].loadable is True
+
+    @pytest.mark.asyncio
+    async def test_an_image_row_merges_its_cached_state(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+
+        assert entries["flux2-klein-4b"].cached is True
+        assert entries["flux2-klein-4b"].cached_bytes == 4619704407
+
+    @pytest.mark.asyncio
+    async def test_image_capability_is_derived_from_the_repo_id(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+
+        # FLUX.2 accepts both request shapes, which is what lets the surface
+        # offer Edit on it at all. Repeats the CLI's `[image:both]` rule.
+        assert entries["flux2-klein-4b"].image_capability == "both"
+        # Only image rows carry one; anything else branching on it would be
+        # reading a field that means nothing.
+        assert entries["qwen3.5-9b-4bit"].image_capability is None
+        assert entries["whisper-large-v3"].image_capability is None
+
+    @pytest.mark.parametrize(
+        ("hf_path", "expected"),
+        [
+            ("Runpod/FLUX.2-klein-4B-mflux-4bit", "both"),
+            ("mlx-community/flux2-dev", "both"),
+            # Underscores are folded, as the CLI folds them.
+            ("org/Qwen_Image_Edit-2509", "editing"),
+            ("mlx-community/Qwen-Image-Edit-2509-4bit", "editing"),
+            # Plain Qwen-Image is text-to-image: the edit token must win only
+            # where it is actually present.
+            ("mlx-community/Qwen-Image-4bit", "generation"),
+            ("mlx-community/Z-Image-Turbo", "generation"),
+        ],
+    )
+    def test_the_capability_rule_matches_the_cli(self, hf_path, expected):
+        assert _image_capability(hf_path) == expected
+
+    @pytest.mark.asyncio
+    async def test_an_audio_row_is_normalised(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+        whisper = entries["whisper-large-v3"]
+
+        # ``hf_id`` becomes ``hf_path`` and the registry's tts/stt
+        # ``kind`` moves aside, so one shape serves every kind.
+        assert whisper.hf_path == "mlx-community/whisper-large-v3"
+        assert whisper.audio_kind == "stt"
+        assert whisper.family == "whisper"
+        # No size manifest covers audio repos, so the pull gate — which
+        # fails closed on an unknown size — must see None, never zero.
+        assert whisper.size_bytes is None
+
+
 class TestListChatModels:
     @pytest.mark.asyncio
     async def test_only_text_models_are_listed(self, fake_cli):
@@ -158,8 +271,23 @@ class TestListChatModels:
 
         # The bonsai row is present on disk but "incomplete". Reporting
         # it as downloaded would make a switch fail inside the engine.
+        # This is the boundary "unmapped" must not be widened past: both
+        # carry alias=None, and only one of them is loadable.
         assert entries["bonsai-1.7b-2bit"].cached is False
         assert entries["bonsai-1.7b-2bit"].cached_bytes is None
+
+    @pytest.mark.asyncio
+    async def test_an_unmapped_snapshot_still_counts_as_downloaded(self, fake_cli):
+        script, _ = fake_cli
+        entries = {e.alias: e for e in await ModelCatalog(str(script)).list_models()}
+
+        # "unmapped" means complete and usable but absent from the TEXT
+        # alias registry — which is every audio repo, because audio aliases
+        # live in their own registry the cached scan does not consult.
+        # Accepting only "ok" reported every downloaded voice model as not
+        # downloaded, with no way to fix it from this surface.
+        assert entries["whisper-large-v3"].cached is True
+        assert entries["whisper-large-v3"].cached_bytes == 1610000000
 
     @pytest.mark.asyncio
     async def test_downloaded_models_sort_first(self, fake_cli):
@@ -278,14 +406,14 @@ class TestRemove:
         assert "rm" not in calls.read_text()
 
     @pytest.mark.asyncio
-    async def test_a_non_chat_alias_is_refused(self, fake_cli):
+    async def test_a_cached_image_model_can_be_removed(self, fake_cli):
         script, calls = fake_cli
-        # Present in the catalog, but as an image model — and this route
-        # only ever lists chat models, so it must not reach past them.
-        with pytest.raises(RemovalError):
-            await ModelCatalog(str(script)).remove("flux2-klein-4b")
+        freed = await ModelCatalog(str(script)).remove("flux2-klein-4b")
 
-        assert "rm" not in calls.read_text()
+        # Removal is kind-agnostic on purpose: it frees disk, and an
+        # image checkpoint is one of the largest things on it.
+        assert "rm Runpod/FLUX.2-klein-4B-mflux-4bit --yes" in calls.read_text()
+        assert freed == 4619704407
 
     @pytest.mark.asyncio
     async def test_a_model_that_is_not_downloaded_is_refused(self, fake_cli):

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
-import type { DownloadJob, ModelEntry, StatusResponse } from '@/api/types';
+import type { DownloadJob, ModelEntry, ModelKind, StatusResponse } from '@/api/types';
 import { activePath, choicesAlong, deepestLeaf } from '@/chat/MessageTree';
 import { newId } from '@/lib/ids';
 import { HISTORY_BACKUP_KEY, HISTORY_KEY, deriveTitle, migrate } from './migrate';
@@ -84,6 +84,45 @@ export interface Notice {
   action?: { label: string; run: () => void } | undefined;
 }
 
+type SelectionByKind = Record<ModelKind, string | null>;
+
+/**
+ * Adopt the engine's served model as the text selection.
+ *
+ * Provisional only while the catalog is missing: guessing `text` is right far
+ * more often than not (the served model usually IS a chat model) and
+ * `reconcileKinds` corrects it once the kinds arrive. Once they HAVE arrived
+ * the guess must stop — status polls every few seconds, and re-adopting a
+ * served image model would undo the reconciliation on the very next tick.
+ */
+function adoptServedModel(
+  current: SelectionByKind,
+  served: string | null,
+  models: ModelEntry[],
+): SelectionByKind {
+  if (served === null || current.text !== null) return current;
+  const entry = models.find((model) => model.alias === served);
+  if (entry !== undefined && entry.kind !== 'text') return current;
+  return { ...current, text: served };
+}
+
+/** Move a provisionally-adopted alias to the slot its real kind says it owns. */
+function reconcileKinds(current: SelectionByKind, models: ModelEntry[]): SelectionByKind {
+  const adopted = current.text;
+  if (adopted === null) return current;
+
+  const entry = models.find((model) => model.alias === adopted);
+  if (entry === undefined || entry.kind === 'text') return current;
+
+  return {
+    ...current,
+    text: null,
+    // Only if that slot is free — a selection the user made themselves wins
+    // over one inferred from whatever the engine happened to be serving.
+    [entry.kind]: current[entry.kind] ?? adopted,
+  };
+}
+
 interface StoreState {
   // ---- conversations
   conversations: Conversation[];
@@ -96,7 +135,14 @@ interface StoreState {
   statusFailures: number;
   models: ModelEntry[];
   catalogLoaded: boolean;
-  selectedAlias: string | null;
+  /**
+   * What the user last picked, PER KIND.
+   *
+   * Not one shared value: the chat and images surfaces each have a model, and
+   * a single field means choosing an image model silently retargets the chat
+   * — which then reports the image model's start failure as its own.
+   */
+  selectedByKind: Record<ModelKind, string | null>;
   canSwitch: boolean;
   allowDownloads: boolean;
   download: DownloadJob | null;
@@ -123,7 +169,7 @@ interface StoreState {
   setStatus(status: StatusResponse | null, failed: boolean): void;
   setModels(models: ModelEntry[]): void;
   setCapabilities(canSwitch: boolean, allowDownloads: boolean): void;
-  selectAlias(alias: string | null): void;
+  selectAlias(kind: ModelKind, alias: string | null): void;
   setDownload(job: DownloadJob | null): void;
 
   pushNotice(notice: Omit<Notice, 'id'>): void;
@@ -206,7 +252,7 @@ export const useStore = create<StoreState>()((set, get) => {
     statusFailures: 0,
     models: [],
     catalogLoaded: false,
-    selectedAlias: null,
+    selectedByKind: { text: null, image: null, audio: null },
     canSwitch: false,
     allowDownloads: false,
     download: null,
@@ -216,6 +262,25 @@ export const useStore = create<StoreState>()((set, get) => {
     settings: loadSettings(),
 
     createConversation() {
+      // Reuse an existing empty conversation rather than stacking another one
+      // beside it. Pressing New Chat twice, or pressing it when the app has
+      // just opened on a blank one, otherwise leaves a column of identical
+      // "New chat" rows that the user then has to delete one at a time.
+      // Reuse is only safe when it is UNTITLED as well as empty: a renamed
+      // blank conversation is one the user deliberately made.
+      const existing = get().conversations.find(
+        (conversation) =>
+          conversation.nodes.length === 0 &&
+          !conversation.hasCustomTitle &&
+          conversation.title.trim() === '' &&
+          !conversation.isArchived,
+      );
+      if (existing) {
+        set({ activeId: existing.id });
+        schedulePersist();
+        return existing.id;
+      }
+
       const id = newId();
       const now = Date.now();
       set((state) => ({
@@ -349,23 +414,39 @@ export const useStore = create<StoreState>()((set, get) => {
         status: status ?? state.status,
         statusFailures: failed ? state.statusFailures + 1 : 0,
         canSwitch: status?.can_switch ?? state.canSwitch,
-        // Adopt the serving model as the selection until the user picks one,
-        // so a page opened against a running engine is immediately usable.
-        selectedAlias: state.selectedAlias ?? status?.model ?? null,
+        // Adopt the serving model as the TEXT selection until the user picks
+        // one, so a page opened against a running engine is immediately
+        // usable — and so `--attach` mode, where there is no catalog at all,
+        // still names the model it is attached to.
+        //
+        // The kind cannot be checked here: the catalog may not have loaded
+        // yet. `setModels` corrects a wrong guess when it does.
+        selectedByKind: adoptServedModel(
+          state.selectedByKind,
+          status?.model ?? null,
+          state.models,
+        ),
       }));
     },
 
     setModels(models) {
-      set({ models, catalogLoaded: true });
+      set((state) => ({
+        models,
+        catalogLoaded: true,
+        // Now that the kinds are known, undo an adoption `setStatus` could
+        // not have got right: a served IMAGE model must not be sitting in
+        // the chat's slot, or the chat reports its failures as its own.
+        selectedByKind: reconcileKinds(state.selectedByKind, models),
+      }));
     },
 
     setCapabilities(canSwitch, allowDownloads) {
       set({ canSwitch, allowDownloads });
     },
 
-    selectAlias(alias) {
+    selectAlias(kind, alias) {
       set((state) => ({
-        selectedAlias: alias,
+        selectedByKind: { ...state.selectedByKind, [kind]: alias },
         // Mark the status as no longer describing the selection. Without this
         // the cached snapshot still names the PREVIOUS model, so
         // `resolveReadiness` finds no serving state and tells the user to

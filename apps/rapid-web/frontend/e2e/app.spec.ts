@@ -1,5 +1,5 @@
 import { expect, test as base, type Page } from '@playwright/test';
-import { startStub, chatFrame, type Scenario } from './stub-server';
+import { startStub, chatFrame, stubModel, type Scenario } from './stub-server';
 
 /**
  * End-to-end specs against the BUILT artifact.
@@ -226,26 +226,18 @@ test.describe('errors', () => {
         // all — which is what the first version of this test did, and it
         // failed for a reason that had nothing to do with notices.
         models: [
-          {
+          stubModel({
             alias: 'qwen3-4b',
-            hf_path: 'org/qwen3-4b',
             size_bytes: 2_400_000_000,
             cached: true,
             cached_bytes: 2_400_000_000,
-            tool_call_parser: null,
-            reasoning_parser: null,
-            is_text_only: true,
-          },
-          {
+          }),
+          stubModel({
             alias: 'gemma-2b',
-            hf_path: 'org/gemma-2b',
             size_bytes: 1_100_000_000,
             cached: true,
             cached_bytes: 1_100_000_000,
-            tool_call_parser: null,
-            reasoning_parser: null,
-            is_text_only: true,
-          },
+          }),
         ],
       },
     });
@@ -260,13 +252,11 @@ test.describe('errors', () => {
       });
 
       await page.goto(stub.baseURL);
-      // The model selector is in the sidebar, which is a drawer at this width.
-      await page.getByLabel('Open sidebar').click();
-      await page.getByRole('button', { name: /qwen3-4b/ }).click();
-      // Anchored: a cached row carries a "Delete <alias>" button as well, and
-      // an unanchored /gemma-2b/ matches both. The row's accessible name
-      // STARTS with the alias, the trash's starts with "Delete".
-      await page.getByRole('button', { name: /^gemma-2b/ }).click();
+      await expect(page.getByLabel('Message')).toBeVisible();
+
+      // Through the composer's picker, which is where the model now lives.
+      await page.getByRole('button', { name: /^Model:/ }).click();
+      await page.getByRole('menuitem', { name: /gemma-2b/ }).click();
 
       await expect(page.getByText('still streaming')).toBeVisible();
       expect(alerted).toBe(false);
@@ -407,26 +397,30 @@ test.describe('layout', () => {
     await expect(rail).toBeVisible();
   });
 
-  test('the model selector lives in the rail on desktop', async ({ page, stub }) => {
+  test('the model selector lives in the composer, not the rail', async ({ page, stub }) => {
+    // Moved out of the sidebar: the model is a property of the message about
+    // to be sent, so it belongs beside Send rather than in the navigation.
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto(stub.baseURL);
-    await expect(page.locator('aside').getByRole('button', { name: /qwen3-4b/ })).toBeVisible();
+
+    await expect(page.getByRole('button', { name: /^Model: qwen3-4b/ })).toBeVisible();
+    await expect(page.locator('aside').getByRole('button', { name: /qwen3-4b/ })).toHaveCount(0);
   });
 });
 
 test.describe('attach mode', () => {
   test.use({ scenario: { canSwitch: false, model: null, engineState: 'stopped' } });
 
-  test('explains why the model cannot be changed, on screen', async ({ page, stub }) => {
+  test('offers no control that cannot deliver', async ({ page, stub }) => {
     // The dead end this fixes: a disabled chip whose only explanation was a
     // `title`, plus an empty state telling the user to go and press it. There
     // is no hover on a phone, so that tooltip never fired at all.
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto(stub.baseURL);
 
-    await expect(page.getByText(/does not own/)).toBeVisible();
-    // And there must be no control offering something it cannot deliver.
-    await expect(page.getByRole('button', { name: /Choose a model/ })).toHaveCount(0);
+    // The engine belongs to whoever started it, so the picker is inert text
+    // rather than a menu that would refuse every choice in it.
+    await expect(page.getByRole('button', { name: /^Model:/ })).toHaveCount(0);
   });
 
   test('does not send the user to a picker that cannot help', async ({ page, stub }) => {

@@ -14,7 +14,8 @@ export interface ChatBarProps {
   title: string;
   /** Null on a wide screen: the rail is already visible. */
   onOpenSidebar: (() => void) | null;
-  onNewChat(): void;
+  /** Null on the images surface, which has no conversations. */
+  onNewChat: (() => void) | null;
 }
 
 export function ChatBar({ title, onOpenSidebar, onNewChat }: ChatBarProps) {
@@ -43,7 +44,7 @@ export function ChatBar({ title, onOpenSidebar, onNewChat }: ChatBarProps) {
         {title}
       </h1>
 
-      {onOpenSidebar ? (
+      {onOpenSidebar && onNewChat ? (
         <Button
           variant="ghost"
           size="icon"

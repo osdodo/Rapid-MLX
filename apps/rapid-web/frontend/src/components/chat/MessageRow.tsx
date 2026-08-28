@@ -1,9 +1,9 @@
 import { memo, useRef, useState, useSyncExternalStore } from 'react';
-import { Check, ChevronLeft, ChevronRight, Copy, Pencil, RotateCw, Trash2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Pencil, RotateCw, Trash2 } from 'lucide-react';
 import { Markdown } from '@/components/chat/Markdown';
 import { parseMarkdown, tokensOf } from '@/markdown/lex';
 import { streamingStore } from '@/chat/StreamingStore';
-import { copyText } from '@/lib/clipboard';
+import { CopyButton } from '@/components/common/CopyButton';
 import { cn } from '@/lib/utils';
 import { formatDuration, formatTokensPerSecond } from '@/lib/format';
 import type { MessageNode } from '@/state/types';
@@ -30,7 +30,7 @@ export const MessageRow = memo(function MessageRow(props: MessageRowProps) {
   return <AssistantRow {...props} />;
 });
 
-function UserRow({ node, onEdit, onDelete, busy }: MessageRowProps) {
+function UserRow({ node, branch, onBranch, onEdit, onDelete, busy }: MessageRowProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(node.content);
 
@@ -73,6 +73,7 @@ function UserRow({ node, onEdit, onDelete, busy }: MessageRowProps) {
         {node.content}
       </div>
       <MessageActions>
+        <BranchSwitcher branch={branch} onBranch={onBranch} noun="version" busy={busy} />
         <CopyButton text={node.content} />
         <ActionButton
           label="Edit"
@@ -125,40 +126,7 @@ function AssistantRow({
         // edge — without it the row shrink-wraps the buttons and there is no
         // space to push into.
         <MessageActions className="w-full">
-          {branch && branch.total > 1 ? (
-            <span className="mr-1 inline-flex items-center gap-px">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="text-muted-foreground size-7 [&_svg:not([class*=size-])]:size-3.5"
-                // Bounded, not wrapping: the disabled state then matches what
-                // the control actually does at each end.
-                disabled={branch.index === 0 || busy}
-                onClick={() => onBranch(-1)}
-                aria-label="Previous version"
-                title="Previous version"
-              >
-                <ChevronLeft />
-              </Button>
-              <span
-                className="text-muted-foreground min-w-[26px] text-center font-mono text-[11px]"
-                aria-label={`Version ${branch.index + 1} of ${branch.total}`}
-              >
-                {branch.index + 1}/{branch.total}
-              </span>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="text-muted-foreground size-7 [&_svg:not([class*=size-])]:size-3.5"
-                disabled={branch.index === branch.total - 1 || busy}
-                onClick={() => onBranch(1)}
-                aria-label="Next version"
-                title="Next version"
-              >
-                <ChevronRight />
-              </Button>
-            </span>
-          ) : null}
+          <BranchSwitcher branch={branch} onBranch={onBranch} noun="response" busy={busy} />
           <CopyButton text={node.content} />
           <ActionButton label="Retry" icon={<RotateCw />} onClick={onRetry} disabled={busy} />
           <ActionButton label="Delete" icon={<Trash2 />} onClick={onDelete} disabled={busy} />
@@ -166,6 +134,65 @@ function AssistantRow({
         </MessageActions>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The `‹ 2/3 ›` control, shared by both roles.
+ *
+ * On a user row the alternatives are edits of the prompt, on an assistant row
+ * they are retries of the answer — so the noun differs, but nothing else does.
+ * Rendered only when there IS an alternative: a permanent `1/1` with two dead
+ * arrows on every row is noise, and the control appearing is itself the signal
+ * that the previous version is still reachable.
+ */
+function BranchSwitcher({
+  branch,
+  onBranch,
+  noun,
+  busy,
+}: {
+  branch: MessageRowProps['branch'];
+  onBranch: MessageRowProps['onBranch'];
+  noun: 'version' | 'response';
+  busy: boolean;
+}) {
+  if (!branch || branch.total <= 1) return null;
+  const Noun = noun === 'version' ? 'Version' : 'Response';
+
+  return (
+    <span className="mr-1 inline-flex items-center gap-px">
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground size-7 [&_svg:not([class*=size-])]:size-3.5"
+        // Bounded, not wrapping: the disabled state then matches what
+        // the control actually does at each end.
+        disabled={branch.index === 0 || busy}
+        onClick={() => onBranch(-1)}
+        aria-label={`Previous ${noun}`}
+        title={`Previous ${noun}`}
+      >
+        <ChevronLeft />
+      </Button>
+      <span
+        className="text-muted-foreground min-w-[26px] text-center font-mono text-[11px]"
+        aria-label={`${Noun} ${branch.index + 1} of ${branch.total}`}
+      >
+        {branch.index + 1}/{branch.total}
+      </span>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground size-7 [&_svg:not([class*=size-])]:size-3.5"
+        disabled={branch.index === branch.total - 1 || busy}
+        onClick={() => onBranch(1)}
+        aria-label={`Next ${noun}`}
+        title={`Next ${noun}`}
+      >
+        <ChevronRight />
+      </Button>
+    </span>
   );
 }
 
@@ -307,31 +334,6 @@ function ActionButton({
       title={label}
     >
       {icon}
-    </Button>
-  );
-}
-
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      className="text-muted-foreground size-7 [&_svg:not([class*=size-])]:size-3.5"
-      // The label changes with the state, so the announcement and the
-      // tooltip change with it too — that tick is the only feedback there is.
-      aria-label={copied ? 'Copied' : 'Copy'}
-      title={copied ? 'Copied' : 'Copy'}
-      onClick={() => {
-        void copyText(text).then((ok) => {
-          if (!ok) return;
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1200);
-        });
-      }}
-    >
-      {copied ? <Check className="text-success" /> : <Copy />}
     </Button>
   );
 }

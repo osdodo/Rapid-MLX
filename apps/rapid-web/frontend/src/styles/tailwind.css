@@ -108,6 +108,18 @@ button:not(:disabled) {
   }
 }
 
+/* The image HUD's indeterminate shuttle. Travels from fully outside the left
+   edge to fully outside the right, so it enters and leaves rather than
+   popping into existence at the edges. */
+@keyframes hud-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
 /*
   Markdown prose. These stay as CSS rather than utilities for two reasons:
   they target DESCENDANTS the JSX never names (table cells, and the .hljs-*

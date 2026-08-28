@@ -28,16 +28,27 @@ export interface Scenario {
   allowDownloads: boolean;
   engineState: EngineState;
   model: string | null;
+  /**
+   * Every alias the engine is holding, including `model`. Null falls back to
+   * just the primary. More than one models a hot load: a chat model and an
+   * image model usable at the same time.
+   */
+  resident: string[] | null;
   detail: string | null;
   models: Array<{
     alias: string;
     hf_path: string;
     size_bytes: number | null;
     cached: boolean;
+    kind: 'text' | 'image' | 'audio';
+    loadable: boolean;
     cached_bytes: number | null;
     tool_call_parser: string | null;
     reasoning_parser: string | null;
     is_text_only: boolean;
+    audio_kind: string | null;
+    family: string | null;
+    image_capability: 'generation' | 'editing' | 'both' | null;
   }>;
   /** SSE frames for the next chat turn, sent in order. */
   chatFrames: string[] | null;
@@ -45,6 +56,14 @@ export interface Scenario {
   chatFailure: { status: number; type: string; message: string } | null;
   /** Fail the next model load with this status and error type. */
   loadFailure: { status: number; type: string; message: string } | null;
+  /**
+   * Answer a load with `ready` instead of `starting`.
+   *
+   * The real route answers `starting` and settles minutes later, so `false`
+   * is the honest default. Specs that only care about what is serving
+   * AFTERWARDS set this to skip the loading window.
+   */
+  loadSettlesReady: boolean;
   /** Fail the next model removal with this status and error type. */
   removeFailure: { status: number; type: string; message: string } | null;
   /** Aliases the stub has been asked to delete, in order. */
@@ -59,8 +78,41 @@ export interface Scenario {
   } | null;
   /** How many times `/api/downloads/status` has been requested. */
   statusPolls: number;
+  /**
+   * Delay `/api/status`, so a spec sees the window between choosing a model
+   * and the first poll that describes it — which is exactly where "Start"
+   * used to be offered for a model that was already starting.
+   */
+  statusDelayMs: number;
   /** Delay between chat frames, so a spec can act mid-stream. */
   frameDelayMs: number;
+  /** Base64 PNG the next image render returns. Null renders nothing. */
+  imageResult: string | null;
+  /** What `/api/images/progress` reports. */
+  imageProgress: { running: boolean; step: number; total: number };
+  /** Delay before the image render answers, so a spec can act mid-render. */
+  imageDelayMs: number;
+  /** Every edit the stub has been asked for, in order. */
+  edits: Array<{ prompt: string; model: string | null }>;
+  /** Voices `/api/audio/voices` reports. Empty models a lane that has none. */
+  voices: string[];
+  /** Fail the next voices request with this status and error type. */
+  voicesFailure: { status: number; type: string; message: string } | null;
+  /** Text `/api/audio/transcriptions` returns. */
+  transcript: string;
+  /** What `/api/residency` reports. */
+  residency: {
+    memory_limit_bytes: number;
+    memory_used_bytes: number;
+    models: Array<{
+      id: string;
+      aliases: string[];
+      state: string;
+      pinned: boolean;
+      estimated_bytes: number;
+      measured_bytes: number | null;
+    }>;
+  };
 }
 
 const DEFAULT_SCENARIO: Scenario = {
@@ -71,6 +123,7 @@ const DEFAULT_SCENARIO: Scenario = {
   allowDownloads: true,
   engineState: 'ready',
   model: 'qwen3-4b',
+  resident: null,
   detail: null,
   models: [
     {
@@ -78,30 +131,137 @@ const DEFAULT_SCENARIO: Scenario = {
       hf_path: 'org/qwen3-4b',
       size_bytes: 2_400_000_000,
       cached: true,
+      kind: 'text',
+      loadable: true,
       cached_bytes: 2_400_000_000,
       tool_call_parser: null,
       reasoning_parser: null,
       is_text_only: true,
+      audio_kind: null,
+      family: null,
+      image_capability: null,
     },
     {
       alias: 'llama-8b',
       hf_path: 'org/llama-8b',
       size_bytes: 8_200_000_000,
       cached: false,
+      kind: 'text',
+      loadable: true,
       cached_bytes: null,
       tool_call_parser: 'llama3',
       reasoning_parser: null,
       is_text_only: true,
+      audio_kind: null,
+      family: null,
+      image_capability: null,
+    },
+    {
+      alias: 'flux2-klein-4b',
+      hf_path: 'org/flux2-klein-4b',
+      size_bytes: 4_600_000_000,
+      cached: true,
+      kind: 'image',
+      loadable: true,
+      cached_bytes: 4_600_000_000,
+      tool_call_parser: null,
+      reasoning_parser: null,
+      is_text_only: false,
+      audio_kind: null,
+      family: null,
+      image_capability: 'both',
+    },
+    {
+      alias: 'whisper-large-v3',
+      hf_path: 'org/whisper-large-v3',
+      size_bytes: null,
+      cached: false,
+      kind: 'audio',
+      // `serve <audio-alias>` boots in audio mode, so audio IS loadable —
+      // it is just the last resort, since the lane rides on whatever is
+      // already serving.
+      loadable: true,
+      cached_bytes: null,
+      tool_call_parser: null,
+      reasoning_parser: null,
+      is_text_only: false,
+      audio_kind: 'stt',
+      family: 'whisper',
+      image_capability: null,
+    },
+    {
+      alias: 'whisper-large-v3-turbo',
+      hf_path: 'org/whisper-large-v3-turbo',
+      size_bytes: null,
+      cached: true,
+      kind: 'audio',
+      loadable: true,
+      cached_bytes: 1_600_000_000,
+      tool_call_parser: null,
+      reasoning_parser: null,
+      is_text_only: false,
+      audio_kind: 'stt',
+      family: 'whisper',
+      image_capability: null,
+    },
+    {
+      alias: 'kokoro',
+      hf_path: 'org/Kokoro-82M-bf16',
+      size_bytes: null,
+      cached: true,
+      kind: 'audio',
+      loadable: true,
+      cached_bytes: 330_000_000,
+      tool_call_parser: null,
+      reasoning_parser: null,
+      is_text_only: false,
+      audio_kind: 'tts',
+      family: 'kokoro',
+      image_capability: null,
     },
   ],
   chatFrames: null,
   chatFailure: null,
   loadFailure: null,
+  loadSettlesReady: false,
   removeFailure: null,
   removed: [],
   download: null,
   statusPolls: 0,
+  statusDelayMs: 0,
   frameDelayMs: 10,
+  // A 1x1 transparent PNG: the specs assert the image is displayed and
+  // saveable, not what it depicts.
+  imageResult:
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  imageProgress: { running: false, step: 0, total: 0 },
+  imageDelayMs: 0,
+  edits: [],
+  voices: ['af_heart', 'am_adam', 'bf_emma'],
+  voicesFailure: null,
+  transcript: 'this is a transcription',
+  residency: {
+    memory_limit_bytes: 25 * 1024 ** 3,
+    memory_used_bytes: 9_750_000_000,
+    models: [
+      {
+        id: 'org/qwen3-4b',
+        aliases: ['qwen3-4b'],
+        state: 'resident',
+        pinned: true,
+        estimated_bytes: 6_340_000_000,
+        measured_bytes: 5_900_000_000,
+      },
+      {
+        id: 'org/bonsai-1.7b-2bit',
+        aliases: ['bonsai-1.7b-2bit'],
+        state: 'resident',
+        pinned: false,
+        estimated_bytes: 3_410_000_000,
+        measured_bytes: null,
+      },
+    ],
+  },
 };
 
 function chatFrame(content: string): string {
@@ -148,7 +308,12 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     ...DEFAULT_SCENARIO,
     removed: [],
     statusPolls: 0,
+    edits: [],
     models: DEFAULT_SCENARIO.models.map((model) => ({ ...model })),
+    residency: {
+      ...DEFAULT_SCENARIO.residency,
+      models: DEFAULT_SCENARIO.residency.models.map((model) => ({ ...model })),
+    },
     ...overrides,
   };
 
@@ -172,7 +337,8 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     response.setHeader(
       'Content-Security-Policy',
       "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
-        "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
+        "connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; " +
+        "frame-ancestors 'none'; base-uri 'none'",
     );
 
     if (path === '/') {
@@ -227,12 +393,18 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     }
 
     if (path === '/api/status') {
+      if (scenario.statusDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.statusDelayMs));
+      }
       json(response, 200, {
         state: scenario.engineState,
         model: scenario.model,
         port: 8000,
         detail: scenario.detail,
         can_switch: scenario.canSwitch,
+        // Defaults to just the primary, so a scenario that says nothing
+        // about residency behaves exactly as it did before hot loading.
+        resident: scenario.resident ?? (scenario.model ? [scenario.model] : []),
       });
       return;
     }
@@ -249,13 +421,25 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     }
 
     if (path === '/api/models/load') {
-      await readBody(request);
+      const body = JSON.parse((await readBody(request)) || '{}') as { model?: string };
       if (scenario.loadFailure) {
         const { status, type, message } = scenario.loadFailure;
         apiError(response, status, type, message);
         return;
       }
-      json(response, 200, { ok: true, model: scenario.model, state: 'ready' });
+      // Adopt the requested alias, as the real route does: the page reads
+      // the response to decide what is now serving, so echoing a stale
+      // `scenario.model` makes a successful switch look like a no-op.
+      if (body.model) scenario.model = body.model;
+      // `starting`, matching the real route: a load is minutes of work and
+      // answers immediately, detached. Answering `ready` here made every
+      // switch instantaneous and hid the whole loading window from the specs.
+      scenario.engineState = scenario.loadSettlesReady ? 'ready' : 'starting';
+      json(response, 200, {
+        ok: true,
+        model: scenario.model,
+        state: scenario.engineState,
+      });
       return;
     }
 
@@ -300,6 +484,91 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       // reaches a terminal state.
       scenario.statusPolls += 1;
       json(response, 200, scenario.download ?? { state: 'idle' });
+      return;
+    }
+
+    if (path === '/api/images/progress') {
+      json(response, 200, scenario.imageProgress);
+      return;
+    }
+
+    if (path === '/api/residency') {
+      json(response, 200, scenario.residency);
+      return;
+    }
+
+    if (path === '/api/images/cancel') {
+      await readBody(request);
+      scenario.imageProgress = { running: false, step: 0, total: 0 };
+      json(response, 200, { ok: true });
+      return;
+    }
+
+    if (path === '/v1/images/generations') {
+      await readBody(request);
+      if (scenario.imageDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.imageDelayMs));
+      }
+      json(response, 200, {
+        created: 1,
+        data: scenario.imageResult ? [{ b64_json: scenario.imageResult }] : [],
+        cancelled: false,
+      });
+      return;
+    }
+
+    if (path === '/api/images/edits') {
+      const body = JSON.parse((await readBody(request)) || '{}') as {
+        prompt?: string;
+        image?: string;
+        model?: string;
+      };
+      scenario.edits.push({ prompt: body.prompt ?? '', model: body.model ?? null });
+      if (scenario.imageDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.imageDelayMs));
+      }
+      json(response, 200, {
+        created: 1,
+        data: scenario.imageResult ? [{ b64_json: scenario.imageResult }] : [],
+        cancelled: false,
+      });
+      return;
+    }
+
+    if (path === '/api/audio/voices') {
+      if (scenario.voicesFailure) {
+        const { status, type, message } = scenario.voicesFailure;
+        apiError(response, status, type, message);
+        return;
+      }
+      json(response, 200, { voices: scenario.voices });
+      return;
+    }
+
+    if (path === '/api/audio/speech') {
+      await readBody(request);
+      // A minimal but REAL RIFF/WAVE header: the page hands this to an
+      // <audio> element, and bytes that are not a container make WebKit
+      // fire `error` rather than render a player.
+      const header = Buffer.from(
+        'UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=',
+        'base64',
+      );
+      response.writeHead(200, {
+        'Content-Type': 'audio/wav',
+        'Content-Length': header.length,
+      });
+      response.end(header);
+      return;
+    }
+
+    if (path === '/api/audio/transcriptions') {
+      await readBody(request);
+      json(response, 200, {
+        text: scenario.transcript,
+        language: 'en',
+        duration: 1.5,
+      });
       return;
     }
 
@@ -353,6 +622,52 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       await new Promise<void>((done) => server.close(() => done()));
     },
   };
+}
+
+export type StubModel = Scenario['models'][number];
+
+/**
+ * A model row with the boilerplate filled in.
+ *
+ * Specs care about one or two fields each; spelling out all twelve every time
+ * is how a new field ends up missing from half of them.
+ */
+export function stubModel(overrides: Partial<StubModel> & { alias: string }): StubModel {
+  return {
+    hf_path: `org/${overrides.alias}`,
+    size_bytes: 1_000_000_000,
+    cached: false,
+    kind: 'text',
+    loadable: true,
+    cached_bytes: null,
+    tool_call_parser: null,
+    reasoning_parser: null,
+    is_text_only: true,
+    audio_kind: null,
+    family: null,
+    // Null for the default (text) kind; an image row must set it explicitly,
+    // since it decides which request shapes the surface offers.
+    image_capability: null,
+    ...overrides,
+  };
+}
+
+/**
+ * Open the model list.
+ *
+ * It lives in the Settings window's Models panel, reached from the sidebar
+ * footer — the sidebar's old "Choose a model" row is gone, since the picker
+ * now sits in the composer. Centralised because a dozen specs need it and the
+ * route has already moved twice.
+ */
+export async function openModelList(page: import('@playwright/test').Page) {
+  const drawerToggle = page.getByLabel('Open sidebar');
+  if (await drawerToggle.isVisible()) await drawerToggle.click();
+  await page.getByRole('button', { name: 'Settings' }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Settings' });
+  await dialog.getByRole('button', { name: 'Models' }).click();
+  return dialog;
 }
 
 export { chatFrame, usageFrame };
