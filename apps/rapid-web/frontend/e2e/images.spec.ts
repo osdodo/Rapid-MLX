@@ -211,7 +211,7 @@ test.describe('with an image model loaded', () => {
       engineState: 'ready',
       model: 'flux2-klein-4b',
       imageDelayMs: 4000,
-      imageProgress: { running: true, step: 3, total: 8 },
+      imageProgress: { step: 3, total: 8 },
     });
     try {
       await openImages(page, stub.baseURL);
@@ -234,6 +234,41 @@ test.describe('with an image model loaded', () => {
       // Stopping returns the surface immediately rather than waiting out the
       // render it just cancelled.
       await expect(page.getByRole('button', { name: 'Generate' })).toBeVisible();
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test('the request that starts a render is not held open for it', async ({ page }) => {
+    // The reason renders are jobs. The engine answers only once the whole
+    // image is finished, so relaying inline left a connection with no bytes
+    // flowing for minutes — Cloudflare cuts that at 100 s and returns 524.
+    // A ~20 s generation survived the tunnel and a slower edit never did.
+    const stub = await startStub({
+      engineState: 'ready',
+      model: 'flux2-klein-4b',
+      imageDelayMs: 4000,
+      imageProgress: { step: 2, total: 8 },
+    });
+    try {
+      let startMs = 0;
+      await page.route('**/api/images/jobs', async (route) => {
+        const began = Date.now();
+        await route.continue();
+        startMs = Date.now() - began;
+      });
+
+      await openImages(page, stub.baseURL);
+      await page.getByLabel('Prompt').fill('slow render');
+      await page.getByRole('button', { name: 'Generate' }).click();
+
+      // Progress proves the render is genuinely still going while the POST
+      // that started it has already come back.
+      await expect(page.getByText('2 / 8')).toBeVisible();
+      expect(startMs).toBeLessThan(1000);
+
+      // And the result still arrives, over the poll rather than that request.
+      await expect(page.getByAltText('slow render')).toBeVisible({ timeout: 15000 });
     } finally {
       await stub.close();
     }

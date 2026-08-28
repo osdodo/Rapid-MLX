@@ -6,7 +6,7 @@ keeps the external port fixed: switching models has no hot-swap path — a
 different model is a different process — so a page pointed straight at
 the engine would break on every switch. The child also gets an ephemeral
 port picked here, so this can run alongside an existing ``rapid-mlx
-serve`` or the desktop app.
+serve``.
 
 The child is driven as a subprocess of the CLI, never by importing
 ``vllm_mlx``: the contract is the documented command line, which is what
@@ -21,6 +21,7 @@ import os
 import shutil
 import signal
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -31,17 +32,14 @@ import httpx
 # the large models people most want to run.
 DEFAULT_READY_TIMEOUT_S = 900.0
 
-# Evict an idle unpinned secondary model after half an hour, matching the
-# Mac app's spawn flags.
+# Evict an idle unpinned secondary model after half an hour.
 _RESIDENT_IDLE_TTL_S = 1800
 
 
 def resident_memory_ceiling_gb() -> int:
     """The engine's resident-model ceiling, in GiB.
 
-    80% of physical RAM, floored, with a 4 GiB minimum — the same rule as
-    ``ModelSizing.residentMemoryCeilingGB`` in the Mac app, so the two
-    surfaces do not disagree about how much of this machine is usable.
+    80% of physical RAM, floored, with a 4 GiB minimum.
 
     Passed on every spawn because the engine's default is 0, which disables
     the ceiling entirely: ``/v1/models/residency`` then reports a limit of
@@ -207,11 +205,17 @@ class EngineSupervisor:
         api_key: str,
         serve_args: list[str] | None = None,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
+        mcp_config_path: Callable[[], str | None] | None = None,
     ) -> None:
         self._binary = binary
         self._api_key = api_key
         self._serve_args = list(serve_args or [])
         self._ready_timeout_s = ready_timeout_s
+        # A callable, not a path: ``--mcp-config`` is read once at spawn, so
+        # the value that matters is the one true at the MOMENT of the spawn.
+        # A snapshot taken at construction would arm connectors the user
+        # switched off half an hour ago, and miss ones they just added.
+        self._mcp_config_path = mcp_config_path or (lambda: None)
 
         self._process: asyncio.subprocess.Process | None = None
         self._model: str | None = None
@@ -378,8 +382,7 @@ class EngineSupervisor:
             # primary model in the same process. The gate short-circuits on
             # this flag before it looks at the model, so a text server gets
             # the lane too — and the STT/TTS engines stay lazy, loading only
-            # on the first audio request. Same reasoning as the Mac app,
-            # which passes it unconditionally (ServerManager.swift).
+            # on the first audio request, so the flag costs nothing until used.
             "--enable-audio",
             # Without a ceiling the engine's residency snapshot reports a
             # limit of 0, and the memory panel has nothing to measure
@@ -388,7 +391,17 @@ class EngineSupervisor:
             str(resident_memory_ceiling_gb()),
             "--resident-model-idle-ttl",
             str(_RESIDENT_IDLE_TTL_S),
-        ] + self._serve_args
+        ]
+
+        # Connectors are armed at spawn or not at all: the engine reads this
+        # file once and builds its MCP subsystem from it. That is why turning
+        # the master switch on cannot take effect on a running child, and why
+        # the page offers a Restart rather than pretending it can.
+        mcp_config = self._mcp_config_path()
+        if mcp_config:
+            argv += ["--mcp-config", mcp_config]
+
+        argv += self._serve_args
 
         env = dict(os.environ)
         # The bearer travels by environment, not argv: on macOS `ps -axww`

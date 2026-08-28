@@ -13,6 +13,8 @@ import base64
 import contextlib
 import json
 import re
+import threading
+import time
 
 import httpx
 import pytest
@@ -157,6 +159,17 @@ def build_client(
         **config_kwargs,
     )
     return TestClient(create_app(config))
+
+
+def _await_job(client, job_id, timeout=10.0):
+    """Poll a render to a terminal state, exactly as the page does."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/images/jobs/{job_id}", headers=AUTH).json()
+        if body["state"] != "running":
+            return body
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} never finished")
 
 
 class TestAuthGate:
@@ -409,15 +422,167 @@ class TestProxyForwarding:
         assert TOKEN not in json.dumps(dict(captured["headers"]))
         assert captured["url"].endswith("/v1/chat/completions")
 
-
-class TestImageGeneration:
-    def test_generation_is_relayed_with_the_engine_key(self, monkeypatch):
+    def test_a_tools_array_reaches_the_engine_untouched(self, monkeypatch):
+        """The chat route is a pass-through, so tool calling needs no
+        server-side translation — this is what pins that."""
         captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "hi"}}]},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        tools_payload = [
+            {
+                "type": "function",
+                "function": {"name": "weather", "description": "d", "parameters": {}},
+            }
+        ]
+        with build_client() as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": tools_payload,
+                    "tool_choice": "auto",
+                },
+            )
+
+        assert captured["json"]["tools"] == tools_payload
+        assert captured["json"]["tool_choice"] == "auto"
+
+    def test_a_tool_result_turn_reaches_the_engine(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "hi"}}]},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        messages = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "18C", "tool_call_id": "call_1"},
+        ]
+        with build_client() as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={**AUTH, **JSON_CT},
+                json={"messages": messages},
+            )
+
+        assert captured["json"]["messages"] == messages
+
+
+class TestToolRoutes:
+    def test_lists_the_tools_and_which_need_approval(self):
+        with build_client() as client:
+            response = client.get("/api/tools", headers=AUTH)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert {t["function"]["name"] for t in body["tools"]} == {
+            "weather",
+            "web_search",
+            "browse",
+        }
+        assert body["approval_required"] == ["browse"]
+
+    def test_refuses_a_call_for_a_tool_that_was_not_advertised(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/tools/call",
+                headers={**AUTH, **JSON_CT},
+                json={"name": "browse", "arguments": "{}", "advertised": ["weather"]},
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_error"]
+        assert "isn't available" in body["content"]
+
+    def test_refuses_browsing_a_loopback_address(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/tools/call",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "name": "browse",
+                    "arguments": '{"url": "http://127.0.0.1:8080/admin"}',
+                    "advertised": ["browse"],
+                    "approved_origins": ["http://127.0.0.1:8080"],
+                },
+            )
+
+        body = response.json()
+        assert body["is_error"]
+        assert "private/loopback" in body["content"]
+
+    def test_rejects_a_body_missing_the_advertised_list(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/tools/call",
+                headers={**AUTH, **JSON_CT},
+                json={"name": "weather", "arguments": "{}"},
+            )
+
+        assert response.status_code == 400
+
+    def test_rejects_non_string_arguments(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/tools/call",
+                headers={**AUTH, **JSON_CT},
+                json={"name": "weather", "arguments": {}, "advertised": ["weather"]},
+            )
+
+        assert response.status_code == 400
+
+    def test_requires_the_bearer(self):
+        with build_client() as client:
+            assert client.get("/api/tools").status_code == 401
+
+
+class TestImageJobs:
+    """Renders run as jobs, not as the request that asked for them.
+
+    The engine answers only once the whole image is finished, so relaying
+    it inline held a connection open with no bytes flowing for minutes and
+    Cloudflare cut it at 100 s with a 524. The POST starts a job and the
+    page polls for the result.
+    """
+
+    def test_a_generation_starts_a_job_and_answers_immediately(self, monkeypatch):
+        captured = {}
+        release = threading.Event()
 
         async def fake_post(self, url, **kwargs):
             captured["url"] = url
             captured["headers"] = kwargs.get("headers", {})
             captured["json"] = kwargs.get("json")
+            # Held so the POST provably answers before the render does.
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
             return httpx.Response(
                 200,
                 json={"created": 1, "data": [{"b64_json": "aGk="}], "cancelled": False},
@@ -427,29 +592,293 @@ class TestImageGeneration:
         monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
         with build_client() as client:
-            response = client.post(
-                "/v1/images/generations",
+            started = client.post(
+                "/api/images/jobs",
                 headers={**AUTH, **JSON_CT},
-                json={"prompt": "a cat", "size": "512x512"},
+                json={"prompt": "a cat", "size": "512x512", "model": "flux2-klein-4b"},
             )
+            assert started.status_code == 200
+            job = started.json()
+            assert job["state"] == "running"
+            assert job["b64_json"] is None
 
-        assert response.status_code == 200
-        assert response.json()["data"][0]["b64_json"] == "aGk="
+            release.set()
+            body = _await_job(client, job["id"])
+
+        assert body["state"] == "done"
+        assert body["b64_json"] == "aGk="
         assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
         assert captured["url"].endswith("/v1/images/generations")
+        assert captured["json"]["prompt"] == "a cat"
+        assert captured["json"]["size"] == "512x512"
+        assert captured["json"]["model"] == "flux2-klein-4b"
+
+    def test_an_edit_is_rebuilt_as_multipart(self, monkeypatch):
+        captured = {}
+
+        async def fake_post(self, url, **kwargs):
+            captured["url"] = url
+            captured["files"] = kwargs.get("files")
+            captured["data"] = kwargs.get("data")
+            captured["headers"] = kwargs.get("headers", {})
+            return httpx.Response(
+                200,
+                json={"created": 1, "data": [{"b64_json": "aGk="}], "cancelled": False},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            started = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={
+                    "mode": "edit",
+                    "image": base64.b64encode(b"\x89PNGfake").decode(),
+                    "prompt": "make it night",
+                    "model": "flux2-klein-4b",
+                },
+            )
+            assert started.status_code == 200
+            body = _await_job(client, started.json()["id"])
+
+        assert body["b64_json"] == "aGk="
+        assert captured["url"].endswith("/v1/images/edits")
+        # The engine's field is `image`, not the `file` transcription uses.
+        assert captured["files"]["image"][1] == b"\x89PNGfake"
+        assert captured["data"]["prompt"] == "make it night"
+        assert captured["data"]["model"] == "flux2-klein-4b"
+        # `size` is deliberately absent: the edit backends derive their canvas
+        # from the input image, and the engine discards it anyway.
+        assert "size" not in captured["data"]
+        # No Content-Type of our own, or httpx cannot set the boundary.
+        assert "Content-Type" not in captured["headers"]
+        assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
+
+    def test_a_running_job_reports_the_engines_denoise_counter(self, monkeypatch):
+        """One poll carries both progress and the result.
+
+        A render therefore occupies a single connection: the separate
+        progress feed it replaced was a second one held open beside it.
+        """
+        release = threading.Event()
+
+        async def fake_post(self, url, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            return httpx.Response(
+                200, json={"data": []}, request=httpx.Request("POST", url)
+            )
+
+        async def fake_get(self, url, **kwargs):
+            return httpx.Response(
+                200,
+                json={"running": True, "step": 3, "total": 8},
+                request=httpx.Request("GET", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            job_id = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat", "model": "flux2-klein-4b"},
+            ).json()["id"]
+
+            body = client.get(f"/api/images/jobs/{job_id}", headers=AUTH).json()
+            assert body["state"] == "running"
+            assert (body["step"], body["total"]) == (3, 8)
+
+            release.set()
+            _await_job(client, job_id)
+
+    def test_a_dropped_progress_read_is_not_a_render_failure(self, monkeypatch):
+        release = threading.Event()
+
+        async def fake_post(self, url, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            return httpx.Response(
+                200, json={"data": []}, request=httpx.Request("POST", url)
+            )
+
+        async def fake_get(self, url, **kwargs):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        with build_client() as client:
+            job_id = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+            ).json()["id"]
+
+            body = client.get(f"/api/images/jobs/{job_id}", headers=AUTH).json()
+            # Still running, with no steps yet — the job's own state is what
+            # reports a failure, not the progress read.
+            assert body["state"] == "running"
+            assert (body["step"], body["total"]) == (0, 0)
+
+            release.set()
+            _await_job(client, job_id)
+
+    def test_an_engine_error_lands_on_the_job_not_the_start(self, monkeypatch):
+        async def fake_post(self, url, **kwargs):
+            return httpx.Response(
+                409,
+                json={"error": {"message": "no image model", "type": "image_model_not_loaded"}},
+                request=httpx.Request("POST", url),
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            started = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+            )
+            # The start succeeded; the render is what failed.
+            assert started.status_code == 200
+            body = _await_job(client, started.json()["id"])
+
+        assert body["state"] == "failed"
+        assert body["error"]["type"] == "image_model_not_loaded"
+        assert body["error"]["status"] == 409
+
+    def test_a_transport_failure_lands_on_the_job(self, monkeypatch):
+        async def fake_post(self, url, **kwargs):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            started = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+            )
+            body = _await_job(client, started.json()["id"])
+
+        assert body["state"] == "failed"
+        assert body["error"]["type"] == "engine_transport"
+
+    def test_an_unknown_job_is_404(self):
+        with build_client() as client:
+            response = client.get("/api/images/jobs/nope", headers=AUTH)
+        # Only the last job is kept. Reporting a vanished one as idle would
+        # leave the page waiting on it forever.
+        assert response.status_code == 404
+        assert response.json()["error"]["type"] == "unknown_image_job"
+
+    def test_a_second_render_is_refused_while_one_runs(self, monkeypatch):
+        release = threading.Event()
+
+        async def fake_post(self, url, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            return httpx.Response(
+                200, json={"data": []}, request=httpx.Request("POST", url)
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        with build_client() as client:
+            first = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+            )
+            second = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a dog"}
+            )
+            assert second.status_code == 409
+            assert second.json()["error"]["type"] == "image_busy"
+
+            release.set()
+            _await_job(client, first.json()["id"])
+
+    def test_a_switch_is_refused_from_the_instant_a_job_starts(self, monkeypatch):
+        """The count must be taken before the job's task is scheduled.
+
+        A task does not run until the next tick, and the POST's own response
+        is what frees the loop to service the next request — so counting
+        inside the task let a load arriving immediately after slip through
+        and restart the engine under the render.
+        """
+        release = threading.Event()
+
+        async def fake_post(self, url, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            return httpx.Response(
+                200, json={"data": []}, request=httpx.Request("POST", url)
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        engine = FakeEngine()
+        with build_client(engine) as client:
+            job_id = client.post(
+                "/api/images/jobs", headers={**AUTH, **JSON_CT}, json={"prompt": "a cat"}
+            ).json()["id"]
+
+            blocked = client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "bonsai-1.7b-2bit"},
+            )
+            assert blocked.status_code == 409
+            assert blocked.json()["error"]["type"] == "busy_streaming"
+            assert engine.started == []
+
+            release.set()
+            _await_job(client, job_id)
+
+    def test_an_empty_prompt_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"mode": "edit", "image": base64.b64encode(b"x").decode(), "prompt": "  "},
+            )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_body"
+
+    def test_a_non_base64_image_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"mode": "edit", "image": "not base64!!", "prompt": "make it night"},
+            )
+        assert response.status_code == 400
+
+    def test_an_oversize_image_is_refused_here(self):
+        oversize = base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()
+        with build_client() as client:
+            response = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"mode": "edit", "image": oversize, "prompt": "make it night"},
+            )
+        # Refused before the relay rather than after another hop.
+        assert response.status_code == 413
+
+    def test_starting_before_a_model_is_loaded_is_503(self):
+        engine = FakeEngine(state=ChildState.STARTING)
+        with build_client(engine) as client:
+            response = client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
+            )
+        assert response.status_code == 503
+        assert response.json()["error"]["type"] == "engine_unavailable"
 
     @pytest.mark.asyncio
-    async def test_generation_counts_as_a_stream_so_a_switch_is_refused(
-        self, monkeypatch
-    ):
+    async def test_a_job_counts_as_a_stream_so_a_switch_is_refused(self, monkeypatch):
         """A render is minutes of GPU work with no resume.
 
         Switching restarts the engine, so a load arriving mid-render must
-        refuse exactly as it does mid-chat. Patched at ``proxy_unary``
-        rather than on ``httpx.AsyncClient`` — the async test client is
-        itself an ``AsyncClient``, so patching the class would replace
-        the test's own transport. Same reasoning as
-        ``TestSwitchBlockedByActiveStream``.
+        refuse exactly as it does mid-chat — and now for the JOB's whole
+        life, not just while a request is being relayed. Patched at
+        ``proxy_unary`` rather than on ``httpx.AsyncClient``: the async
+        test client is itself an ``AsyncClient``, so patching the class
+        would replace the test's own transport.
         """
         release = asyncio.Event()
         started = asyncio.Event()
@@ -473,12 +902,10 @@ class TestImageGeneration:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            render = asyncio.create_task(
-                client.post(
-                    "/v1/images/generations",
-                    headers={**AUTH, **JSON_CT},
-                    json={"prompt": "a cat"},
-                )
+            await client.post(
+                "/api/images/jobs",
+                headers={**AUTH, **JSON_CT},
+                json={"prompt": "a cat"},
             )
             await asyncio.wait_for(started.wait(), timeout=10)
 
@@ -493,62 +920,8 @@ class TestImageGeneration:
             assert engine.started == []
 
             release.set()
-            await render
 
         await app.state.http.aclose()
-
-    def test_generation_before_a_model_is_loaded_is_503(self):
-        engine = FakeEngine(state=ChildState.STARTING)
-        with build_client(engine) as client:
-            response = client.post(
-                "/v1/images/generations",
-                headers={**AUTH, **JSON_CT},
-                json={"prompt": "a cat"},
-            )
-        assert response.status_code == 503
-        assert response.json()["error"]["type"] == "engine_unavailable"
-
-    def test_progress_is_relayed(self, monkeypatch):
-        async def fake_get(self, url, **kwargs):
-            return httpx.Response(
-                200,
-                json={"running": True, "step": 3, "total": 8, "elapsed_ms": 900},
-                request=httpx.Request("GET", url),
-            )
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-
-        with build_client() as client:
-            body = client.get("/api/images/progress", headers=AUTH).json()
-
-        assert body == {"running": True, "step": 3, "total": 8, "elapsed_ms": 900}
-
-    def test_progress_reports_idle_rather_than_failing_when_unreachable(
-        self, monkeypatch
-    ):
-        """A dropped poll is not itself a render failure.
-
-        The poller's job is to report the render; surfacing a transport
-        error would put a red banner over a render that is still fine.
-        """
-
-        async def fake_get(self, url, **kwargs):
-            raise httpx.ConnectError("refused")
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-
-        with build_client() as client:
-            response = client.get("/api/images/progress", headers=AUTH)
-
-        assert response.status_code == 200
-        assert response.json()["running"] is False
-
-    def test_progress_with_no_engine_reports_idle(self):
-        engine = FakeEngine(state=ChildState.STOPPED)
-        with build_client(engine) as client:
-            body = client.get("/api/images/progress", headers=AUTH).json()
-
-        assert body["running"] is False
 
     def test_cancel_sends_the_model_in_the_query_string(self, monkeypatch):
         captured = {}
@@ -578,166 +951,13 @@ class TestImageGeneration:
 
     def test_image_routes_require_a_token(self):
         with build_client() as client:
-            assert client.get("/api/images/progress").status_code == 401
+            assert client.get("/api/images/jobs/anything").status_code == 401
             assert (
                 client.post(
-                    "/v1/images/generations", headers=JSON_CT, json={"prompt": "x"}
+                    "/api/images/jobs", headers=JSON_CT, json={"prompt": "x"}
                 ).status_code
                 == 401
             )
-            assert (
-                client.post(
-                    "/api/images/edits", headers=JSON_CT, json={"prompt": "x"}
-                ).status_code
-                == 401
-            )
-
-
-class TestImageEditing:
-    """Base64 in, multipart out — the same shape as transcription.
-
-    The middleware's CSRF control rejects the CORS-simple content types, and
-    ``multipart/form-data`` is one of them, so the browser's own multipart
-    cannot be relayed without a second, weaker policy for one route.
-    """
-
-    def test_an_edit_is_rebuilt_as_multipart(self, monkeypatch):
-        captured = {}
-
-        async def fake_post(self, url, **kwargs):
-            captured["url"] = url
-            captured["files"] = kwargs.get("files")
-            captured["data"] = kwargs.get("data")
-            captured["headers"] = kwargs.get("headers", {})
-            return httpx.Response(
-                200,
-                json={"created": 1, "data": [{"b64_json": "aGk="}], "cancelled": False},
-                request=httpx.Request("POST", url),
-            )
-
-        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-
-        with build_client() as client:
-            response = client.post(
-                "/api/images/edits",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "image": base64.b64encode(b"\x89PNGfake").decode(),
-                    "prompt": "make it night",
-                    "model": "flux2-klein-4b",
-                },
-            )
-
-        assert response.status_code == 200
-        assert response.json()["data"][0]["b64_json"] == "aGk="
-        assert captured["url"].endswith("/v1/images/edits")
-        # The engine's field is `image`, not the `file` transcription uses.
-        assert captured["files"]["image"][1] == b"\x89PNGfake"
-        assert captured["data"]["prompt"] == "make it night"
-        assert captured["data"]["model"] == "flux2-klein-4b"
-        # `size` is deliberately absent: the edit backends derive their canvas
-        # from the input image, and the engine discards it anyway.
-        assert "size" not in captured["data"]
-        # No Content-Type of our own, or httpx cannot set the boundary.
-        assert "Content-Type" not in captured["headers"]
-        assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
-
-    def test_an_empty_prompt_is_refused(self):
-        with build_client() as client:
-            response = client.post(
-                "/api/images/edits",
-                headers={**AUTH, **JSON_CT},
-                json={"image": base64.b64encode(b"x").decode(), "prompt": "  "},
-            )
-        assert response.status_code == 400
-        assert response.json()["error"]["type"] == "invalid_body"
-
-    def test_a_non_base64_image_is_refused(self):
-        with build_client() as client:
-            response = client.post(
-                "/api/images/edits",
-                headers={**AUTH, **JSON_CT},
-                json={"image": "not base64!!", "prompt": "make it night"},
-            )
-        assert response.status_code == 400
-
-    def test_an_oversize_image_is_refused_here(self):
-        oversize = base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()
-        with build_client() as client:
-            response = client.post(
-                "/api/images/edits",
-                headers={**AUTH, **JSON_CT},
-                json={"image": oversize, "prompt": "make it night"},
-            )
-        # Refused before the relay rather than after another hop.
-        assert response.status_code == 413
-
-    def test_an_edit_before_a_model_is_loaded_is_503(self):
-        engine = FakeEngine(state=ChildState.STARTING)
-        with build_client(engine) as client:
-            response = client.post(
-                "/api/images/edits",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "image": base64.b64encode(b"x").decode(),
-                    "prompt": "make it night",
-                },
-            )
-        assert response.status_code == 503
-        assert response.json()["error"]["type"] == "engine_unavailable"
-
-    @pytest.mark.asyncio
-    async def test_an_edit_counts_as_a_stream_so_a_switch_is_refused(self, monkeypatch):
-        """An edit is minutes of GPU work with no resume, exactly like a
-        render, so a load arriving mid-edit must refuse rather than restart
-        the engine doing it."""
-        release = asyncio.Event()
-        started = asyncio.Event()
-
-        async def fake_multipart(client, **kwargs):
-            started.set()
-            await release.wait()
-            return httpx.Response(
-                200,
-                json={"data": []},
-                request=httpx.Request("POST", "http://engine.invalid"),
-            )
-
-        monkeypatch.setattr(app_module.proxy, "proxy_multipart", fake_multipart)
-
-        engine = FakeEngine()
-        app = create_app(WebConfig(token=TOKEN, engine=engine, catalog=FakeCatalog()))
-        app.state.http = httpx.AsyncClient()
-        app.state.boot = None
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            edit = asyncio.create_task(
-                client.post(
-                    "/api/images/edits",
-                    headers={**AUTH, **JSON_CT},
-                    json={
-                        "image": base64.b64encode(b"x").decode(),
-                        "prompt": "make it night",
-                    },
-                )
-            )
-            await asyncio.wait_for(started.wait(), timeout=10)
-
-            blocked = await client.post(
-                "/api/models/load",
-                headers={**AUTH, **JSON_CT},
-                json={"model": "bonsai-1.7b-2bit"},
-            )
-            assert blocked.status_code == 409
-            assert blocked.json()["error"]["type"] == "busy_streaming"
-            assert engine.started == []
-
-            release.set()
-            await edit
-
-        await app.state.http.aclose()
 
 
 class TestAudio:

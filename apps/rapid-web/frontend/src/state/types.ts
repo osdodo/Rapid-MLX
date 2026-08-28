@@ -6,7 +6,9 @@
  * conversations slice touches the nodes.
  */
 
-export type Role = 'system' | 'user' | 'assistant';
+import type { ToolCall } from '@/api/chat';
+
+export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
 export type MessageStatus = 'complete' | 'streaming' | 'failed';
 
@@ -44,6 +46,11 @@ export interface MessageNode {
   stats?: TurnStats;
   /** Which alias produced this answer. Lets a failure be attributed. */
   model?: string;
+  /** On an assistant node: the calls this turn asked for. Its `content` may
+   *  be empty — a tool-call-only turn is a real turn, not a blank one. */
+  toolCalls?: ToolCall[];
+  /** On a tool node: which call this result answers. */
+  toolCallId?: string;
 }
 
 export interface Conversation {
@@ -70,6 +77,12 @@ export interface Conversation {
   isPinned: boolean;
   isArchived: boolean;
   folderId: string | null;
+  /**
+   * This conversation's own system prompt. Travels with the history rather
+   * than living in settings, because it describes this chat and not the
+   * device. Wins over `Settings.system` where the two conflict.
+   */
+  customInstructions?: string;
 }
 
 export interface Folder {
@@ -92,6 +105,21 @@ export interface Settings {
    * probe at boot rather than left for the user to discover.
    */
   mathRendering: 'mathml' | 'source';
+  /**
+   * Which tools the model may call, by name. Absent from the set means off.
+   * Shipped tools default ON — a fresh install gets them without having to
+   * discover a switch first.
+   */
+  enabledTools: string[];
+  /**
+   * Approve every `browse` destination without asking.
+   *
+   * Off by default, and the default is the security model: the MODEL picks
+   * the URL, so the prompt is what stops a page fetch becoming a way to post
+   * the conversation to a host of its choosing. On is for unattended use.
+   * Private and local addresses stay blocked either way.
+   */
+  autoApproveBrowsing: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -101,10 +129,15 @@ export const DEFAULT_SETTINGS: Settings = {
   maxTokens: 2048,
   theme: 'auto',
   mathRendering: 'mathml',
+  enabledTools: ['web_search', 'browse', 'weather'],
+  autoApproveBrowsing: false,
 };
 
-/** The persisted envelope. v3 is the first shape to carry its own version. */
-export const SCHEMA_VERSION = 3;
+/**
+ * The persisted envelope. v4 adds the `tool` role and the tool envelope on a
+ * node; v3 is the first shape to carry its own version.
+ */
+export const SCHEMA_VERSION = 4;
 
 export interface PersistedStore {
   v: typeof SCHEMA_VERSION;

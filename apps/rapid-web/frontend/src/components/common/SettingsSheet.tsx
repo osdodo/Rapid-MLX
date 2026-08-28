@@ -1,7 +1,22 @@
-import { useState, type ReactNode } from 'react';
-import { HardDrive, MessageSquare, Palette } from 'lucide-react';
+import { useEffect, useState, type ReactNode } from 'react';
+import {
+  CloudSun,
+  Globe,
+  HardDrive,
+  MessageSquareText,
+  Palette,
+  Plug,
+  Search,
+  Server,
+  SlidersHorizontal,
+  Trash2,
+  Wrench,
+} from 'lucide-react';
 import { useStore } from '@/state/store';
 import type { Settings } from '@/state/types';
+import { loadTools } from '@/chat/tools';
+import { EffectiveSystemPrompt } from '@/components/chat/ConversationInstructions';
+import type { ToolDefinition } from '@/api/chat';
 import { SHEET_DESKTOP_SIZE } from './Sheet';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { X } from 'lucide-react';
@@ -10,22 +25,39 @@ import { Button } from '@/components/ui/button';
 import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
-import { Textarea } from '@/components/ui/textarea';
 import { Segmented } from './Segmented';
+import { Switch } from './Switch';
+import { InstructionEditor } from './InstructionEditor';
+import {
+  PageHeader,
+  PanelBody,
+  SettingsRow,
+  SettingsRowDivider,
+  SettingsSection,
+} from './SettingsSection';
+import { ConnectorsPanel } from '@/components/connectors/ConnectorsPanel';
 import { ModelManagement } from '@/components/models/ModelManagement';
 
 /**
  * The settings window: a category rail on the left, one panel on the right.
  *
- * Mirrors `rapid-mac`'s `SettingsView`, including the rule that makes the
- * layout hold together — the panel area is ONE scroll container whose content
- * is swapped, so switching category cannot make the window resize.
+ * The rule that makes it hold together: the panel area is ONE scroll
+ * container whose content is swapped, so switching category cannot make the
+ * window resize.
  *
- * Below `sm:` the rail becomes a horizontal strip above the panel: a 200px
+ * Below `sm:` the rail becomes a horizontal strip above the panel: a 184px
  * rail beside a phone-width panel leaves nothing for the panel.
  */
 
-export const CATEGORIES = ['models', 'chat', 'appearance'] as const;
+export const CATEGORIES = [
+  'models',
+  'instructions',
+  'chat',
+  'tools',
+  'connectors',
+  'appearance',
+  'app',
+] as const;
 export type SettingsCategory = (typeof CATEGORIES)[number];
 
 const CATEGORY_META: Record<
@@ -33,19 +65,21 @@ const CATEGORY_META: Record<
   { title: string; icon: ReactNode }
 > = {
   models: { title: 'Models', icon: <HardDrive /> },
-  chat: { title: 'Chat', icon: <MessageSquare /> },
+  instructions: { title: 'System Prompt', icon: <MessageSquareText /> },
+  chat: { title: 'Chat', icon: <SlidersHorizontal /> },
+  tools: { title: 'Tools', icon: <Wrench /> },
+  connectors: { title: 'Connectors', icon: <Plug /> },
   appearance: { title: 'Appearance', icon: <Palette /> },
+  app: { title: 'Engine', icon: <Server /> },
 };
 
 export function SettingsSheet({
   open,
   onClose,
-  engineInfo,
   initialCategory = 'models',
 }: {
   open: boolean;
   onClose(): void;
-  engineInfo: string;
   initialCategory?: SettingsCategory;
 }) {
   const [category, setCategory] = useState<SettingsCategory>(initialCategory);
@@ -95,13 +129,21 @@ export function SettingsSheet({
             {/* One scroll container per window, not per panel: a panel that
                 owns its own scroller re-anchors to the top on every switch
                 and loses the position of the one being returned to. */}
-            <div className="min-h-0 flex-1 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+            <div className="bg-muted/20 min-h-0 flex-1 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
               {category === 'models' ? (
                 <ModelManagement open={open} onClose={onClose} />
+              ) : category === 'instructions' ? (
+                <InstructionsPanel />
               ) : category === 'chat' ? (
                 <ChatPanel />
+              ) : category === 'tools' ? (
+                <ToolsPanel />
+              ) : category === 'connectors' ? (
+                <ConnectorsPanel />
+              ) : category === 'appearance' ? (
+                <AppearancePanel />
               ) : (
-                <AppearancePanel engineInfo={engineInfo} />
+                <EnginePanel />
               )}
             </div>
           </div>
@@ -135,11 +177,11 @@ function CategoryRail({
             // tablist/listbox role this deliberately does not claim.
             aria-current={selected ? 'page' : undefined}
             className={cn(
-              'flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors outline-none',
+              'flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors outline-none',
               'focus-visible:ring-ring/50 focus-visible:ring-[3px]',
               selected
-                ? 'bg-background text-foreground shadow-xs'
-                : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+                ? 'bg-background text-foreground font-semibold shadow-xs'
+                : 'text-muted-foreground hover:bg-accent hover:text-foreground font-medium',
               'sm:w-full',
             )}
             onClick={() => onChange(category)}
@@ -153,140 +195,388 @@ function CategoryRail({
   );
 }
 
+/**
+ * Mirrors `rapid-mac`'s Settings → System Prompt, including its one deviation
+ * from the house style: the instruction section draws NO grouped card,
+ * because the editor already defines its own surface and a box around a box
+ * adds weight without structure. Clear sits on the heading's trailing edge for
+ * the same reason it does there — an action on the section, not a control
+ * adrift in the whitespace beneath it.
+ *
+ * The GLOBAL layer only. A conversation's own prompt is a property of the
+ * chat, so it lives on the composer — see chat/ConversationInstructions.tsx.
+ */
+function InstructionsPanel() {
+  const system = useStore((state) => state.settings.system);
+  const update = useStore((state) => state.updateSettings);
+
+  return (
+    <PanelBody>
+      <PageHeader
+        title="System Prompt"
+        subtitle="Sent as a system message with every conversation. A conversation can add its own from the composer, which wins where the two conflict."
+      />
+      <SettingsSection
+        flat
+        title="Global default"
+        subtitle="Used by every conversation on this device. Stored only in this browser."
+        accessory={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="text-muted-foreground size-8"
+            disabled={system.trim() === ''}
+            onClick={() => update({ system: '' })}
+            aria-label="Clear system prompt"
+            title="Clear"
+          >
+            <Trash2 />
+          </Button>
+        }
+      >
+        <InstructionEditor
+          id="system"
+          label="System prompt"
+          className="min-h-44"
+          value={system}
+          onChange={(next) => update({ system: next })}
+          placeholder="For example: Answer concisely, use plain language, and include code examples when useful."
+        />
+      </SettingsSection>
+
+      <EffectiveSystemPrompt global={system} conversation="" />
+    </PanelBody>
+  );
+}
+
 function ChatPanel() {
   const settings = useStore((state) => state.settings);
   const update = useStore((state) => state.updateSettings);
 
   return (
     <PanelBody>
-      <Field
-        label="System prompt"
-        htmlFor="system"
-        hint="Prepended to every turn, in this browser only."
-        control={
-          <Textarea
-            id="system"
-            value={settings.system}
-            onChange={(event) => update({ system: event.target.value })}
-            placeholder="You are a helpful assistant."
-            rows={3}
-          />
-        }
+      <PageHeader
+        title="Chat"
+        subtitle="How replies are sampled. These shape what the model says, not how fast it says it."
       />
+      <SettingsSection title="Sampling">
+        <SliderField
+          id="temperature"
+          label="Temperature"
+          description="Lower is more deterministic; higher is more varied."
+          value={settings.temperature}
+          min={0}
+          max={2}
+          step={0.05}
+          format={(value) => value.toFixed(2)}
+          onChange={(temperature) => update({ temperature })}
+        />
 
-      <SliderField
-        id="temperature"
-        label="Temperature"
-        hint="Lower is more deterministic; higher is more varied."
-        value={settings.temperature}
-        min={0}
-        max={2}
-        step={0.05}
-        format={(value) => value.toFixed(2)}
-        onChange={(temperature) => update({ temperature })}
-      />
+        <SettingsRowDivider />
 
-      <SliderField
-        id="top-p"
-        label="Top P"
-        hint="Nucleus sampling cutoff."
-        value={settings.topP}
-        min={0.05}
-        max={1}
-        step={0.05}
-        format={(value) => value.toFixed(2)}
-        onChange={(topP) => update({ topP })}
-      />
+        <SliderField
+          id="top-p"
+          label="Top P"
+          description="Nucleus sampling cutoff."
+          value={settings.topP}
+          min={0.05}
+          max={1}
+          step={0.05}
+          format={(value) => value.toFixed(2)}
+          onChange={(topP) => update({ topP })}
+        />
 
-      <SliderField
-        id="max-tokens"
-        label="Max tokens"
-        hint="Upper bound on the length of a single reply."
-        value={settings.maxTokens}
-        min={256}
-        max={16384}
-        step={256}
-        format={(value) => String(value)}
-        onChange={(maxTokens) => update({ maxTokens })}
-      />
+        <SettingsRowDivider />
+
+        <SliderField
+          id="max-tokens"
+          label="Max tokens"
+          description="Upper bound on the length of a single reply."
+          value={settings.maxTokens}
+          min={256}
+          max={16384}
+          step={256}
+          format={(value) => String(value)}
+          onChange={(maxTokens) => update({ maxTokens })}
+        />
+      </SettingsSection>
     </PanelBody>
   );
 }
 
-function AppearancePanel({ engineInfo }: { engineInfo: string }) {
+/**
+ * Presentation for a tool's identity. The wire identifiers are what the
+ * request body, the enabled set and the dispatch gate all use; none of that
+ * is touched by anything here.
+ *
+ * A tool with no entry falls back to its own name and the engine-facing
+ * description, so one added on the server still shows something true.
+ */
+const TOOL_DISPLAY: Record<string, { title: string; summary: string; icon: ReactNode }> = {
+  web_search: {
+    title: 'Web Search',
+    summary: 'Looks up current information on the web when a question needs it.',
+    icon: <Search />,
+  },
+  browse: {
+    title: 'Browse Web Page',
+    summary: 'Opens a web page you or the model names and reads it. You approve each page.',
+    icon: <Globe />,
+  },
+  weather: {
+    title: 'Weather',
+    summary: 'Gets the current weather for a place you name.',
+    icon: <CloudSun />,
+  },
+};
+
+/**
+ * Settings → Tools.
+ *
+ * The row leads with a HUMAN name, not the wire identifier: `web_search` in a
+ * monospaced face is an implementation detail presented as a title, and the
+ * description under it is written FOR THE MODEL — it carries calling
+ * conventions and pagination offsets, so it reads as documentation rather
+ * than as a setting. It moves behind a disclosure, with the identifier beside
+ * it, because someone debugging a prompt needs both.
+ *
+ * The list itself comes from the server: it owns the tools, and a second copy
+ * here would drift.
+ */
+function ToolsPanel() {
+  const enabled = useStore((state) => state.settings.enabledTools);
+  const autoApprove = useStore((state) => state.settings.autoApproveBrowsing);
+  const update = useStore((state) => state.updateSettings);
+  const [tools, setTools] = useState<ToolDefinition[] | null>(null);
+  const [approvalRequired, setApprovalRequired] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    let live = true;
+    loadTools()
+      .then((catalogue) => {
+        if (!live) return;
+        setTools(catalogue.tools);
+        setApprovalRequired(catalogue.approvalRequired);
+      })
+      .catch(() => live && setTools([]));
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const toggle = (name: string, on: boolean) => {
+    const next = enabled.filter((item) => item !== name);
+    update({ enabledTools: on ? [...next, name] : next });
+  };
+
+  const gated = tools?.filter((tool) => approvalRequired.has(tool.function.name)) ?? [];
+
+  return (
+    <PanelBody>
+      <PageHeader
+        title="Tools"
+        subtitle="Tools the model can call during a chat. Turn one off and it is never offered — and never runs, even if the model asks for it by name."
+      />
+      {tools === null ? (
+        <p className="text-muted-foreground text-sm">Loading…</p>
+      ) : tools.length === 0 ? (
+        <p className="text-muted-foreground text-sm">This server exposes no tools.</p>
+      ) : (
+        <>
+          <SettingsSection title="Available tools">
+            {tools.map((tool, index) => (
+              <div key={tool.function.name}>
+                {index > 0 ? <SettingsRowDivider /> : null}
+                <ToolRow
+                  definition={tool}
+                  checked={enabled.includes(tool.function.name)}
+                  onChange={(on) => toggle(tool.function.name, on)}
+                />
+              </div>
+            ))}
+          </SettingsSection>
+
+          {gated.length > 0 ? (
+            <SettingsSection
+              title="Browsing"
+              subtitle="These fetch a page and hand its text to the model. The model picks the URL, so by default you approve each destination first."
+            >
+              <SettingsRow
+                title="Approve every page automatically"
+                description="Skips the confirmation for unattended use. Private and local addresses stay blocked either way."
+                control={
+                  <Switch
+                    label="Approve every page automatically"
+                    checked={autoApprove}
+                    onChange={(on) => update({ autoApproveBrowsing: on })}
+                  />
+                }
+              />
+              <SettingsRowDivider />
+              <p className="text-muted-foreground m-0 text-xs">
+                An approval covers that host for the rest of the answer, so reading several pages
+                on one site asks once.
+              </p>
+            </SettingsSection>
+          ) : null}
+
+          <SettingsSection
+            title="Where they run"
+            subtitle="On the Mac serving this page, not in this browser — a browser cannot reach these providers directly."
+          >
+            <p className="text-muted-foreground m-0 text-xs">
+              At most 3 calls answer one message. After that the model has to reply from what it
+              already has.
+            </p>
+          </SettingsSection>
+        </>
+      )}
+    </PanelBody>
+  );
+}
+
+/** One tool: switch, human summary, and the engine-facing text on request. */
+function ToolRow({
+  definition,
+  checked,
+  onChange,
+}: {
+  definition: ToolDefinition;
+  checked: boolean;
+  onChange(next: boolean): void;
+}) {
+  const name = definition.function.name;
+  const display = TOOL_DISPLAY[name];
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-1 items-start gap-2.5">
+          <span className="text-muted-foreground mt-px shrink-0 [&_svg]:size-4" aria-hidden="true">
+            {display?.icon ?? <Wrench />}
+          </span>
+          <div className="flex min-w-0 flex-col gap-1">
+            <span className="text-sm leading-none font-medium">{display?.title ?? name}</span>
+            <span className="text-muted-foreground text-xs">
+              {display?.summary ?? definition.function.description}
+            </span>
+          </div>
+        </div>
+        <Switch label={name} checked={checked} onChange={onChange} />
+      </div>
+
+      {/* Indented to the text column so it lines up under the summary it
+          expands, not under the glyph. */}
+      <details className="pl-[26px]">
+        <summary className="text-muted-foreground w-fit cursor-pointer text-xs">Details</summary>
+        <div className="bg-muted/50 mt-1.5 flex flex-col gap-1.5 rounded-md p-3">
+          {/* Exactly the string the model receives. */}
+          <p className="text-muted-foreground m-0 text-xs">{definition.function.description}</p>
+          <code className="text-muted-foreground/70 text-[11px]">{name}</code>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function AppearancePanel() {
   const settings = useStore((state) => state.settings);
   const update = useStore((state) => state.updateSettings);
 
   return (
     <PanelBody>
-      <Field
-        label="Appearance"
-        hint="Auto follows your device's light or dark setting."
-        control={
-          <Segmented<Settings['theme']>
-            label="theme"
-            className="w-full"
-            value={settings.theme}
-            options={[
-              { value: 'auto', label: 'Auto' },
-              { value: 'light', label: 'Light' },
-              { value: 'dark', label: 'Dark' },
-            ]}
-            onChange={(theme) => update({ theme })}
-          />
-        }
+      <PageHeader
+        title="Appearance"
+        subtitle="Override the system theme. Auto follows your device's light or dark setting; Light and Dark stay put regardless of it."
       />
+      <SettingsSection>
+        <SettingsRow
+          title="Theme"
+          description="Auto follows your device's light or dark setting."
+          control={
+            <Segmented<Settings['theme']>
+              label="theme"
+              value={settings.theme}
+              options={[
+                { value: 'auto', label: 'Auto' },
+                { value: 'light', label: 'Light' },
+                { value: 'dark', label: 'Dark' },
+              ]}
+              onChange={(theme) => update({ theme })}
+            />
+          }
+        />
 
-      <Field
-        label="Maths"
-        hint="Switch to source if formulas render as run-together text."
-        control={
-          <Segmented<Settings['mathRendering']>
-            label="math"
-            className="w-full"
-            value={settings.mathRendering}
-            options={[
-              { value: 'mathml', label: 'Typeset' },
-              { value: 'source', label: 'Source' },
-            ]}
-            onChange={(mathRendering) => update({ mathRendering })}
-          />
-        }
-      />
+        <SettingsRowDivider />
 
-      <Field label="Engine" hint={engineInfo} control={null} />
+        <SettingsRow
+          title="Maths"
+          description="Switch to source if formulas render as run-together text."
+          control={
+            <Segmented<Settings['mathRendering']>
+              label="math"
+              value={settings.mathRendering}
+              options={[
+                { value: 'mathml', label: 'Typeset' },
+                { value: 'source', label: 'Source' },
+              ]}
+              onChange={(mathRendering) => update({ mathRendering })}
+            />
+          }
+        />
+      </SettingsSection>
     </PanelBody>
   );
 }
 
-function PanelBody({ children }: { children: ReactNode }) {
+/**
+ * What the server is running. `rapid-mac`'s equivalent panel is about the
+ * .app's own self-update, which a browser has no counterpart to — what is
+ * left, and what a phone actually needs, is the state of the engine it is
+ * talking to.
+ */
+function EnginePanel() {
+  const status = useStore((state) => state.status);
+  const canSwitch = useStore((state) => state.canSwitch);
+  const allowDownloads = useStore((state) => state.allowDownloads);
+
   return (
-    <div className="flex flex-col gap-6 px-4 pt-4 pb-[calc(env(safe-area-inset-bottom)+16px)]">
-      {children}
-    </div>
+    <PanelBody>
+      <PageHeader
+        title="Engine"
+        subtitle="The Rapid-MLX server this page is talking to. It runs on the Mac, not in this browser."
+      />
+      <SettingsSection title="Status">
+        <ValueRow label="Model" value={status?.model ?? 'no model'} />
+        <SettingsRowDivider />
+        <ValueRow label="State" value={status?.state ?? 'unreachable'} />
+        <SettingsRowDivider />
+        <ValueRow label="Port" value={status?.port === null ? '—' : String(status?.port ?? '—')} />
+        {status?.detail ? (
+          <>
+            <SettingsRowDivider />
+            <ValueRow label="Detail" value={status.detail} />
+          </>
+        ) : null}
+      </SettingsSection>
+
+      <SettingsSection
+        title="This server"
+        subtitle="Set on the Mac when the server was started; not changeable from here."
+      >
+        <ValueRow label="Model switching" value={canSwitch ? 'allowed' : 'off'} />
+        <SettingsRowDivider />
+        <ValueRow label="Downloads" value={allowDownloads ? 'allowed' : 'off'} />
+      </SettingsSection>
+    </PanelBody>
   );
 }
 
-function Field({
-  label,
-  htmlFor,
-  hint,
-  control,
-}: {
-  label: string;
-  htmlFor?: string;
-  hint: string;
-  control: React.ReactNode;
-}) {
+function ValueRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex flex-col gap-2">
-      {htmlFor ? (
-        <Label htmlFor={htmlFor}>{label}</Label>
-      ) : (
-        <span className="text-sm leading-none font-medium">{label}</span>
-      )}
-      {control}
-      <span className="text-muted-foreground text-xs">{hint}</span>
+    <div className="flex items-baseline gap-4">
+      <span className="text-muted-foreground w-28 shrink-0 text-xs">{label}</span>
+      <span className="min-w-0 flex-1 font-mono text-xs [overflow-wrap:anywhere]">{value}</span>
     </div>
   );
 }
@@ -294,7 +584,7 @@ function Field({
 function SliderField({
   id,
   label,
-  hint,
+  description,
   value,
   min,
   max,
@@ -304,7 +594,7 @@ function SliderField({
 }: {
   id: string;
   label: string;
-  hint: string;
+  description: string;
   value: number;
   min: number;
   max: number;
@@ -328,7 +618,7 @@ function SliderField({
         step={step}
         onValueChange={([next]) => next !== undefined && onChange(next)}
       />
-      <span className="text-muted-foreground text-xs">{hint}</span>
+      <span className="text-muted-foreground text-xs">{description}</span>
     </div>
   );
 }

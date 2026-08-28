@@ -24,10 +24,15 @@ import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
  * window sized to its own content — Settings 630px, the model picker 259px —
  * so opening one after another made the dialog jump.
  *
+ * 960 rather than 760: Settings spends 184 of it on the category rail, which
+ * left its panels narrower than the model rows and the two-column settings
+ * rows wanted. The `100%-48px` clamp is what keeps this honest on a window
+ * narrower than the figure.
+ *
  * `sm:`-scoped throughout. On a phone these stay content-sized bottom sheets;
  * a fixed height there would push a two-row picker over most of the screen.
  */
-export const SHEET_DESKTOP_SIZE = 'sm:h-[min(80dvh,760px)] sm:w-[min(760px,100%-48px)]';
+export const SHEET_DESKTOP_SIZE = 'sm:h-[min(80dvh,760px)] sm:w-[min(960px,100%-48px)]';
 
 export interface SheetProps {
   open: boolean;

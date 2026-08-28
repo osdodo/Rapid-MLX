@@ -178,7 +178,11 @@ Attaching a tunnel puts this on the public internet, so:
   read it.** Branching needs a message tree the previous flat format cannot
   represent. The migration keeps every message, but downgrading afterwards
   shows an empty list — export anything you cannot lose first.
-- Text chat only. No images, audio, tools or MCP.
+- Three tools — `weather`, `web_search`, `browse` — and no MCP. They run on
+  the Mac, not in the browser, because a page cannot fetch a cross-origin
+  provider. `browse` asks before each new host: the model chooses the URL, so
+  approving it is what stops a page fetch becoming a way to post the
+  conversation elsewhere. At most 3 calls answer one message.
 - Downloads are one at a time, with progress polled once a second, so
   reloading mid-download reconnects to the running pull.
 - `--attach` mode cannot list or switch models: listing needs the CLI and

@@ -24,8 +24,10 @@ import {
   type ReadinessAction,
 } from '@/readiness/ModelReadiness';
 import { useActiveConversation, useActivePath, useStore } from '@/state/store';
+import type { MessageNode } from '@/state/types';
 import { Composer } from '@/components/chat/Composer';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
+import { ApprovalDialog } from '@/components/common/ApprovalDialog';
 import { ChatBar } from '@/components/chat/ChatBar';
 import {
   Sidebar,
@@ -162,6 +164,16 @@ function Chat() {
   // composer stuck in "stop", and there is no cascading render.
   const streaming = path.some((node) => node.status === 'streaming');
   const [revision, setRevision] = useState(0);
+
+  // Tool results are indexed by the call they answer rather than rendered as
+  // rows of their own: a result belongs under the call that asked for it.
+  const toolResults = useMemo(() => {
+    const byCallId = new Map<string, MessageNode>();
+    for (const node of path) {
+      if (node.role === 'tool' && node.toolCallId) byCallId.set(node.toolCallId, node);
+    }
+    return byCallId;
+  }, [path]);
 
   useThemeAttribute(settings.theme);
   useMathProbe();
@@ -369,6 +381,7 @@ function Chat() {
                     node={node}
                     mathRendering={settings.mathRendering}
                     branch={conversation ? branchPosition(node.id, conversation.nodes) : null}
+                    toolResults={toolResults}
                     onBranch={(direction) => switchBranch(node.id, direction)}
                     onRetry={() => retry(node.id)}
                     onEdit={(text) => editAndResend(node.id, text)}
@@ -417,7 +430,6 @@ function Chat() {
       <SettingsSheet
         open={settingsPage !== null}
         onClose={() => setSettingsPage(null)}
-        engineInfo={engineInfoOf(status)}
         initialCategory={settingsPage ?? 'models'}
       />
 
@@ -439,6 +451,8 @@ function Chat() {
           setPendingDelete(null);
         }}
       />
+
+      <ApprovalDialog />
     </div>
   );
 }
@@ -579,11 +593,4 @@ function lastFailure(path: ReturnType<typeof useActivePath>) {
 function conversationTitle(conversation: { title: string } | null): string {
   if (!conversation) return 'New chat';
   return conversation.title.trim() === '' ? 'New chat' : conversation.title;
-}
-
-function engineInfoOf(status: ReturnType<typeof useStore.getState>['status']): string {
-  if (!status) return '—';
-  const parts = [status.model ?? 'no model', status.state];
-  if (status.port) parts.push(`port ${status.port}`);
-  return parts.join(' · ');
 }

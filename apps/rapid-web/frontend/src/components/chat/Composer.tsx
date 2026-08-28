@@ -3,6 +3,7 @@ import { ArrowUp, Square } from 'lucide-react';
 import { READING_COLUMN } from '@/lib/layout';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
+import { ConversationInstructionsButton } from './ConversationInstructions';
 
 export interface ComposerProps {
   placeholder: string;
@@ -103,9 +104,11 @@ export function Composer({
           aria-label="Message"
         />
 
-        {/* The control row. The model belongs here rather than in the
-            sidebar: it is a property of the message about to be sent. */}
+        {/* The control row. The model and the conversation's system prompt
+            belong here rather than in the sidebar or Settings: both are
+            properties of the message about to be sent. */}
         <div className="mt-1 flex items-center gap-1">
+          <ConversationInstructionsButton disabled={streaming} />
           <span className="min-w-0 flex-1" />
           {picker}
           <Button

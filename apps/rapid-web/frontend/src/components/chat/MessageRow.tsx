@@ -1,11 +1,22 @@
 import { memo, useRef, useState, useSyncExternalStore } from 'react';
-import { ChevronLeft, ChevronRight, Pencil, RotateCw, Trash2 } from 'lucide-react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  CircleAlert,
+  CircleCheck,
+  Loader2,
+  Pencil,
+  RotateCw,
+  Trash2,
+} from 'lucide-react';
 import { Markdown } from '@/components/chat/Markdown';
 import { parseMarkdown, tokensOf } from '@/markdown/lex';
 import { streamingStore } from '@/chat/StreamingStore';
+import { withoutToolCallEcho } from '@/chat/toolEcho';
 import { CopyButton } from '@/components/common/CopyButton';
 import { cn } from '@/lib/utils';
 import { formatDuration, formatTokensPerSecond } from '@/lib/format';
+import type { ToolCall } from '@/api/chat';
 import type { MessageNode } from '@/state/types';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -15,6 +26,9 @@ export interface MessageRowProps {
   mathRendering: 'mathml' | 'source';
   /** Position within its sibling group, when there is more than one. */
   branch: { index: number; total: number } | null;
+  /** Results for this node's tool calls, keyed by call id. Absent means the
+   *  call has not come back yet. */
+  toolResults?: Map<string, MessageNode>;
   onBranch(direction: -1 | 1): void;
   onRetry(): void;
   onEdit(content: string): void;
@@ -26,6 +40,9 @@ export interface MessageRowProps {
 
 export const MessageRow = memo(function MessageRow(props: MessageRowProps) {
   const { node } = props;
+  // A tool result is not a row. It is rendered inside the chip belonging to
+  // the call that produced it.
+  if (node.role === 'tool') return null;
   if (node.role === 'user') return <UserRow {...props} />;
   return <AssistantRow {...props} />;
 });
@@ -68,8 +85,14 @@ function UserRow({ node, branch, onBranch, onEdit, onDelete, busy }: MessageRowP
   return (
     <div className="animate-in fade-in-0 slide-in-from-bottom-2 group flex flex-col items-end">
       {/* Plain text, never markdown: this is what the user typed, and
-          rendering it would change what they see from what they wrote. */}
-      <div className="bg-primary text-primary-foreground max-w-[84%] rounded-lg rounded-br-sm px-4 py-2.5 shadow-xs [overflow-wrap:anywhere] whitespace-pre-wrap">
+          rendering it would change what they see from what they wrote.
+
+          `secondary`, NOT `primary`: shadcn's primary is near-black in light
+          and near-white in dark, so the bubble INVERTED the theme — a slab of
+          black on a white page, and a white slab at night. Secondary is a
+          tint of the surface in both, so the prompt still reads as distinct
+          from the answer without fighting the page around it. */}
+      <div className="bg-secondary text-secondary-foreground max-w-[84%] rounded-lg rounded-br-sm px-4 py-2.5 shadow-xs [overflow-wrap:anywhere] whitespace-pre-wrap">
         {node.content}
       </div>
       <MessageActions>
@@ -94,22 +117,44 @@ function AssistantRow({
   node,
   mathRendering,
   branch,
+  toolResults,
   onBranch,
   onRetry,
   onDelete,
   busy,
 }: MessageRowProps) {
   const streaming = node.status === 'streaming';
+  // A turn that dispatched tools is a step, not an answer: Copy would copy a
+  // fragment, Retry would re-run the dispatch rather than the reply, and its
+  // throughput belongs to the answer that follows and prints its own.
+  //
+  // Keyed on the calls alone, NOT on empty content: a model that also narrates
+  // the call — or leaks the raw JSON into its prose, which small ones do — is
+  // still dispatching, and testing for emptiness put a full stats row between
+  // the call and its result.
+  const dispatchOnly = (node.toolCalls?.length ?? 0) > 0;
 
   return (
     <div className="animate-in fade-in-0 slide-in-from-bottom-2 group flex flex-col items-start">
-      <div className="max-w-full leading-relaxed">
+      {/* `w-full`, not just `max-w-full`: the column is `items-start`, so
+          without it this box shrink-wraps its content and a code block or a
+          table ends up as wide as its longest line rather than as wide as the
+          transcript. */}
+      <div className="w-full max-w-full leading-relaxed">
         {streaming ? (
           <StreamingBody mathRendering={mathRendering} />
         ) : (
           <SettledBody node={node} mathRendering={mathRendering} />
         )}
       </div>
+
+      {node.toolCalls?.length ? (
+        <div className="mt-2 flex w-full flex-col gap-1.5">
+          {node.toolCalls.map((call) => (
+            <ToolCallChip key={call.id} call={call} result={toolResults?.get(call.id)} />
+          ))}
+        </div>
+      ) : null}
 
       {node.status === 'failed' && node.error ? (
         <div
@@ -120,7 +165,7 @@ function AssistantRow({
         </div>
       ) : null}
 
-      {!streaming ? (
+      {!streaming && !dispatchOnly ? (
         // The actions and the stats share ONE row: actions left, stats
         // right. `w-full` is what lets `ml-auto` push the stats to the far
         // edge — without it the row shrink-wraps the buttons and there is no
@@ -135,6 +180,58 @@ function AssistantRow({
       ) : null}
     </div>
   );
+}
+
+/**
+ * One tool call, with its result folded underneath.
+ *
+ * The phase is derived from the result rather than stored: a call is running
+ * until one arrives, and then it either succeeded or it did not. A separate
+ * state field could disagree with the transcript it describes.
+ */
+function ToolCallChip({ call, result }: { call: ToolCall; result: MessageNode | undefined }) {
+  const running = result === undefined;
+  const failed = result?.status === 'failed';
+
+  return (
+    <details
+      className="border-l-2 pl-2.5 text-sm"
+      // Open while it runs and when it failed; a success is the ordinary case
+      // and does not need its payload on screen.
+      open={running || failed}
+    >
+      <summary className="text-muted-foreground flex cursor-pointer items-center gap-1.5 py-0.5 text-xs">
+        {running ? (
+          <Loader2 className="size-3.5 animate-spin" />
+        ) : failed ? (
+          <CircleAlert className="text-destructive size-3.5" />
+        ) : (
+          <CircleCheck className="text-success size-3.5" />
+        )}
+        <span className="font-mono">{call.function.name}</span>
+        {running ? <span>calling…</span> : null}
+      </summary>
+      <div className="text-muted-foreground pb-1 text-[13px] leading-normal">
+        <pre className="mt-1 overflow-x-auto font-mono text-[12px] whitespace-pre-wrap">
+          {prettyArguments(call.function.arguments)}
+        </pre>
+        {result ? (
+          <pre className="mt-1.5 max-h-56 overflow-auto font-mono text-[12px] whitespace-pre-wrap">
+            {result.content}
+          </pre>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
+/** Re-indent the model's argument JSON, or show it verbatim if it is not JSON. */
+function prettyArguments(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw || '{}'), null, 2);
+  } catch {
+    return raw;
+  }
 }
 
 /**
@@ -204,13 +301,20 @@ function SettledBody({
   node: MessageNode;
   mathRendering: 'mathml' | 'source';
 }) {
-  const tokens = useMemoTokens(node.content);
+  // Rendered, not stored: the transcript keeps what the model actually said,
+  // so the echo can stop being hidden without the history having been edited.
+  const content = withoutToolCallEcho(node.content, node.toolCalls);
+  const tokens = useMemoTokens(content);
 
   return (
     <>
       {node.reasoning ? <Reasoning text={node.reasoning} /> : null}
-      {node.content === '' && node.status !== 'failed' ? (
-        <p className="text-muted-foreground italic">(empty response)</p>
+      {content === '' ? (
+        // A turn that only asked for tools is not an empty answer — the chips
+        // below it are what it produced.
+        node.status !== 'failed' && !node.toolCalls?.length ? (
+          <p className="text-muted-foreground italic">(empty response)</p>
+        ) : null
       ) : (
         <Markdown tokens={tokens} mathRendering={mathRendering} />
       )}

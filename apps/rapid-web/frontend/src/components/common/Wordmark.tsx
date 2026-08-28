@@ -46,12 +46,9 @@ export function Wordmark({ className, mark = true }: { className?: string; mark?
     // font, so the mark can be sized in `em` and track the wordmark whatever
     // the caller sets `text-*` to.
     <span className={cn('inline-flex items-center gap-[0.34em] font-semibold tracking-tight', className)}>
-      {mark ? <RapidMark className="size-[1.05em] shrink-0" /> : null}
-      <span className="truncate">
-        Rapid
-        <span className="font-mono text-muted-foreground align-super text-[0.43em] font-semibold tracking-[0.1em] uppercase">
-          -MLX
-        </span>
+      {mark ? <RapidMark className="size-[2em] shrink-0" /> : null}
+      <span className="truncate text-sm">
+        Rapid-MLX
       </span>
     </span>
   );

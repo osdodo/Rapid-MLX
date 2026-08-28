@@ -128,23 +128,27 @@ export interface ErrorEnvelope {
   error: { message: string; type: string };
 }
 
-/** ``POST /v1/images/generations``. ``cancelled`` is a Rapid-MLX extension on
- *  the OpenAI envelope: a render stopped mid-batch keeps whatever finished,
- *  so an empty ``data`` with ``cancelled`` set is a success, not a failure. */
-export interface ImageResponse {
-  created: number;
-  data: Array<{ b64_json?: string }>;
-  cancelled?: boolean;
+/** ``images.ImageJobState``. A cancelled render is ``done``, not a state of
+ *  its own: the engine stops at the next denoise step and keeps whatever
+ *  finished, so an empty result with ``cancelled`` set is a success. */
+export type ImageJobState = 'running' | 'done' | 'failed';
+
+/** ``images.ImageJob.to_dict`` — what ``POST /api/images/jobs`` answers. */
+export interface ImageJob {
+  id: string;
+  state: ImageJobState;
+  b64_json: string | null;
+  cancelled: boolean;
+  error: { message: string; type: string; status: number } | null;
 }
 
-/** ``GET /api/images/progress`` — proxied from the engine's
- *  ``ImageGenerationEngine.progress_snapshot``. Diffusion has a fixed step
- *  count, so ``step / total`` is a true fraction rather than an estimate. */
-export interface ImageProgress {
-  running: boolean;
-  step: number;
-  total: number;
-  elapsed_ms?: number;
+/** ``GET /api/images/jobs/{id}``. The job plus the engine's denoise counter
+ *  while it runs — one poll answers both, so a render occupies a single
+ *  connection. Diffusion has a fixed step count, so ``step / total`` is a
+ *  true fraction rather than an estimate. */
+export interface ImageJobSnapshot extends ImageJob {
+  step?: number;
+  total?: number;
 }
 
 /** One resident model — ``resident_models.ResidentModelManager.snapshot``. */

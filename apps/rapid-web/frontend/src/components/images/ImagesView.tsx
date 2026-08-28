@@ -9,9 +9,9 @@ import {
   Ruler,
   X,
 } from 'lucide-react';
-import { cancelImage, editImage, fetchImageProgress, generateImage } from '@/api/images';
-import { asApiError } from '@/api/errors';
-import { supportsEditing, supportsGeneration, type ImageProgress } from '@/api/types';
+import { cancelImage, fetchImageJob, startImageJob } from '@/api/images';
+import { ApiError, asApiError } from '@/api/errors';
+import { supportsEditing, supportsGeneration } from '@/api/types';
 import { useStore } from '@/state/store';
 import { noticeFor } from '@/state/notices';
 import { percent } from '@/components/models/LifecycleBand';
@@ -50,8 +50,17 @@ import { ImageSourceError, readImageSource, type ImageSource } from '@/images/so
  * long edge — disappears while it is on.
  */
 
-/** How often to ask for denoise progress while a render runs. */
+/** How often to ask a running job for its denoise progress. */
 const PROGRESS_POLL_MS = 400;
+
+/**
+ * Consecutive failed polls before a render is given up on.
+ *
+ * A single dropped poll is not a failure — the tunnel or the radio can lose
+ * one while the render is fine — but a server that has gone away must not be
+ * polled forever. Same cap as the download feed.
+ */
+const MAX_POLL_FAILURES = 5;
 
 /**
  * Shown on an empty canvas. Concrete enough to produce a good first image —
@@ -83,15 +92,23 @@ export function ImagesView({
   const [prompt, setPrompt] = useState('');
   const [aspect, setAspect] = useState<Aspect>('square');
   const [resolution, setResolution] = useState<Resolution>(512);
-  const [rendering, setRendering] = useState(false);
-  const [progress, setProgress] = useState<ImageProgress | null>(null);
+  /** The render in flight, or null. Starting one is itself a request, so
+   *  `starting` covers the gap before an id exists. */
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [progress, setProgress] = useState<{ step: number; total: number } | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [image, setImage] = useState<string | null>(null);
   const [caption, setCaption] = useState('');
   /** Non-null puts the surface in edit mode; it is the image being edited. */
   const [source, setSource] = useState<ImageSource | null>(null);
+  /** The prompt this render was started with, so editing the box afterwards
+   *  cannot relabel an image produced from something else. */
+  const submitted = useRef('');
   const controller = useRef<AbortController | null>(null);
   const filePicker = useRef<HTMLInputElement | null>(null);
+
+  const rendering = starting || jobId !== null;
 
   const loaded = status?.model ?? null;
   // Any image model the engine is HOLDING, not just the primary. A hot load
@@ -126,30 +143,92 @@ export function ImagesView({
   // already owns the explanation.
   const wrongCapability = status?.state === 'ready' && imageModel !== null && !modelFits;
 
-  // Poll progress only while a render is actually in flight. Diffusion has a
-  // fixed step count, so this is a true fraction, not an estimate.
+  // Poll the running job. One request carries both the denoise counter and
+  // the finished image, so a render occupies a single connection — the POST
+  // that started it returned immediately rather than being held open, which
+  // is what a tunnel cuts at 100 s with a 524.
   useEffect(() => {
-    if (!rendering) return;
-    const signal = new AbortController();
+    if (jobId === null) return;
+    const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+
+    const finish = () => {
+      setJobId(null);
+      setProgress(null);
+    };
 
     const tick = async () => {
       try {
-        const snapshot = await fetchImageProgress(signal.signal);
-        if (signal.signal.aborted) return;
-        setProgress(snapshot);
-      } catch {
-        // A dropped poll is not a render failure; the render reports its own.
+        const snapshot = await fetchImageJob(jobId, abort.signal);
+        if (abort.signal.aborted) return;
+        failures = 0;
+
+        if (snapshot.state === 'running') {
+          setProgress({ step: snapshot.step ?? 0, total: snapshot.total ?? 0 });
+        } else if (snapshot.state === 'failed') {
+          const failure = snapshot.error;
+          pushNotice(
+            noticeFor(
+              new ApiError(
+                failure?.status ?? 500,
+                failure?.type ?? 'image_job_failed',
+                failure?.message ?? 'the render failed',
+              ),
+            ),
+          );
+          finish();
+          return;
+        } else if (snapshot.b64_json) {
+          const rendered = snapshot.b64_json;
+          setImage(rendered);
+          setCaption(submitted.current);
+          // Chain: the next edit acts on what was just produced. Functional,
+          // so this does not have to depend on `source` and restart the poll.
+          setSource((previous) =>
+            previous
+              ? {
+                  ...previous,
+                  data: rendered,
+                  mediaType: 'image/png',
+                  label: submitted.current,
+                }
+              : previous,
+          );
+          finish();
+          return;
+        } else {
+          // Cancelled mid-batch keeps whatever finished, which can be
+          // nothing — a success with no image, not a failure.
+          if (!snapshot.cancelled) {
+            pushNotice({ tone: 'warning', title: 'The engine returned no image.' });
+          }
+          finish();
+          return;
+        }
+      } catch (cause) {
+        if (abort.signal.aborted) return;
+        // A 404 means the job is gone — only the last one is kept — so there
+        // is nothing left to wait for.
+        const error = asApiError(cause);
+        failures += 1;
+        if (error.status === 404 || failures >= MAX_POLL_FAILURES) {
+          pushNotice(noticeFor(error));
+          finish();
+          return;
+        }
       }
-      if (!signal.signal.aborted) timer = setTimeout(() => void tick(), PROGRESS_POLL_MS);
+      // Re-scheduled AFTER the response, never on an interval: a slow poll
+      // must not stack overlapping requests behind the render.
+      if (!abort.signal.aborted) timer = setTimeout(() => void tick(), PROGRESS_POLL_MS);
     };
 
     void tick();
     return () => {
-      signal.abort();
+      abort.abort();
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [rendering]);
+  }, [jobId, pushNotice]);
 
   // The elapsed clock, which is the only thing moving during the warm-up: a
   // cold mflux load reports no steps for tens of seconds, and a HUD with a
@@ -167,60 +246,44 @@ export function ImagesView({
 
     const abort = new AbortController();
     controller.current = abort;
-    setRendering(true);
+    setStarting(true);
     setProgress(null);
     setElapsedMs(0);
+    submitted.current = text;
 
     try {
-      // Named explicitly on both paths: the engine can hold several models,
-      // and an omitted `model` resolves to the primary — which is the CHAT
-      // model whenever the image model was hot-loaded beside it.
-      const response = source
-        ? await editImage({
-            image: source.data,
-            prompt: text,
-            ...(imageAlias ? { model: imageAlias } : {}),
-            signal: abort.signal,
-          })
-        : await generateImage({
-            prompt: text,
-            size: outputSize(aspect, resolution),
-            ...(imageAlias ? { model: imageAlias } : {}),
-            signal: abort.signal,
-          });
-      const first = response.data[0]?.b64_json;
-      if (first) {
-        setImage(first);
-        // Captured with the result: editing the box afterwards must not
-        // relabel an image that was rendered from something else.
-        setCaption(text);
-        // Chain, and clear the instruction with it: the next edit acts on
-        // what was just produced, and leaving the applied instruction in the
-        // box invites re-applying it to its own output.
-        if (source) {
-          setSource({ ...source, data: first, mediaType: 'image/png', label: text });
-          setPrompt('');
-        }
-      } else if (!response.cancelled) {
-        pushNotice({ tone: 'warning', title: 'The engine returned no image.' });
-      }
+      // Named explicitly: the engine can hold several models, and an omitted
+      // `model` resolves to the primary — which is the CHAT model whenever
+      // the image model was hot-loaded beside it.
+      const job = await startImageJob({
+        prompt: text,
+        ...(source ? { image: source.data } : { size: outputSize(aspect, resolution) }),
+        ...(imageAlias ? { model: imageAlias } : {}),
+        signal: abort.signal,
+      });
+      // Cleared here rather than on the result: the instruction has been
+      // accepted, and leaving it in the box invites re-applying it to its
+      // own output.
+      if (source) setPrompt('');
+      setJobId(job.id);
     } catch (cause) {
       // An abort is the user pressing Stop, not a failure to report.
       if (!abort.signal.aborted) pushNotice(noticeFor(asApiError(cause)));
     } finally {
       controller.current = null;
-      setRendering(false);
-      setProgress(null);
+      setStarting(false);
     }
   }, [prompt, aspect, resolution, rendering, ready, pushNotice, imageAlias, source]);
 
   const stop = useCallback(() => {
-    // Both: the engine stops at its next denoise step, and aborting the fetch
-    // releases the page rather than waiting out the partial response.
+    // Both: the engine stops at its next denoise step, and dropping the job
+    // releases the page rather than polling out the render it just cancelled.
     // Named, for the same reason the render is: an omitted model cancels
     // against the primary, which may not be the model rendering.
     void cancelImage(imageAlias ?? undefined).catch(() => undefined);
     controller.current?.abort();
+    setJobId(null);
+    setProgress(null);
   }, [imageAlias]);
 
   /** Edit the image on the canvas — the common case, and no file dialog. */

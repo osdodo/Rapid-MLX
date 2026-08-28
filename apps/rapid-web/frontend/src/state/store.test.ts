@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useStore } from './store';
+import { useStore, wireTurns } from './store';
+import type { MessageNode } from './types';
 
 /**
  * `createConversation` reuses an existing blank rather than stacking a new one.
@@ -128,5 +129,72 @@ describe('createConversation', () => {
     // Archiving is how something is put out of the way; pulling it back is
     // the opposite of what the user asked for.
     expect(count()).toBe(2);
+  });
+});
+
+describe('wireTurns', () => {
+  const node = (partial: Partial<MessageNode>): MessageNode => ({
+    id: 'n',
+    parentId: null,
+    role: 'assistant',
+    content: '',
+    status: 'complete',
+    createdAt: 0,
+    ...partial,
+  });
+
+  it('drops a failed turn', () => {
+    const turns = wireTurns([node({ role: 'user', content: 'hi', status: 'failed' })], '');
+    expect(turns).toEqual([]);
+  });
+
+  it('drops an empty turn that produced nothing at all', () => {
+    expect(wireTurns([node({ content: '' })], '')).toEqual([]);
+  });
+
+  // A turn that only asked for tools has no prose but is not empty. Dropping
+  // it orphans the tool results under it and the next request is malformed.
+  it('keeps a tool-call turn that has no prose', () => {
+    const calls = [
+      { id: 'call_1', type: 'function' as const, function: { name: 'weather', arguments: '{}' } },
+    ];
+    const turns = wireTurns([node({ content: '', toolCalls: calls })], '');
+
+    expect(turns).toEqual([{ role: 'assistant', content: '', tool_calls: calls }]);
+  });
+
+  it('carries the call id on a tool result', () => {
+    const turns = wireTurns([node({ role: 'tool', content: '18°C', toolCallId: 'call_1' })], '');
+    expect(turns).toEqual([{ role: 'tool', content: '18°C', tool_call_id: 'call_1' }]);
+  });
+
+  it('puts the system prompt first when there is one', () => {
+    const turns = wireTurns([node({ role: 'user', content: 'hi' })], 'Be brief.');
+    expect(turns[0]).toEqual({ role: 'system', content: 'Be brief.' });
+  });
+});
+
+describe('wireTurns and failed tool results', () => {
+  // A failed tool RAN, and its error is the result. Dropping it leaves the
+  // call above it unanswered, which the model reads as a malformed history.
+  it('keeps a failed tool result', () => {
+    const turns = wireTurns(
+      [
+        {
+          id: 'n',
+          parentId: null,
+          role: 'tool',
+          content: 'browse error: declined',
+          status: 'failed',
+          createdAt: 0,
+          toolCallId: 'call_1',
+        },
+      ],
+      '',
+    );
+
+    expect(turns).toEqual([
+      { role: 'tool', content: 'browse error: declined', tool_call_id: 'call_1' },
+    ]);
   });
 });

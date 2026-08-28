@@ -11,21 +11,23 @@ import {
 /**
  * The localStorage migration chain.
  *
- * Three shapes have existed under `rapid-mlx-web.history`:
+ * Four shapes have existed under `rapid-mlx-web.history`:
  *
  *   v1  Message[]                                          (M1, no envelope)
  *   v2  { conversations: [{id,title,updatedAt,messages}],  (M4, no version
  *        activeId }                                         field)
- *   v3  { v: 3, conversations: Conversation[],             (this build)
+ *   v3  { v: 3, conversations: Conversation[],
  *        folders: Folder[], activeId }
+ *   v4  v3 plus the `tool` role and a node's tool envelope  (this build)
  *
  * v3 is the first shape to carry its own version, so the older two have to be
- * sniffed structurally.
+ * sniffed structurally. v3 -> v4 is a pure widening: the new fields are
+ * optional and v3 nodes already validate, so no node is rewritten.
  *
- * THE MIGRATION IS ONE-WAY. Once v3 is written an older build reads an object
- * with a `v` field and no `conversations[].messages` and returns an empty
- * store, so history APPEARS deleted on a downgrade. The data is still there;
- * the README says so and the JSON export is the backup path.
+ * THE MIGRATION IS ONE-WAY. Once v4 is written an older build sees a `v` it
+ * does not know and returns an empty store, so history APPEARS deleted on a
+ * downgrade. The data is still there; the README says so and the JSON export
+ * is the backup path.
  *
  * Pure, and deliberately not a store middleware: it must be callable from a
  * test without standing up a store.
@@ -255,6 +257,9 @@ function validateV3(parsed: unknown): PersistedStore {
       isPinned: row.isPinned === true,
       isArchived: row.isArchived === true,
       folderId: typeof row.folderId === 'string' ? row.folderId : null,
+      ...(typeof row.customInstructions === 'string'
+        ? { customInstructions: row.customInstructions }
+        : {}),
     });
   }
 

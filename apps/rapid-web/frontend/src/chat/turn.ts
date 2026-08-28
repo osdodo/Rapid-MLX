@@ -1,9 +1,29 @@
-import { streamChat } from '@/api/chat';
+import { streamChat, type ToolCall, type ToolDefinition } from '@/api/chat';
+import { callConnectorTool, updateConnectorSettings, type ConnectorState } from '@/api/connectors';
 import { asApiError } from '@/api/errors';
 import { useStore, wireTurns } from '@/state/store';
 import type { MessageNode } from '@/state/types';
 import { activePath, branchAnchor, siblings } from './MessageTree';
+import {
+  advertisedConnectorTools,
+  displaySafe as displaySafeText,
+  formatArguments,
+  gateConnectorCall,
+  isConnectorTool,
+  loadConnectorState,
+} from './connectors';
+import { composeSystemPrompt } from './instructions';
 import { streamingStore } from './StreamingStore';
+import {
+  MAX_TOOL_EXECUTIONS,
+  TOOL_BUDGET_MESSAGE,
+  TOOL_GUIDANCE,
+  advertised,
+  displaySafe,
+  execute,
+  gate,
+  loadTools,
+} from './tools';
 
 /**
  * Running a turn.
@@ -21,42 +41,338 @@ export function isStreaming(): boolean {
 
 export function stopTurn(): void {
   inFlight?.abort();
+  // A stop while an approval sheet is open must settle the promise the tool
+  // loop is parked on, or the turn never unwinds.
+  useStore.getState().answerApproval('unavailable');
 }
 
 interface RunOptions {
   /** The node the answer is written into. Created by the caller. */
   assistantId: string;
-  /** The path to send, already rewound to the right point. */
-  path: MessageNode[];
   alias: string | null;
 }
 
 /**
  * Stream one answer into `assistantId`.
  *
- * The node is created BEFORE this runs and patched exactly once at the end.
- * Nothing per-token touches the app store: the live text lives in
- * StreamingStore, which is what keeps a 400 ms persist debounce from
- * stringifying the whole store ten times a second.
+ * A logical turn may take several round trips: the model asks for tools, the
+ * results are appended as `tool` nodes, and a fresh assistant node opens for
+ * the answer they inform. Each round commits its own node exactly once —
+ * nothing per-token touches the app store, so a 400 ms persist debounce is
+ * not stringifying the whole store ten times a second.
  */
-export async function runTurn({ assistantId, path, alias }: RunOptions): Promise<void> {
-  const store = useStore.getState();
+export async function runTurn({ assistantId, alias }: RunOptions): Promise<void> {
   const controller = new AbortController();
   inFlight = controller;
 
+  // BEFORE the first await, not inside `runOneStream`. The caller has already
+  // appended a `streaming` node, and that row renders whatever this store
+  // holds — so anything awaited in between leaves the PREVIOUS turn's answer
+  // on screen under the new prompt. Two round trips happen below, and on a
+  // tunnel they are slow enough to read.
   streamingStore.start();
 
   const startedAt = performance.now();
+  const catalogue = await loadToolsSafely();
+  // The connector state is read once per turn: the panel can arm one
+  // mid-session, but a mid-turn change would leave the model advertised a
+  // tool that vanished before it asked for it.
+  const connectors = await loadConnectorState();
+  const approvedOrigins = new Set<string>();
+  // Grants approved during this turn. `always` is written through to the
+  // server, but a plain `allowOnce` must not re-prompt for the same tool in
+  // the same answer — the user already said yes to it.
+  const approvedTools = new Set<string>();
+  let executions = 0;
+  let currentId = assistantId;
+  let sawToolResult = false;
+
+  try {
+    for (;;) {
+      const store = useStore.getState();
+      // Advertised only while there is budget left. The final round runs with
+      // no tools at all, so the model has to answer from what it has rather
+      // than asking for a call that would be refused.
+      const tools =
+        executions < MAX_TOOL_EXECUTIONS
+          ? [
+              ...advertised(catalogue.tools, store.settings.enabledTools),
+              ...advertisedConnectorTools(connectors),
+            ]
+          : [];
+
+      const outcome = await runOneStream({
+        nodeId: currentId,
+        // Re-read each round: the previous round appended nodes.
+        turns: currentTurns(currentId, sawToolResult),
+        alias,
+        tools,
+        startedAt,
+        controller,
+      });
+
+      if (outcome.kind !== 'toolCalls') return;
+
+      const spent = tools.length === 0;
+      const results: Array<{ call: ToolCall; content: string; failed: boolean }> = [];
+      for (const call of outcome.calls) {
+        // Every requested call gets a result row, including one that was
+        // never run: the wire shape is assistant(tool_calls) -> tool per id,
+        // and a missing answer makes the next request malformed.
+        if (spent || executions >= MAX_TOOL_EXECUTIONS) {
+          results.push({ call, content: TOOL_BUDGET_MESSAGE, failed: true });
+          continue;
+        }
+        executions += 1;
+        results.push({
+          call,
+          ...(isConnectorTool(connectors, call.function.name)
+            ? await runConnectorCall(call, {
+                connectors,
+                approvedTools,
+                signal: controller.signal,
+              })
+            : await runOneCall(call, {
+                catalogue,
+                enabled: store.settings.enabledTools,
+                approvedOrigins,
+                signal: controller.signal,
+              })),
+        });
+      }
+
+      if (controller.signal.aborted) return;
+
+      for (const { call, content, failed } of results) {
+        useStore.getState().appendNode({
+          parentId: currentLeaf(),
+          role: 'tool',
+          content,
+          // The status is what the chip paints from. Deriving it by matching
+          // the prose instead would misread any result that merely mentions
+          // an error, and miss every one worded differently.
+          status: failed ? 'failed' : 'complete',
+          toolCallId: call.id,
+        });
+      }
+      sawToolResult = true;
+
+      // That round was already the tools-disabled one and it asked anyway.
+      // Its rows say why; re-entering would loop forever against a model that
+      // keeps asking for calls it can no longer make.
+      if (spent) return;
+
+      currentId = useStore.getState().appendNode({
+        parentId: currentLeaf(),
+        role: 'assistant',
+        content: '',
+        status: 'streaming',
+      });
+    }
+  } finally {
+    if (inFlight === controller) inFlight = null;
+  }
+}
+
+/** The catalogue, or an empty one. A server without tools is not an error. */
+async function loadToolsSafely(): Promise<{
+  tools: ToolDefinition[];
+  approvalRequired: Set<string>;
+}> {
+  try {
+    return await loadTools();
+  } catch {
+    return { tools: [], approvalRequired: new Set() };
+  }
+}
+
+/**
+ * The turns to send, with both instruction layers merged into one system
+ * message and the guidance preamble folded in once a tool result is in the
+ * history. One row, never two: local chat templates often reject a second
+ * system message.
+ */
+function currentTurns(nodeId: string, sawToolResult: boolean) {
+  const store = useStore.getState();
+  const conversation = activeConversation();
+  return wireTurns(
+    pathExcluding(nodeId),
+    composeSystemPrompt({
+      global: store.settings.system,
+      conversation: conversation?.customInstructions ?? '',
+      ...(sawToolResult ? { guidance: TOOL_GUIDANCE } : {}),
+    }),
+  );
+}
+
+/** Run one call through the gate, returning what the model will read. */
+async function runOneCall(
+  call: ToolCall,
+  options: {
+    catalogue: { tools: ToolDefinition[]; approvalRequired: Set<string> };
+    enabled: string[];
+    approvedOrigins: Set<string>;
+    signal: AbortSignal;
+  },
+): Promise<{ content: string; failed: boolean }> {
+  const names = advertised(options.catalogue.tools, options.enabled).map(
+    (tool) => tool.function.name,
+  );
+  const decision = gate(call, {
+    advertised: new Set(names),
+    approvalRequired: options.catalogue.approvalRequired,
+    approvedOrigins: options.approvedOrigins,
+    autoApprove: useStore.getState().settings.autoApproveBrowsing,
+  });
+
+  if (decision.kind === 'refuse') return { content: decision.reason, failed: true };
+
+  if (decision.kind === 'approve') {
+    const answer = await useStore.getState().askApproval({
+      kind: 'browse',
+      url: displaySafe(decision.url),
+      host: decision.host,
+    });
+    if (answer === 'declined') {
+      return {
+        content: `${call.function.name} error: the user did not approve fetching ${decision.host}`,
+        failed: true,
+      };
+    }
+    if (answer === 'unavailable') {
+      return {
+        content: `${call.function.name} error: the approval prompt for ${decision.host} could not be shown`,
+        failed: true,
+      };
+    }
+    options.approvedOrigins.add(decision.origin);
+  }
+
+  try {
+    const result = await execute(call, {
+      advertised: names,
+      approvedOrigins: [...options.approvedOrigins],
+      signal: options.signal,
+    });
+    // A redirect left every approved origin. The server stopped rather than
+    // following it, so the user answers for the new host and the call reruns.
+    if (result.needs_approval) {
+      const answer = await useStore.getState().askApproval({
+        kind: 'browse',
+        url: displaySafe(result.needs_approval.url),
+        host: result.needs_approval.host,
+      });
+      if (answer !== 'allowed') return { content: result.content, failed: true };
+      options.approvedOrigins.add(new URL(result.needs_approval.url).origin);
+      const retried = await execute(call, {
+        advertised: names,
+        approvedOrigins: [...options.approvedOrigins],
+        signal: options.signal,
+      });
+      return { content: retried.content, failed: retried.is_error };
+    }
+    return { content: result.content, failed: result.is_error };
+  } catch (cause) {
+    const error = asApiError(cause);
+    return { content: `${call.function.name} error: ${error.message}`, failed: true };
+  }
+}
+
+/**
+ * Run one connector call through the gate.
+ *
+ * Approval is asked once per tool per turn even without a durable grant: the
+ * user already said yes to this tool in this answer, and re-prompting for
+ * every call of a paginated tool is how a consent dialog gets clicked
+ * through blind.
+ */
+async function runConnectorCall(
+  call: ToolCall,
+  options: {
+    connectors: ConnectorState | null;
+    approvedTools: Set<string>;
+    signal: AbortSignal;
+  },
+): Promise<{ content: string; failed: boolean }> {
+  const name = call.function.name;
+  const decision = gateConnectorCall(call, options.connectors);
+
+  if (decision.kind === 'refuse') return { content: decision.reason, failed: true };
+
+  if (decision.kind === 'approve' && !options.approvedTools.has(name)) {
+    const answer = await useStore.getState().askApproval({
+      kind: 'tool',
+      // Every one of these is connector-supplied, so a bidi or zero-width
+      // scalar in a tool's metadata must not be able to spoof the prompt.
+      tool: displaySafeText(decision.tool),
+      server: displaySafeText(decision.server),
+      short: displaySafeText(decision.short),
+      args: displaySafeText(formatArguments(decision.args)),
+    });
+    if (answer === 'declined') {
+      return {
+        content: `The user declined to run '${name}'. Continue without it.`,
+        failed: true,
+      };
+    }
+    if (answer === 'unavailable') {
+      return {
+        content: `'${name}' was not run — the request was cancelled before it could be approved.`,
+        failed: true,
+      };
+    }
+    options.approvedTools.add(name);
+    if (answer === 'always') {
+      // Best effort: a grant that failed to persist costs one more prompt
+      // next turn, which is the safe direction to fail in.
+      void updateConnectorSettings({ tool: name, grant: true }).catch(() => {});
+    }
+  }
+
+  try {
+    const result = await callConnectorTool({
+      name,
+      arguments: call.function.arguments,
+      signal: options.signal,
+    });
+    return { content: displaySafeText(result.content), failed: result.is_error };
+  } catch (cause) {
+    const error = asApiError(cause);
+    return { content: `${name} error: ${error.message}`, failed: true };
+  }
+}
+
+type StreamOutcome =
+  | { kind: 'done' }
+  | { kind: 'failed' }
+  | { kind: 'toolCalls'; calls: ToolCall[] };
+
+/** One request/response cycle, committed into `nodeId`. */
+async function runOneStream(options: {
+  nodeId: string;
+  turns: ReturnType<typeof wireTurns>;
+  alias: string | null;
+  tools: ToolDefinition[];
+  startedAt: number;
+  controller: AbortController;
+}): Promise<StreamOutcome> {
+  const { nodeId, alias, controller } = options;
+  const store = useStore.getState();
+
+  streamingStore.start();
+
   let firstTokenAt: number | null = null;
   let engineTokens: number | null = null;
+  let calls: ToolCall[] = [];
 
   try {
     const deltas = streamChat({
-      turns: wireTurns(path, store.settings.system),
+      turns: options.turns,
       model: alias,
       temperature: store.settings.temperature,
       topP: store.settings.topP,
       maxTokens: store.settings.maxTokens,
+      ...(options.tools.length ? { tools: options.tools } : {}),
       signal: controller.signal,
     });
 
@@ -75,45 +391,49 @@ export async function runTurn({ assistantId, path, alias }: RunOptions): Promise
         case 'usage':
           engineTokens = delta.completionTokens;
           break;
+        case 'toolCalls':
+          calls = delta.calls;
+          break;
       }
     }
 
     commit({
-      assistantId,
-      startedAt,
+      assistantId: nodeId,
+      startedAt: options.startedAt,
       firstTokenAt,
       engineTokens,
       alias,
       status: 'complete',
+      ...(calls.length ? { toolCalls: calls } : {}),
     });
+    return calls.length ? { kind: 'toolCalls', calls } : { kind: 'done' };
   } catch (cause) {
     if (controller.signal.aborted) {
       // A stopped turn KEEPS what arrived. The user pressed stop because they
       // had read enough, not because they wanted it thrown away.
       commit({
-        assistantId,
-        startedAt,
+        assistantId: nodeId,
+        startedAt: options.startedAt,
         firstTokenAt,
         engineTokens,
         alias,
         status: 'complete',
       });
-      return;
+      return { kind: 'done' };
     }
 
     const error = asApiError(cause);
     streamingStore.flush();
     const { content, reasoning } = streamingStore.current();
 
-    useStore.getState().patchNode(assistantId, {
+    useStore.getState().patchNode(nodeId, {
       content,
       ...(reasoning ? { reasoning } : {}),
       status: 'failed',
       error: { type: error.type, message: error.message },
       ...(alias ? { model: alias } : {}),
     });
-  } finally {
-    if (inFlight === controller) inFlight = null;
+    return { kind: 'failed' };
   }
 }
 
@@ -124,6 +444,7 @@ interface CommitOptions {
   firstTokenAt: number | null;
   engineTokens: number | null;
   status: 'complete';
+  toolCalls?: ToolCall[];
 }
 
 function commit({
@@ -133,6 +454,7 @@ function commit({
   engineTokens,
   alias,
   status,
+  toolCalls,
 }: CommitOptions): void {
   // Flush first: the last few tokens must not be sitting on a timer when the
   // final content is read.
@@ -149,6 +471,7 @@ function commit({
   useStore.getState().patchNode(assistantId, {
     content,
     ...(reasoning ? { reasoning } : {}),
+    ...(toolCalls?.length ? { toolCalls } : {}),
     status,
     ...(alias ? { model: alias } : {}),
     stats: {
@@ -182,7 +505,7 @@ export function send(text: string): void {
     status: 'streaming',
   });
 
-  void runTurn({ assistantId, path: pathExcluding(assistantId), alias });
+  void runTurn({ assistantId, alias });
 }
 
 /**
@@ -215,7 +538,6 @@ export function retry(nodeId: string): void {
 
   void runTurn({
     assistantId,
-    path: pathExcluding(assistantId),
     alias: store.selectedByKind.text,
   });
 }
@@ -252,7 +574,6 @@ export function editAndResend(nodeId: string, text: string): void {
 
   void runTurn({
     assistantId,
-    path: pathExcluding(assistantId),
     alias: store.selectedByKind.text,
   });
 }

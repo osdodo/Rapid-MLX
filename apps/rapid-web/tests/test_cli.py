@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from rmlx_web import cli
+from rmlx_web.connectors import ConnectorStore
 
 
 class TestLoginURL:
@@ -181,11 +182,21 @@ class TestOptionalModelArgument:
     def _args(self, argv: list[str]):
         return cli.build_parser().parse_args(argv)
 
-    def test_starting_with_no_model_is_allowed(self, monkeypatch):
+    def _connectors(self, tmp_path):
+        # Never the real ~/.config: this constructor reads a file other tools
+        # on this Mac use, and a test must not depend on what is in it.
+        return ConnectorStore(
+            config_path=tmp_path / "mcp.json",
+            settings_path=tmp_path / "rmlx-web.json",
+        )
+
+    def test_starting_with_no_model_is_allowed(self, monkeypatch, tmp_path):
         monkeypatch.setattr(cli, "find_rapid_mlx_binary", lambda explicit: "/bin/true")
 
         engine, catalog, downloads = cli._resolve_engine(
-            self._args([]), downloads_enabled=True
+            self._args([]),
+            downloads_enabled=True,
+            connectors=self._connectors(tmp_path),
         )
 
         # A supervisor, not an attached engine — it owns the child it will
@@ -197,23 +208,26 @@ class TestOptionalModelArgument:
         assert catalog is not None
         assert downloads is not None
 
-    def test_an_alias_is_still_honoured(self, monkeypatch):
+    def test_an_alias_is_still_honoured(self, monkeypatch, tmp_path):
         monkeypatch.setattr(cli, "find_rapid_mlx_binary", lambda explicit: "/bin/true")
 
         engine, catalog, _ = cli._resolve_engine(
-            self._args(["some-alias"]), downloads_enabled=False
+            self._args(["some-alias"]),
+            downloads_enabled=False,
+            connectors=self._connectors(tmp_path),
         )
 
         assert engine.can_switch is True
         assert catalog is not None
 
-    def test_attach_still_refuses_a_model(self):
+    def test_attach_still_refuses_a_model(self, tmp_path):
         # --attach targets a server this process does not own, so the
         # model is not ours to choose.
         with pytest.raises(SystemExit):
             cli._resolve_engine(
                 self._args(["--attach", "http://x", "alias"]),
                 downloads_enabled=False,
+                connectors=self._connectors(tmp_path),
             )
 
     def test_the_help_text_does_not_name_a_specific_model(self):

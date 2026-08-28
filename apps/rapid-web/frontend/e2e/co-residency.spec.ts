@@ -48,7 +48,7 @@ test('the images surface is usable while a chat model is primary', async ({ page
 
 test('a render names its own model rather than the primary', async ({ page, stub }) => {
   const bodies: Array<Record<string, unknown>> = [];
-  await page.route('**/v1/images/generations', async (route) => {
+  await page.route('**/api/images/jobs', async (route) => {
     bodies.push(route.request().postDataJSON() as Record<string, unknown>);
     await route.continue();
   });

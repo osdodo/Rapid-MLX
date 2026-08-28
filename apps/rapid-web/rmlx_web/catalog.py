@@ -116,9 +116,8 @@ KINDS = ("text", "image", "audio")
 # It is still the LAST resort, not the normal path: with a chat model
 # already up, the `--enable-audio` lane serves speech from that process
 # and nothing needs to be switched. Starting an audio model as the served
-# model is only for when the engine is otherwise idle — which is exactly
-# `rapid-mac`'s `ensureVoiceLane` contract (co-load if something is
-# serving, else bring the voice model up on its own).
+# model is only for when the engine is otherwise idle — co-load if
+# something is serving, else bring the voice model up on its own.
 LOADABLE_KINDS = frozenset({"text", "image", "audio"})
 
 

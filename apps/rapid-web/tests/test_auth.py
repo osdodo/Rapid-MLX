@@ -31,8 +31,7 @@ class TestTokenFile:
         first = auth.load_or_create_token(path)
         second = auth.load_or_create_token(path)
 
-        # Rotating per launch — as the desktop app's BearerSecret does —
-        # would log every phone out on each restart.
+        # Rotating per launch would log every phone out on each restart.
         assert first == second
 
     def test_rotate_replaces_the_stored_token(self, tmp_path):

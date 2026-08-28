@@ -178,7 +178,7 @@ test.describe('sheet chrome', () => {
       const onModels = await dialog.boundingBox();
 
       await dialog.getByRole('button', { name: 'Appearance' }).click();
-      await expect(dialog.getByText('Engine')).toBeVisible();
+      await expect(dialog.getByRole('heading', { name: 'Appearance' })).toBeVisible();
       const onAppearance = await dialog.boundingBox();
 
       expect(onAppearance!.height).toBe(onModels!.height);

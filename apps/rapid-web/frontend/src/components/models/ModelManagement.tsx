@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Trash2 } from 'lucide-react';
+import { ArrowUpDown, Check, HardDrive, Search, Trash2, X } from 'lucide-react';
 import {
   cancelDownload,
   fetchDownload,
@@ -14,20 +14,46 @@ import { useStore } from '@/state/store';
 import { startModel } from '@/state/startModel';
 import { noticeFor } from '@/state/notices';
 import { percent } from '@/components/models/LifecycleBand';
+import {
+  aggregateOnDiskBytes,
+  diskUsageFooter,
+  entryBytes,
+  filterEntries,
+  largestCachedEntry,
+  listHeading,
+  noMatchesCopy,
+  sortEntries,
+  storageSummary,
+  FILTER_LABELS,
+  SORT_LABELS,
+  type FilterMode,
+  type SortOrder,
+} from '@/components/models/modelCache';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Segmented } from '@/components/common/Segmented';
+import { PageHeader, SettingsRowDivider, SettingsSection } from '@/components/common/SettingsSection';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 /**
  * Model management, as the Settings window's first panel.
  *
- * Grouped by kind, following `rapid-mac`'s Model Management tabs. A kind with
- * no entries is HIDDEN rather than shown empty: audio aliases only exist once
- * the engine ships the audio registry, and an always-present empty tab reads
- * as a broken install.
+ * Ported from `rapid-mac`'s `SettingsModelManagementPanel`, same layout top to
+ * bottom: a Disk overview card, the capability tabs, the search + filter +
+ * sort controls, a counted list heading, one card of rows, and the
+ * "Total: X across N models" footer.
+ *
+ * A kind with no entries is HIDDEN rather than shown empty: audio aliases only
+ * exist once the engine ships the audio registry, and an always-present empty
+ * tab reads as a broken install.
  */
 
 const KIND_LABELS: Record<ModelKind, string> = {
@@ -37,6 +63,9 @@ const KIND_LABELS: Record<ModelKind, string> = {
 };
 
 const KIND_ORDER: ModelKind[] = ['text', 'image', 'audio'];
+
+const FILTER_ORDER: FilterMode[] = ['all', 'cached', 'notCached'];
+const SORT_ORDER: SortOrder[] = ['name', 'sizeDescending'];
 
 export function ModelManagement({ open, onClose }: { open: boolean; onClose(): void }) {
   const models = useStore((state) => state.models);
@@ -54,6 +83,8 @@ export function ModelManagement({ open, onClose }: { open: boolean; onClose(): v
 
   const [kind, setKind] = useState<ModelKind>('text');
   const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<FilterMode>('all');
+  const [sort, setSort] = useState<SortOrder>('name');
   const [loading, setLoading] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ModelEntry | null>(null);
@@ -142,13 +173,20 @@ export function ModelManagement({ open, onClose }: { open: boolean; onClose(): v
   // list with no way back.
   const activeKind = availableKinds.includes(kind) ? kind : (availableKinds[0] ?? 'text');
 
-  const visible = useMemo(() => {
-    const term = query.trim().toLowerCase();
-    return models.filter(
-      (model) =>
-        model.kind === activeKind && (term === '' || model.alias.toLowerCase().includes(term)),
-    );
-  }, [models, query, activeKind]);
+  const kindEntries = useMemo(
+    () => models.filter((model) => model.kind === activeKind),
+    [models, activeKind],
+  );
+
+  const visible = useMemo(
+    () => sortEntries(filterEntries(kindEntries, filter, query), sort),
+    [kindEntries, filter, query, sort],
+  );
+
+  const usage = useMemo(() => aggregateOnDiskBytes(kindEntries), [kindEntries]);
+  const largest = useMemo(() => largestCachedEntry(kindEntries), [kindEntries]);
+  const heading = listHeading(filter, query, visible.length, kindEntries.length);
+  const footer = diskUsageFooter(usage);
 
   const choose = async (model: ModelEntry) => {
     if (!model.loadable) {
@@ -215,8 +253,37 @@ export function ModelManagement({ open, onClose }: { open: boolean; onClose(): v
   };
 
   return (
-    <div className="flex min-h-full flex-col">
-      <div className="bg-background sticky top-0 z-1 flex flex-col gap-2 px-3.5 pt-3 pb-2">
+    <div className="flex min-h-full flex-col gap-6 px-5 pt-5 pb-[calc(env(safe-area-inset-bottom)+16px)]">
+      <PageHeader
+        title="Models"
+        subtitle="Manage the on-disk model cache. Download what you need; delete what you don't to reclaim space."
+      />
+
+      <SettingsSection title="Disk overview">
+        <div className="flex items-baseline gap-4">
+          <span className="flex items-center gap-2 text-sm font-medium">
+            <HardDrive className="text-muted-foreground size-4 shrink-0" aria-hidden="true" />
+            Models
+          </span>
+          <span className="text-muted-foreground flex-1 text-right font-mono text-xs">
+            {storageSummary(usage)}
+          </span>
+        </div>
+        {largest ? (
+          <>
+            <SettingsRowDivider />
+            <div className="flex items-baseline gap-3">
+              <span className="text-muted-foreground shrink-0 text-xs">Largest</span>
+              <span className="min-w-0 flex-1 truncate text-sm font-medium">{largest.alias}</span>
+              <span className="text-muted-foreground shrink-0 font-mono text-xs">
+                {formatBytes(largest.cached_bytes)}
+              </span>
+            </div>
+          </>
+        ) : null}
+      </SettingsSection>
+
+      <div className="flex flex-col gap-3">
         {availableKinds.length > 1 ? (
           <Segmented<ModelKind>
             label="Model type"
@@ -229,41 +296,106 @@ export function ModelManagement({ open, onClose }: { open: boolean; onClose(): v
             onChange={setKind}
           />
         ) : null}
-        <label htmlFor="model-search" className="sr-only">
-          Search models
-        </label>
-        <Input
-          id="model-search"
-          type="search"
-          className="h-10"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search models"
-          autoCapitalize="off"
-          autoCorrect="off"
+
+        <div className="flex items-center gap-2">
+          <div className="relative min-w-0 flex-1">
+            <label htmlFor="model-search" className="sr-only">
+              Search models
+            </label>
+            <Search
+              className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
+              aria-hidden="true"
+            />
+            <Input
+              id="model-search"
+              type="search"
+              className="h-10 px-9"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search models"
+              autoCapitalize="off"
+              autoCorrect="off"
+            />
+            {query !== '' ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="text-muted-foreground absolute top-1/2 right-1 size-8 -translate-y-1/2"
+                aria-label="Clear search"
+                onClick={() => setQuery('')}
+              >
+                <X />
+              </Button>
+            ) : null}
+          </div>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" className="h-10 shrink-0">
+                <ArrowUpDown />
+                Sort
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {SORT_ORDER.map((order) => (
+                <DropdownMenuItem key={order} onSelect={() => setSort(order)}>
+                  {/* A reserved slot, not a conditional icon: rendering the
+                      check only on the active row indents the labels
+                      differently from one another. */}
+                  <span className="flex size-4 shrink-0 items-center justify-center">
+                    {sort === order ? <Check className="size-4" /> : null}
+                  </span>
+                  {SORT_LABELS[order]}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        <Segmented<FilterMode>
+          label="Filter"
+          className="w-full"
+          value={filter}
+          options={FILTER_ORDER.map((mode) => ({ value: mode, label: FILTER_LABELS[mode] }))}
+          onChange={setFilter}
         />
       </div>
 
-      <div className="flex flex-1 flex-col gap-0.5 px-2.5 pb-3">
+      <section className="flex flex-col gap-2">
+        <div className="flex items-baseline gap-2">
+          <h3 className="m-0 text-[15px] leading-none font-semibold">{heading.title}</h3>
+          <span className="text-muted-foreground font-mono text-xs">{heading.countText}</span>
+        </div>
+
         {failure ? (
-          <p className="text-destructive m-0 px-3.5 py-6 text-center text-sm">{failure}</p>
+          <p className="text-destructive m-0 py-6 text-center text-sm">{failure}</p>
         ) : visible.length === 0 ? (
-          <p className="text-muted-foreground m-0 px-3.5 py-6 text-center text-sm">
-            {loading ? 'Loading…' : query ? 'No models match.' : 'No models found.'}
+          <p className="text-muted-foreground m-0 py-6 text-sm">
+            {loading ? 'Loading…' : noMatchesCopy(filter, query)}
           </p>
         ) : (
-          visible.map((model) => (
-            <ModelRow
-              key={model.alias}
-              model={model}
-              current={model.alias === selectedByKind[model.kind]}
-              deleting={deleting === model.alias}
-              onChoose={() => void choose(model)}
-              onDelete={() => setPendingDelete(model)}
-            />
-          ))
+          // One card holding every row, split by hairlines — rapid-mac's
+          // `listSection`. A card per row reads as a stack of stripes rather
+          // than one table. `p-1.5` insets the rows so a selected row's fill
+          // sits INSIDE the card rather than colliding with its rounded edge.
+          <div className="bg-card flex flex-col rounded-lg border p-1.5">
+            {visible.map((model, index) => (
+              <div key={model.alias}>
+                {index > 0 ? <div aria-hidden="true" className="bg-border mx-1.5 h-px" /> : null}
+                <ModelRow
+                  model={model}
+                  current={model.alias === selectedByKind[model.kind]}
+                  deleting={deleting === model.alias}
+                  onChoose={() => void choose(model)}
+                  onDelete={() => setPendingDelete(model)}
+                />
+              </div>
+            ))}
+          </div>
         )}
-      </div>
+
+        {footer ? <p className="text-muted-foreground m-0 text-xs">{footer}</p> : null}
+      </section>
 
       {download ? <DownloadStrip job={download} onCancel={() => void cancelDownload()} /> : null}
 
@@ -302,7 +434,7 @@ function ModelRow({
   onChoose(): void;
   onDelete(): void;
 }) {
-  const size = formatBytes(model.cached ? model.cached_bytes : model.size_bytes);
+  const size = formatBytes(entryBytes(model));
 
   return (
     // A div, not the button it used to be: the trash is a second control, and
@@ -379,7 +511,7 @@ function DownloadStrip({ job, onCancel }: { job: DownloadJob; onCancel(): void }
   return (
     <div
       className={cn(
-        'bg-muted sticky bottom-0 border-t px-3.5 pt-2.5 pb-[calc(env(safe-area-inset-bottom)+10px)]',
+        'bg-muted sticky bottom-0 -mx-5 border-t px-5 pt-2.5 pb-[calc(env(safe-area-inset-bottom)+10px)]',
         failed && 'border-destructive/40',
       )}
     >

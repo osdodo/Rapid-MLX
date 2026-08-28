@@ -1,6 +1,14 @@
 import { memo, useMemo, useState } from 'react';
 import type { Token, Tokens } from 'marked';
 import { highlight, type HastNode } from '@/markdown/highlight';
+import {
+  elementFor,
+  foldHtml,
+  scanHtml,
+  VOID_TAGS,
+  type HtmlEvent,
+  type HtmlNode,
+} from '@/markdown/html';
 import { parseMarkdown } from '@/markdown/lex';
 import { safeHref, safeImageSrc } from '@/markdown/links';
 import { segmentLaTeX } from '@/markdown/latex';
@@ -149,9 +157,18 @@ const Block = memo(function Block({ token, streaming, mathRendering }: BlockProp
       return null;
 
     case 'html':
-      // Raw HTML from a model is rendered as TEXT, never as markup. It is the
-      // one place a token could carry an element we did not construct.
-      return <p className={'md-p'}>{(token as Tokens.HTML).raw}</p>;
+      // A whole block of raw HTML. Only the allow-listed inline tags become
+      // elements; a `<script>`, an `<img>` or anything carrying an attribute
+      // renders as its literal source, exactly as this did before.
+      return (
+        <p className={'md-p'}>
+          <Inline
+            tokens={[token]}
+            mathRendering={mathRendering}
+            streaming={streaming}
+          />
+        </p>
+      );
 
     default: {
       const fallback = token as { tokens?: Token[]; raw?: string };
@@ -343,9 +360,56 @@ function inlineTokensOf(source: string): Token[] {
 
 function Inline({ tokens, mathRendering, streaming }: InlineProps): React.ReactNode {
   if (!tokens) return null;
-  return tokens.map((token, index) => (
-    <InlineToken key={index} token={token} mathRendering={mathRendering} streaming={streaming} />
-  ));
+
+  // `<b>` and `</b>` arrive as two SEPARATE html tokens with the emphasised
+  // run between them, so the nesting has to be rebuilt from the flat list —
+  // it is not in the token tree. Everything not on the allow-list becomes a
+  // text event and renders exactly as it did before.
+  type Payload = { token: Token; index: number };
+  const items: Array<HtmlEvent | { kind: 'payload'; value: Payload }> = [];
+  tokens.forEach((token, index) => {
+    if (token.type === 'html') items.push(...scanHtml((token as Tokens.HTML).raw));
+    else items.push({ kind: 'payload', value: { token, index } });
+  });
+
+  return (
+    <HtmlTree
+      nodes={foldHtml(items)}
+      mathRendering={mathRendering}
+      streaming={streaming}
+    />
+  );
+}
+
+/** The folded tree as elements. Every tag came from the allow-list and every
+ *  one is written here as JSX — no HTML string is ever constructed. */
+function HtmlTree({
+  nodes,
+  mathRendering,
+  streaming,
+}: {
+  nodes: HtmlNode<{ token: Token; index: number }>[];
+} & Omit<InlineProps, 'tokens'>): React.ReactNode {
+  return nodes.map((node, index) => {
+    if (node.kind === 'text') return <span key={index}>{node.value}</span>;
+    if (node.kind === 'payload') {
+      return (
+        <InlineToken
+          key={index}
+          token={node.value.token}
+          mathRendering={mathRendering}
+          streaming={streaming}
+        />
+      );
+    }
+    const Tag = elementFor(node.tag) as 'b';
+    if (VOID_TAGS.has(node.tag)) return <Tag key={index} />;
+    return (
+      <Tag key={index}>
+        <HtmlTree nodes={node.children} mathRendering={mathRendering} streaming={streaming} />
+      </Tag>
+    );
+  });
 }
 
 function InlineToken({
@@ -418,7 +482,7 @@ function InlineToken({
       // copyable, and the click is simply dead.
       if (href === null) return <span className={'md-dead-link'}>{label}</span>;
       return (
-        <a href={href} target="_blank" rel="noopener noreferrer">
+        <a className={'md-link'} href={href} target="_blank" rel="noopener noreferrer">
           {label}
         </a>
       );
@@ -434,6 +498,9 @@ function InlineToken({
     }
 
     case 'html':
+      // Unreachable in practice: `Inline` turns every html token into tag
+      // events before this sees it. Kept as the literal source so a token
+      // arriving by some other path still shows what the model wrote.
       return (token as Tokens.HTML).raw;
 
     default:

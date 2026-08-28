@@ -146,6 +146,67 @@ describe('link safety', () => {
   });
 });
 
+describe('inline HTML', () => {
+  // Models routinely write `<b>` and `<br>` in prose, and showing the literal
+  // tag reads as a rendering failure. Only the allow-list in markdown/html.ts
+  // becomes markup, and only in bare form.
+
+  it.each([
+    ['<b>bold</b>', 'b', 'bold'],
+    ['<strong>strong</strong>', 'strong', 'strong'],
+    ['<i>italic</i>', 'i', 'italic'],
+    ['<u>under</u>', 'u', 'under'],
+    ['<sub>sub</sub>', 'sub', 'sub'],
+    ['<sup>sup</sup>', 'sup', 'sup'],
+    ['<mark>mark</mark>', 'mark', 'mark'],
+  ])('renders %s as real markup', (source, tag, content) => {
+    const container = draw(source);
+    const element = container.querySelector(tag);
+    expect(element).toBeInTheDocument();
+    expect(element).toHaveTextContent(content);
+  });
+
+  it('renders <br> as a line break', () => {
+    expect(draw('one<br>two').querySelector('br')).toBeInTheDocument();
+  });
+
+  it('maps <strike> onto <s>, which React will accept', () => {
+    // React refuses the deprecated element name outright.
+    const container = draw('<strike>gone</strike>');
+    expect(container.querySelector('s')).toHaveTextContent('gone');
+  });
+
+  it('renders markdown INSIDE an html tag', () => {
+    // `<b>` and `</b>` are separate tokens with the run between them, so the
+    // nesting is rebuilt rather than read off the token tree.
+    const container = draw('<b>bold with `code`</b>');
+    expect(container.querySelector('b')?.querySelector('code')).toHaveTextContent('code');
+  });
+
+  it('still shows a script tag as text, beside a rendered one', () => {
+    // The exact line from the bug report: the safe tag renders, the two
+    // dangerous ones do not.
+    const container = draw('<b>HTML粗体</b> <script>alert(1)</script> <img src=x onerror=alert(2)>');
+
+    expect(container.querySelector('b')).toHaveTextContent('HTML粗体');
+    expect(container.querySelector('script')).not.toBeInTheDocument();
+    expect(container.querySelector('img')).not.toBeInTheDocument();
+    expect(container).toHaveTextContent('<script>alert(1)</script>');
+    expect(container).toHaveTextContent('<img src=x onerror=alert(2)>');
+  });
+
+  it('refuses an allow-listed tag that carries an attribute', () => {
+    // No attribute ever reaches an element, so there is nothing to sanitise.
+    const container = draw('<b onclick="alert(1)">x</b>');
+    expect(container.querySelector('b')).not.toBeInTheDocument();
+    expect(container).toHaveTextContent('<b onclick="alert(1)">x');
+  });
+
+  it('does not let an unclosed tag swallow the rest of the transcript', () => {
+    expect(draw('<b>open').querySelector('b')).toHaveTextContent('open');
+  });
+});
+
 describe('XSS fixtures', () => {
   // Everything in this pipeline is a React element built from a token, so
   // markup cannot be injected — except through Temml's MathML, which is the

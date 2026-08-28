@@ -115,6 +115,39 @@ class TestSupervisorLifecycle:
         assert "--resident-model-idle-ttl" in captured
 
     @pytest.mark.asyncio
+    async def test_the_mcp_config_path_is_read_at_every_spawn(self, monkeypatch):
+        """``--mcp-config`` is read once by the engine, at spawn.
+
+        So the value that matters is the one true at the MOMENT of the spawn:
+        a snapshot taken when the supervisor was built would arm connectors
+        the user switched off half an hour ago, and miss ones they just added.
+        """
+        captured: list[str] = []
+        path: str | None = None
+
+        async def fake_exec(*argv, **kwargs):
+            captured.clear()
+            captured.extend(argv)
+            raise OSError("stop here — argv is all this test needs")
+
+        monkeypatch.setattr(supervisor.asyncio, "create_subprocess_exec", fake_exec)
+
+        engine = EngineSupervisor(
+            binary="rapid-mlx", api_key="k", mcp_config_path=lambda: path
+        )
+
+        with pytest.raises(SupervisorError):
+            await engine.start("qwen3-4b")
+        # Off: the child gets no MCP subsystem at all, not merely zero
+        # servers.
+        assert "--mcp-config" not in captured
+
+        path = "/tmp/mcp.json"
+        with pytest.raises(SupervisorError):
+            await engine.start("qwen3-4b")
+        assert captured[captured.index("--mcp-config") + 1] == "/tmp/mcp.json"
+
+    @pytest.mark.asyncio
     async def test_child_that_exits_immediately_reports_failure(self):
         # A child that never binds a port must be noticed by its exit,
         # not by waiting out the full readiness timeout — otherwise a bad
@@ -279,8 +312,6 @@ class TestAttachedEngine:
 
 class TestResidentMemoryCeiling:
     def test_is_eighty_percent_of_physical_ram(self, monkeypatch):
-        # The same rule as the Mac app's ModelSizing.residentMemoryCeilingGB,
-        # so the two surfaces do not disagree about this machine.
         # 16384 * 2097152 = 32 GiB -> floor(32 * 0.8) = 25
         monkeypatch.setattr(
             supervisor.os,

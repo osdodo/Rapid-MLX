@@ -42,8 +42,11 @@ export function SpeechPanel() {
   const [speed, setSpeed] = useState(1);
   const [busy, setBusy] = useState(false);
   const [audio, setAudio] = useState<{ url: string; bytes: number } | null>(null);
-  const [previewing, setPreviewing] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState<{ voice: string; loading: boolean } | null>(null);
   const preview = useRef<HTMLAudioElement | null>(null);
+  // Bumped by every stop, so a synthesis that lands after the user has moved
+  // on cannot start playing over whatever replaced it.
+  const previewToken = useRef(0);
 
   const alias = model.alias;
   const live = model.live;
@@ -69,6 +72,7 @@ export function SpeechPanel() {
 
   // A preview outlives neither a model change nor the panel.
   const stopPreview = useCallback(() => {
+    previewToken.current += 1;
     preview.current?.pause();
     preview.current = null;
     setPreviewing(null);
@@ -118,12 +122,13 @@ export function SpeechPanel() {
 
   const playPreview = useCallback(
     async (candidate: string) => {
-      if (previewing === candidate) {
+      if (previewing?.voice === candidate) {
         stopPreview();
         return;
       }
       stopPreview();
-      setPreviewing(candidate);
+      const token = previewToken.current;
+      setPreviewing({ voice: candidate, loading: true });
       try {
         const blob = await synthesize({
           input: previewText(candidate),
@@ -131,16 +136,19 @@ export function SpeechPanel() {
           voice: candidate,
           speed,
         });
+        if (previewToken.current !== token) return;
         const element = new Audio(URL.createObjectURL(blob));
         // Revoked on `ended` rather than after `play()`: revoking a URL the
         // element is still reading from stops playback in WebKit.
         element.addEventListener('ended', () => {
           URL.revokeObjectURL(element.src);
-          setPreviewing((current) => (current === candidate ? null : current));
+          setPreviewing((current) => (current?.voice === candidate ? null : current));
         });
         preview.current = element;
+        setPreviewing({ voice: candidate, loading: false });
         await element.play();
       } catch (cause) {
+        if (previewToken.current !== token) return;
         setPreviewing(null);
         pushNotice(noticeFor(asApiError(cause)));
       }
@@ -250,9 +258,10 @@ export function SpeechPanel() {
  * decoded detail and a play button that synthesises a sample in that voice's
  * own language.
  *
- * `onSelect={(event) => event.preventDefault()}` on the preview button keeps
- * the menu open: previewing is comparison, and a menu that closes on the first
- * sample makes comparing two voices six clicks instead of two.
+ * Previewing is comparison, so the preview button must not close the menu:
+ * a menu that closes on the first sample makes comparing two voices six
+ * clicks instead of two. Synthesis is not instant either, so the button
+ * spins while the sample is being generated — otherwise a tap looks ignored.
  */
 function VoicePicker({
   voices,
@@ -265,10 +274,14 @@ function VoicePicker({
   voices: string[];
   value: string | null;
   placeholder: string;
-  previewing: string | null;
+  previewing: { voice: string; loading: boolean } | null;
   onSelect(voice: string): void;
   onPreview(voice: string): void;
 }) {
+  // Set by the preview button, read by the row it sits in. The button's click
+  // bubbles into the row, so the flag is always set before the row reads it.
+  const fromPreview = useRef(false);
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -287,42 +300,58 @@ function VoicePicker({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="max-h-[50dvh] w-[min(22rem,90vw)] overflow-y-auto">
-        {voices.map((candidate) => (
-          <DropdownMenuItem
-            key={candidate}
-            className="gap-2 pr-1"
-            onSelect={() => onSelect(candidate)}
-          >
-            <span className="min-w-0 flex-1 truncate text-sm">{candidate}</span>
-            <span className="text-muted-foreground shrink-0 text-xs">
-              {voiceDetails(candidate)}
-            </span>
-            <button
-              type="button"
-              aria-label={
-                previewing === candidate ? `Stop ${candidate} preview` : `Preview ${candidate}`
-              }
-              className={cn(
-                'hover:bg-accent flex size-7 shrink-0 items-center justify-center rounded-md transition-colors outline-none',
-                'focus-visible:ring-ring/50 focus-visible:ring-[3px]',
-              )}
-              // Both, and on the CAPTURE phase for pointerdown: Radix's item
-              // selects on pointerdown, so stopping only the click still
-              // closes the menu before the preview is audible.
-              onPointerDownCapture={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onPreview(candidate);
+        {voices.map((candidate) => {
+          const active = previewing?.voice === candidate ? previewing : null;
+          return (
+            <DropdownMenuItem
+              key={candidate}
+              className="gap-2 pr-1"
+              onSelect={(event) => {
+                // Radix keeps the menu open only if THIS event is defaulted.
+                // Stopping propagation on the button is not enough: on
+                // `pointerup` the item re-fires a synthetic `click()` whenever
+                // it never saw the matching `pointerdown`.
+                if (fromPreview.current) {
+                  fromPreview.current = false;
+                  event.preventDefault();
+                  return;
+                }
+                onSelect(candidate);
               }}
             >
-              {previewing === candidate ? (
-                <Square className="size-3 fill-current" />
-              ) : (
-                <Play className="size-3.5" />
-              )}
-            </button>
-          </DropdownMenuItem>
-        ))}
+              <span className="min-w-0 flex-1 truncate text-sm">{candidate}</span>
+              <span className="text-muted-foreground shrink-0 text-xs">
+                {voiceDetails(candidate)}
+              </span>
+              <button
+                type="button"
+                aria-label={
+                  active?.loading
+                    ? `Generating ${candidate} preview`
+                    : active
+                      ? `Stop ${candidate} preview`
+                      : `Preview ${candidate}`
+                }
+                className={cn(
+                  'hover:bg-accent flex size-7 shrink-0 items-center justify-center rounded-md transition-colors outline-none',
+                  'focus-visible:ring-ring/50 focus-visible:ring-[3px]',
+                )}
+                onClick={() => {
+                  fromPreview.current = true;
+                  onPreview(candidate);
+                }}
+              >
+                {active?.loading ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : active ? (
+                  <Square className="size-3 fill-current" />
+                ) : (
+                  <Play className="size-3.5" />
+                )}
+              </button>
+            </DropdownMenuItem>
+          );
+        })}
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -19,7 +19,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -27,13 +27,15 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, proxy
+from . import auth, connectors, proxy, tools
 from .catalog import CatalogError, ModelCatalog, RemovalError
+from .connectors import ConnectorError, ConnectorStore
 from .downloads import (
     DownloadError,
     DownloadManager,
     check_disk_budget,
 )
+from .images import ImageJobError, ImageJobManager, ImageJobState
 from .supervisor import (
     AttachedEngine,
     ChildState,
@@ -131,6 +133,10 @@ class WebConfig:
     # ``None`` when downloads are disabled — also the single source of
     # truth for whether they are allowed.
     downloads: DownloadManager | None = None
+    # Owns the MCP config file and the switches around it. Always present:
+    # unlike downloads, there is no mode in which connectors cannot be
+    # configured — the master switch is the off state.
+    connectors: ConnectorStore = field(default_factory=ConnectorStore)
 
 
 # Catalog kind -> the engine's own modality vocabulary. `audio` never
@@ -200,6 +206,9 @@ async def _switch(config: WebConfig, alias: str, entry=None) -> None:
 
 def create_app(config: WebConfig) -> FastAPI:
     streams = StreamTracker()
+    # Renders run detached from the request that started them, so they are
+    # counted here for their whole life rather than by a route.
+    image_jobs = ImageJobManager(streams)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -230,6 +239,8 @@ def create_app(config: WebConfig) -> FastAPI:
             if config.downloads is not None:
                 with contextlib.suppress(Exception):
                     await config.downloads.shutdown()
+            with contextlib.suppress(Exception):
+                await image_jobs.shutdown()
             # Always stop the child, including when startup itself failed:
             # a half-started engine still holds GPU memory.
             await config.engine.stop()
@@ -648,66 +659,20 @@ def create_app(config: WebConfig) -> FastAPI:
             headers=proxy.filtered_response_headers(upstream.headers),
         )
 
-    @app.post("/v1/images/generations")
-    async def image_generations(request: Request):
-        """Render an image on the loaded image model.
+    @app.post("/api/images/jobs")
+    async def start_image_job(request: Request):
+        """Start a render or an edit, and answer with its id immediately.
 
-        A plain relay, with one addition: the request is counted as a
-        stream so a concurrent ``/api/models/load`` refuses rather than
-        killing the engine mid-render. A render is minutes of GPU work
-        and has no resume.
-        """
-        try:
-            payload = await request.json()
-        except (ValueError, json.JSONDecodeError):
-            return _json_error(400, "request body was not valid JSON", "invalid_json")
-        if not isinstance(payload, dict):
-            return _json_error(
-                400, "request body must be a JSON object", "invalid_json"
-            )
+        The connection is NOT held for the render. The engine replies only
+        once the whole image is finished, so relaying inline left a socket
+        with no bytes flowing for minutes and Cloudflare cut it at 100 s
+        with a 524. The page polls ``/api/images/jobs/{id}`` instead.
 
-        engine = config.engine
-        base_url = engine.base_url
-        if base_url is None:
-            snapshot = engine.status()
-            return _json_error(
-                503,
-                _unavailable_message(snapshot.state, snapshot.detail),
-                "engine_unavailable",
-            )
-
-        with streams.track():
-            try:
-                upstream = await proxy.proxy_unary(
-                    app.state.http,
-                    base_url=base_url,
-                    path="/v1/images/generations",
-                    payload=payload,
-                    api_key=engine.api_key,
-                )
-            except httpx.HTTPError as exc:
-                return _json_error(
-                    502, f"connection to the engine failed: {exc}", "engine_transport"
-                )
-
-        return JSONResponse(
-            status_code=upstream.status_code,
-            content=_decode_json_body(upstream),
-            headers=proxy.filtered_response_headers(upstream.headers),
-        )
-
-    @app.post("/api/images/edits")
-    async def image_edits(request: Request):
-        """Instruction-edit an image the user supplied.
-
-        JSON with the source as base64, rebuilt into the multipart the
-        engine's ``/v1/images/edits`` expects — the middleware's CSRF
-        control rejects ``multipart/form-data``, so relaying the browser's
-        own would need a second, weaker policy. Same reasoning as
+        ``mode`` picks the shape. An edit carries its source as base64 and
+        is rebuilt into the multipart the engine expects — the middleware's
+        CSRF control rejects ``multipart/form-data``, so relaying the
+        browser's own would need a second, weaker policy. Same reasoning as
         ``/api/audio/transcriptions``.
-
-        ``size`` is deliberately not forwarded: the edit backends derive
-        their canvas from the input image and the engine discards it.
         """
         try:
             payload = await request.json()
@@ -716,29 +681,41 @@ def create_app(config: WebConfig) -> FastAPI:
         if not isinstance(payload, dict):
             return _json_error(
                 400, "request body must be a JSON object", "invalid_json"
+            )
+
+        mode = payload.get("mode", "generation")
+        if mode not in ("generation", "edit"):
+            return _json_error(
+                400, "`mode` must be 'generation' or 'edit'", "invalid_body"
             )
 
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return _json_error(400, "`prompt` must not be empty", "invalid_body")
+        prompt = prompt.strip()
 
-        encoded = payload.get("image")
-        if not isinstance(encoded, str) or not encoded:
-            return _json_error(
-                400, "`image` must be a base64-encoded string", "invalid_body"
-            )
-        try:
-            content = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error):
-            return _json_error(400, "`image` was not valid base64", "invalid_body")
-        if not content:
-            return _json_error(400, "the image was empty", "invalid_body")
-        if len(content) > MAX_IMAGE_BYTES:
-            return _json_error(
-                413,
-                f"that image is larger than {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
-                "payload_too_large",
-            )
+        model = payload.get("model")
+        model = model if isinstance(model, str) and model else None
+
+        content: bytes | None = None
+        if mode == "edit":
+            encoded = payload.get("image")
+            if not isinstance(encoded, str) or not encoded:
+                return _json_error(
+                    400, "`image` must be a base64-encoded string", "invalid_body"
+                )
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                return _json_error(400, "`image` was not valid base64", "invalid_body")
+            if not content:
+                return _json_error(400, "the image was empty", "invalid_body")
+            if len(content) > MAX_IMAGE_BYTES:
+                return _json_error(
+                    413,
+                    f"that image is larger than {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
+                    "payload_too_large",
+                )
 
         engine = config.engine
         base_url = engine.base_url
@@ -750,15 +727,12 @@ def create_app(config: WebConfig) -> FastAPI:
                 "engine_unavailable",
             )
 
-        fields = {"prompt": prompt, "n": "1", "response_format": "b64_json"}
-        model = payload.get("model")
-        if isinstance(model, str) and model:
-            fields["model"] = model
+        if mode == "edit":
+            fields = {"prompt": prompt, "n": "1", "response_format": "b64_json"}
+            if model:
+                fields["model"] = model
 
-        # Counted like a render: an edit is minutes of GPU work with no
-        # resume, and a concurrent switch would kill the engine doing it.
-        with streams.track():
-            try:
+            async def work():
                 upstream = await proxy.proxy_multipart(
                     app.state.http,
                     base_url=base_url,
@@ -772,45 +746,76 @@ def create_app(config: WebConfig) -> FastAPI:
                     content=content,
                     fields=fields,
                 )
-            except httpx.HTTPError as exc:
-                return _json_error(
-                    502, f"connection to the engine failed: {exc}", "engine_transport"
+                return upstream.status_code, _decode_json_body(upstream)
+        else:
+            body = {
+                "prompt": prompt,
+                "n": 1,
+                "response_format": "b64_json",
+                **({"model": model} if model else {}),
+                # `size` is forwarded only for generation: the edit backends
+                # derive their canvas from the source image and discard it.
+                **(
+                    {"size": payload["size"]}
+                    if isinstance(payload.get("size"), str)
+                    else {}
+                ),
+            }
+
+            async def work():
+                upstream = await proxy.proxy_unary(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/images/generations",
+                    payload=body,
+                    api_key=engine.api_key,
                 )
+                return upstream.status_code, _decode_json_body(upstream)
 
-        return JSONResponse(
-            status_code=upstream.status_code, content=_decode_json_body(upstream)
-        )
+        try:
+            job = image_jobs.start(work, model=model)
+        except ImageJobError as exc:
+            return _json_error(409, str(exc), "image_busy")
+        return JSONResponse(job.to_dict())
 
-    @app.get("/api/images/progress")
-    async def image_progress(model: str = ""):
-        """Denoise progress for the single in-flight render.
+    @app.get("/api/images/jobs/{job_id}")
+    async def image_job(job_id: str):
+        """The job's progress while it runs, and its result when it ends.
 
-        Polled, like the download feed and for the same reason: a sparse
-        SSE body is buffered indefinitely by a tunnel. Diffusion has a
-        fixed step count, so ``step / total`` is a true fraction rather
-        than an estimate.
+        One poll answers both, so a render occupies a single connection at
+        a time. Polled rather than streamed: a sparse SSE body is buffered
+        indefinitely by a tunnel, which is what removed the download feed.
 
-        An unreachable engine answers ``running: false`` rather than an
-        error — the poller's job is to report the render, and a dropped
-        poll mid-render is not itself a failure.
+        An unknown id is 404 — only the last job is kept, and reporting a
+        vanished one as idle would leave the page waiting on it forever.
         """
+        job = image_jobs.get(job_id)
+        if job is None:
+            return _json_error(404, "no such render", "unknown_image_job")
+
+        snapshot = job.to_dict()
+        if job.state is not ImageJobState.RUNNING:
+            return JSONResponse(snapshot)
+
+        # Denoise steps come from the engine, and a dropped read is not a
+        # render failure — the job's own state is what reports one.
         engine = config.engine
         base_url = engine.base_url
-        if base_url is None:
-            return JSONResponse({"running": False, "step": 0, "total": 0})
-        try:
-            upstream = await proxy.proxy_get(
-                app.state.http,
-                base_url=base_url,
-                path="/v1/images/progress",
-                api_key=engine.api_key,
-                params={"model": model} if model else None,
-            )
-        except httpx.HTTPError:
-            return JSONResponse({"running": False, "step": 0, "total": 0})
-        if upstream.status_code >= 400:
-            return JSONResponse({"running": False, "step": 0, "total": 0})
-        return JSONResponse(_decode_json_body(upstream))
+        step, total = 0, 0
+        if base_url is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                upstream = await proxy.proxy_get(
+                    app.state.http,
+                    base_url=base_url,
+                    path="/v1/images/progress",
+                    api_key=engine.api_key,
+                    params={"model": job.model} if job.model else None,
+                )
+                if upstream.status_code < 400:
+                    progress = _decode_json_body(upstream)
+                    step = progress.get("step") or 0
+                    total = progress.get("total") or 0
+        return JSONResponse({**snapshot, "step": step, "total": total})
 
     @app.post("/api/images/cancel")
     async def image_cancel(request: Request):
@@ -866,6 +871,430 @@ def create_app(config: WebConfig) -> FastAPI:
         if upstream.status_code >= 400:
             return JSONResponse(_EMPTY_RESIDENCY)
         return JSONResponse(_decode_json_body(upstream))
+
+    # ---------------------------------------------------------------- tools
+    #
+    # The tool loop lives in the page — it is what streams the answer — but
+    # the tools run here: a browser cannot fetch an arbitrary origin, and none
+    # of these providers send the CORS headers that would let it.
+
+    @app.get("/api/tools")
+    async def list_tools() -> JSONResponse:
+        """Every tool this server can run, as OpenAI tool definitions.
+
+        The page sends the enabled subset back on the chat request, so this
+        is the source of truth for the schemas the model is shown.
+        """
+        return JSONResponse(
+            {
+                "tools": tools.DEFINITIONS,
+                "approval_required": sorted(tools.APPROVAL_REQUIRED),
+            }
+        )
+
+    @app.post("/api/tools/call")
+    async def call_tool(request: Request):
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return _json_error(400, "request body was not valid JSON", "invalid_json")
+        if not isinstance(payload, dict):
+            return _json_error(
+                400, "request body must be a JSON object", "invalid_json"
+            )
+
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            return _json_error(400, "`name` must be a non-empty string", "invalid_body")
+
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, str):
+            return _json_error(
+                400, "`arguments` must be a JSON-encoded string", "invalid_body"
+            )
+
+        # What the model was actually shown this round. The load-bearing gate:
+        # leaving a tool out of the request body does not stop a malformed
+        # model emitting a call for it.
+        advertised = payload.get("advertised")
+        if not isinstance(advertised, list) or not all(
+            isinstance(item, str) for item in advertised
+        ):
+            return _json_error(
+                400, "`advertised` must be an array of tool names", "invalid_body"
+            )
+
+        origins = payload.get("approved_origins") or []
+        if not isinstance(origins, list) or not all(
+            isinstance(item, str) for item in origins
+        ):
+            return _json_error(
+                400, "`approved_origins` must be an array of strings", "invalid_body"
+            )
+
+        result = await tools.run_tool(
+            app.state.http,
+            name=name,
+            arguments=arguments,
+            advertised=set(advertised),
+            approved_origins=set(origins),
+        )
+        return JSONResponse(result.to_dict())
+
+    # ----------------------------------------------------------- connectors
+    #
+    # MCP servers are programs on this Mac that expose tools. The engine
+    # spawns and validates them; this owns the config file it reads
+    # (``~/.config/rapid-mlx/mcp.json``) and relays the engine's read-only
+    # view of what actually connected.
+    #
+    # ``--mcp-config`` is read ONCE at spawn, so arming connectors on a
+    # running child is impossible — hence ``needs_restart`` below and the
+    # restart route, rather than a silent no-op.
+
+    async def _engine_mcp(path: str, *, method: str = "GET") -> dict | None:
+        """One engine MCP read, or None when it could not be reached.
+
+        None rather than an exception: an unreachable engine is most of a
+        model switch, and the panel still has a config to render.
+        """
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            return None
+        try:
+            if method == "POST":
+                upstream = await proxy.proxy_post_query(
+                    app.state.http,
+                    base_url=base_url,
+                    path=path,
+                    api_key=engine.api_key,
+                    timeout=30.0,
+                )
+            else:
+                upstream = await proxy.proxy_get(
+                    app.state.http,
+                    base_url=base_url,
+                    path=path,
+                    api_key=engine.api_key,
+                    timeout=15.0,
+                )
+        except httpx.HTTPError:
+            return None
+        # 404 is an engine predating these routes, not a failure to report.
+        if upstream.status_code >= 400:
+            return None
+        body = _decode_json_body(upstream)
+        return body if isinstance(body, dict) else None
+
+    def _connector_snapshot(
+        servers_body: dict | None, tools_body: dict | None
+    ) -> dict:
+        """The whole panel's state, composed from config plus engine truth.
+
+        One response rather than three: every field the panel renders is
+        derived from the same instant, and a rail that fetched them
+        separately would show a server as connected beside a tool list that
+        no longer contains its tools.
+        """
+        store = config.connectors
+        engine_servers = []
+        subsystem_error = None
+        configured = False
+        if servers_body is not None:
+            raw = servers_body.get("servers")
+            engine_servers = raw if isinstance(raw, list) else []
+            subsystem_error = servers_body.get("error")
+            configured = servers_body.get("configured") is True
+
+        # Only tools whose namespaced name is a legal OpenAI function name.
+        # Advertising one that would 400 on the wire reads as "that tool
+        # silently does nothing"; not advertising it is honest.
+        engine_tools = []
+        if tools_body is not None:
+            raw_tools = tools_body.get("tools")
+            for tool in raw_tools if isinstance(raw_tools, list) else []:
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if isinstance(name, str) and _is_legal_function_name(name):
+                    engine_tools.append(
+                        {
+                            "name": name,
+                            "description": tool.get("description") or "",
+                            "server": tool.get("server") or "",
+                            "parameters": tool.get("parameters"),
+                        }
+                    )
+
+        snapshot = config.engine.status()
+        # Connectors are on, there is something to connect, a child is
+        # running, and that child reports no MCP config — which is exactly
+        # what a spawn that predates the master switch looks like. Derived
+        # every time rather than recorded, so it cannot survive the condition
+        # it describes.
+        needs_restart = (
+            store.is_enabled
+            and any(server.enabled for server in store.servers)
+            and snapshot.state is ChildState.READY
+            and not configured
+        )
+
+        return {
+            "enabled": store.is_enabled,
+            "servers": [server.to_dict() for server in store.servers],
+            "load_error": store.load_error,
+            "config_path": str(store.path),
+            "engine_servers": engine_servers,
+            "engine_reachable": servers_body is not None,
+            "subsystem_error": subsystem_error,
+            "configured": configured,
+            "needs_restart": needs_restart,
+            "engine_running": snapshot.state is ChildState.READY,
+            "tools": engine_tools,
+            "disabled_tools": sorted(store.disabled_tools),
+            "granted_tools": sorted(store.granted_tools),
+            "auto_approve_all": store.auto_approve_all,
+        }
+
+    async def _connector_state() -> JSONResponse:
+        store = config.connectors
+        # The panel is where a user comes to ask "did it work?", so read the
+        # file back rather than trusting the copy in memory: it is
+        # hand-editable and other tools on this Mac read it too.
+        store.reload_from_disk()
+        store.reconcile_grants()
+        servers_body = None
+        tools_body = None
+        if store.is_enabled:
+            servers_body = await _engine_mcp("/v1/mcp/servers")
+            tools_body = await _engine_mcp("/v1/mcp/tools")
+        return JSONResponse(_connector_snapshot(servers_body, tools_body))
+
+    @app.get("/api/connectors")
+    async def get_connectors() -> JSONResponse:
+        return await _connector_state()
+
+    @app.post("/api/connectors/settings")
+    async def set_connector_settings(request: Request):
+        """The switches: master, auto-approve, per-tool, grant reset."""
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        store = config.connectors
+
+        try:
+            if isinstance(payload.get("enabled"), bool):
+                store.set_enabled(payload["enabled"])
+            if isinstance(payload.get("auto_approve_all"), bool):
+                store.set_auto_approve_all(payload["auto_approve_all"])
+            tool = payload.get("tool")
+            if isinstance(tool, str) and isinstance(payload.get("tool_enabled"), bool):
+                store.set_tool_enabled(tool, payload["tool_enabled"])
+            if isinstance(tool, str) and payload.get("grant") is True:
+                store.grant_tool(tool)
+            if payload.get("reset_grants") is True:
+                store.reset_grants()
+        except ConnectorError as exc:
+            return _json_error(500, str(exc), "connector_write_failed")
+
+        return await _connector_state()
+
+    @app.post("/api/connectors/servers")
+    async def upsert_connector(request: Request):
+        """Add or edit one server.
+
+        The command reaches a file the ENGINE spawns from, and the engine's
+        allowlist (``mcp/security.py``: npx/uv/python/…) plus its argument
+        and environment scrubbing are the gate. Nothing here second-guesses
+        it, because a second, different allowlist would only disagree with
+        the one that actually runs.
+        """
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+
+        replacing = payload.get("replacing")
+        if replacing is not None and not isinstance(replacing, str):
+            return _json_error(400, "`replacing` must be a string", "invalid_body")
+
+        try:
+            server = connectors.server_from_payload(payload.get("server"))
+            reconfigured = config.connectors.upsert(server, replacing=replacing)
+        except ConnectorError as exc:
+            return _json_error(400, str(exc), "invalid_connector")
+
+        # Only after the write is durable: a failed save must not strand a
+        # connector with its consent deleted.
+        if reconfigured and isinstance(replacing, str):
+            config.connectors.revoke_grants_for_server(replacing)
+
+        await _apply_connector_change()
+        return await _connector_state()
+
+    @app.post("/api/connectors/servers/remove")
+    async def remove_connector(request: Request):
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            return _json_error(400, "`name` must be a non-empty string", "invalid_body")
+
+        try:
+            config.connectors.remove(name)
+        except ConnectorError as exc:
+            return _json_error(404, str(exc), "unknown_connector")
+
+        config.connectors.revoke_grants_for_server(name)
+        await _apply_connector_change()
+        return await _connector_state()
+
+    @app.post("/api/connectors/servers/enabled")
+    async def set_connector_enabled(request: Request):
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        name = payload.get("name")
+        enabled = payload.get("enabled")
+        if not isinstance(name, str) or not isinstance(enabled, bool):
+            return _json_error(
+                400, "`name` and `enabled` are required", "invalid_body"
+            )
+
+        try:
+            config.connectors.set_server_enabled(name, enabled)
+        except ConnectorError as exc:
+            return _json_error(404, str(exc), "unknown_connector")
+
+        await _apply_connector_change()
+        return await _connector_state()
+
+    async def _apply_connector_change() -> None:
+        """Push a config edit into the running child, best effort.
+
+        The engine's reload route re-reads the file and rebuilds every
+        connection, which is what makes an edit take effect without a model
+        restart. When it cannot — no child, or a child spawned without
+        ``--mcp-config`` — the snapshot's ``configured`` stays false and
+        ``needs_restart`` raises the banner instead. Nothing is recorded, so
+        the banner cannot outlive the condition.
+        """
+        if config.engine.base_url is None:
+            return
+        await _engine_mcp("/v1/mcp/reload", method="POST")
+
+    @app.post("/api/connectors/restart")
+    async def restart_for_connectors():
+        """Respawn the current model so the child gets ``--mcp-config``.
+
+        A real button rather than an instruction: telling the user to go find
+        the model picker and cycle it themselves is asking them to do the
+        app's job.
+        """
+        engine = config.engine
+        if not engine.can_switch:
+            return _json_error(
+                409, "this server cannot restart the engine", "switching_disabled"
+            )
+        if streams.active:
+            return _json_error(
+                409,
+                "a response is still streaming; stop it before restarting",
+                "engine_busy",
+            )
+        snapshot = engine.status()
+        alias = snapshot.model
+        if alias is None:
+            return _json_error(409, "no model is loaded", "no_model")
+
+        # Detached, like every other start: a respawn is minutes on a cold
+        # cache, and the page reads `/api/status` for progress either way.
+        asyncio.create_task(_boot_alias(config, alias))
+        return JSONResponse({"restarting": True, "model": alias})
+
+    @app.post("/api/connectors/execute")
+    async def execute_connector_tool(request: Request):
+        """Run one MCP tool through the engine.
+
+        The consent gate is in the PAGE — by the time a call reaches here the
+        user has approved it. This still refuses a tool the user switched off,
+        because the switch has to hold against a malformed model emitting the
+        name anyway, exactly as ``/api/tools/call`` checks ``advertised``.
+        """
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            return _json_error(400, "`name` must be a non-empty string", "invalid_body")
+        arguments = payload.get("arguments")
+        if arguments is not None and not isinstance(arguments, str):
+            return _json_error(
+                400, "`arguments` must be a JSON-encoded string", "invalid_body"
+            )
+
+        store = config.connectors
+        if not store.is_enabled:
+            return _json_error(
+                409, "connectors are turned off", "connectors_disabled"
+            )
+        if name in store.disabled_tools:
+            return _json_error(
+                409, f"tool '{name}' is turned off", "tool_disabled"
+            )
+
+        engine = config.engine
+        base_url = engine.base_url
+        if base_url is None:
+            snapshot = engine.status()
+            return _json_error(
+                503,
+                _unavailable_message(snapshot.state, snapshot.detail),
+                "engine_unavailable",
+            )
+
+        # An empty string means a no-arg tool, which is legal.
+        text = (arguments or "").strip()
+        try:
+            parsed = json.loads(text) if text else {}
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            return JSONResponse(
+                {
+                    "content": f"tool '{name}' error: arguments must be a JSON object",
+                    "is_error": True,
+                }
+            )
+
+        try:
+            upstream = await app.state.http.post(
+                f"{base_url.rstrip('/')}/v1/mcp/execute",
+                json={"tool_name": name, "arguments": parsed},
+                headers=proxy.upstream_headers(engine.api_key),
+                # A connector tool can legitimately take a while (a query, a
+                # fetch); the engine applies the per-server timeout from the
+                # config file.
+                timeout=httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=10.0),
+            )
+        except httpx.HTTPError as exc:
+            return _json_error(502, f"the engine did not answer: {exc}", "engine_error")
+
+        if upstream.status_code >= 400:
+            return _json_error(
+                upstream.status_code,
+                _describe_connector_failure(upstream),
+                "tool_failed",
+            )
+
+        body = _decode_json_body(upstream)
+        body = body if isinstance(body, dict) else {}
+        return JSONResponse(
+            {
+                "content": _flatten_tool_content(body),
+                "is_error": body.get("is_error") is True,
+            }
+        )
 
     # ---------------------------------------------------------------- audio
     #
@@ -1059,12 +1488,88 @@ def _decode_json_body(response: httpx.Response) -> dict:
         }
 
 
+async def _json_object(request: Request) -> dict | JSONResponse:
+    """The request body as a dict, or the error response to return instead."""
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return _json_error(400, "request body was not valid JSON", "invalid_json")
+    if not isinstance(payload, dict):
+        return _json_error(400, "request body must be a JSON object", "invalid_json")
+    return payload
+
+
 def _unavailable_message(state: ChildState, detail: str | None) -> str:
     if state is ChildState.STARTING:
         return "the model is still loading; retry shortly"
     if state is ChildState.FAILED:
         return f"the engine failed to start: {detail or 'unknown error'}"
     return "no model is loaded"
+
+
+_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _is_legal_function_name(name: str) -> bool:
+    """Whether a namespaced ``server__tool`` can travel as a function name.
+
+    A connector names its own tools, so nothing bounds the composite's length
+    or characters. Advertising one the model cannot emit — or that 400s on the
+    wire — reads as "that tool silently does nothing".
+    """
+    return bool(_FUNCTION_NAME_RE.match(name))
+
+
+def _flatten_tool_content(body: dict) -> str:
+    """The engine's tool result as the string the model reads.
+
+    An empty body from a SUCCESSFUL call is not an error, but handing the
+    model "" invites it to invent the answer — say plainly that nothing came
+    back.
+    """
+    if body.get("is_error") and isinstance(body.get("error_message"), str):
+        return body["error_message"]
+    content = body.get("content")
+    if isinstance(content, str):
+        return content or "(the tool returned no content)"
+    if content is None:
+        return "(the tool returned no content)"
+    return json.dumps(content, sort_keys=True)
+
+
+def _describe_connector_failure(response: httpx.Response) -> str:
+    """The engine's own reason for refusing a tool call.
+
+    Its 503 says "MCP not configured. Start server with --mcp-config", which
+    is operator language for a state a phone user reaches without ever seeing
+    a command line — so that one is replaced. Everything else is passed
+    through: the sandbox's refusals name the pattern that blocked the tool,
+    which nothing composed here would know.
+    """
+    if response.status_code == 503:
+        return (
+            "the running model was started without connectors — restart it "
+            "from Settings → Connectors"
+        )
+    body = _decode_json_body(response)
+    if isinstance(body, dict):
+        detail = body.get("detail", body)
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, dict):
+            error = detail.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                return error["message"]
+            if isinstance(error, str):
+                return error
+    return f"the engine returned HTTP {response.status_code}"
+
+
+async def _boot_alias(config: WebConfig, alias: str) -> None:
+    """Respawn the child for ``alias``. Detached, so failure is recorded in
+    the supervisor rather than raised at a caller that has already answered."""
+    with contextlib.suppress(SupervisorError):
+        await config.engine.start(alias)
 
 
 def _apply_security_headers(response) -> None:

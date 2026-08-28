@@ -80,7 +80,10 @@ test('the alias sits flush left, over its own size line', async ({ page, stub })
         range.selectNodeContents(node);
         return range.getBoundingClientRect().left;
       };
-      const span = [...document.querySelectorAll('span')].find(
+      // Scoped to the row BUTTON: the Disk overview card's "Largest" line
+      // names the same alias, and an unscoped document lookup grabs that
+      // instead — a row this test never renders an assertion about.
+      const span = [...document.querySelectorAll('button span')].find(
         (candidate) => candidate.textContent === name,
       );
       return { name: textLeft(span), size: textLeft(span?.nextElementSibling) };
@@ -120,7 +123,9 @@ test.describe('on a pointer device', () => {
     const badge = sheet.getByText('on disk', { exact: true });
     const before = await badge.boundingBox();
 
-    await sheet.getByText('bonsai-1.7b-2bit', { exact: true }).hover();
+    // The row, not the Disk overview card's "Largest" line — both name this
+    // alias, and only the row has a trash to reveal.
+    await sheet.getByRole('button', { name: /^bonsai-1\.7b-2bit/ }).hover();
     await expect(sheet.getByRole('button', { name: 'Delete bonsai-1.7b-2bit' })).toBeVisible();
 
     const after = await badge.boundingBox();

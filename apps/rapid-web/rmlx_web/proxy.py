@@ -172,9 +172,12 @@ async def proxy_post_query(
     )
 
 
-# Speech synthesis and transcription are both minutes of GPU work on a cold
-# lane (measured: 47 s for a first Kokoro request, 104 s for a first Whisper
-# one), so they get the streaming leg's unbounded read timeout.
+# Speech synthesis, transcription and image editing are all minutes of GPU
+# work on a cold lane (measured: 47 s for a first Kokoro request, 104 s for a
+# first Whisper one), so they get the streaming leg's unbounded read timeout.
+# Safe to leave unbounded now that no BROWSER connection waits on it — the
+# image lane runs these as detached jobs, because a tunnel cuts an idle
+# request at 100 s with a 524.
 _AUDIO_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=120.0, pool=10.0)
 
 

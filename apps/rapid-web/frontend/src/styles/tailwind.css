@@ -174,9 +174,23 @@ button:not(:disabled) {
     font-size: 1em;
   }
 
+  /* Preflight sets `list-style: none` on ul/ol, so the padding below was
+     reserving space for markers that never rendered — every list read as an
+     indented block of loose lines. Restored explicitly, per type. */
   .md-list {
     margin: 0 0 0.85em;
     padding-left: 1.4em;
+  }
+  ul.md-list {
+    list-style: disc;
+  }
+  ol.md-list {
+    list-style: decimal;
+  }
+  /* A task list draws its own checkbox; a bullet beside it is a second,
+     conflicting marker. */
+  .md-li:has(> input[type='checkbox']) {
+    list-style: none;
   }
   .md-li {
     margin: 0.2em 0;
@@ -298,6 +312,22 @@ button:not(:disabled) {
   }
   .md-table tr:last-child td {
     border-bottom: none;
+  }
+
+  /* Tailwind preflight strips the UA's anchor colour and underline, so a link
+     with no rule of its own renders as plain prose — indistinguishable from
+     the text around it, with nothing to say it can be clicked. A class rather
+     than a bare `a` selector, so this cannot leak into UI chrome. */
+  .md-link {
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    /* A model often emits a bare URL as its own label; without this a long
+       one widens the transcript instead of wrapping. */
+    overflow-wrap: anywhere;
+  }
+  .md-link:hover {
+    text-decoration-thickness: 2px;
   }
 
   /* A refused scheme: underlined so the model's intent stays legible, but no

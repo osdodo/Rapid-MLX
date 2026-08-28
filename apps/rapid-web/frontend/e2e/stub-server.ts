@@ -50,10 +50,77 @@ export interface Scenario {
     family: string | null;
     image_capability: 'generation' | 'editing' | 'both' | null;
   }>;
-  /** SSE frames for the next chat turn, sent in order. */
-  chatFrames: string[] | null;
+  /**
+   * SSE frames for the next chat turn, sent in order.
+   *
+   * An array of arrays serves one round each, so a tool round trip can be
+   * scripted: frames[0] asks for the call, frames[1] answers with it done.
+   */
+  chatFrames: string[] | string[][] | null;
+  /** Every chat body the stub received, parsed. Lets a spec assert on what
+   *  was actually sent — the tools array, the tool result turns. */
+  chatRequests: Array<Record<string, unknown>>;
   /** Fail the next chat request with this status and error type. */
   chatFailure: { status: number; type: string; message: string } | null;
+  /** What `/api/tools` advertises. Empty models a server with none. */
+  tools: Array<{
+    type: 'function';
+    function: { name: string; description: string; parameters: unknown };
+  }>;
+  /** Which of those need per-call approval. */
+  toolsNeedingApproval: string[];
+  /** Canned `/api/tools/call` answers, keyed by tool name. */
+  toolResults: Record<string, { content: string; is_error?: boolean }>;
+  /** Every tool call the stub was asked to run, in order. */
+  toolCalls: Array<{ name: string; arguments: string; advertised: string[] }>;
+  /**
+   * `/api/connectors`, mutated in place by the write routes exactly as the
+   * real store is — a spec that adds a server and then asserts on the list is
+   * otherwise asserting on its own fixture.
+   */
+  connectors: {
+    enabled: boolean;
+    servers: Array<{
+      name: string;
+      transport: 'stdio' | 'sse';
+      command: string | null;
+      args: string[];
+      env: Record<string, string>;
+      url: string | null;
+      enabled: boolean;
+      timeout: number;
+      summary: string;
+    }>;
+    load_error: string | null;
+    config_path: string;
+    engine_servers: Array<{
+      name: string;
+      state: string;
+      transport: string;
+      tools_count: number;
+      error: string | null;
+    }>;
+    engine_reachable: boolean;
+    subsystem_error: string | null;
+    configured: boolean;
+    needs_restart: boolean;
+    engine_running: boolean;
+    tools: Array<{
+      name: string;
+      description: string;
+      server: string;
+      parameters: unknown;
+    }>;
+    disabled_tools: string[];
+    granted_tools: string[];
+    auto_approve_all: boolean;
+  };
+  /** Every connector tool the stub was asked to run, in order. */
+  connectorCalls: Array<{ name: string; arguments: string }>;
+  /** Canned `/api/connectors/execute` answers, keyed by tool name. */
+  connectorResults: Record<string, { content: string; is_error?: boolean }>;
+  /** How many times the restart route was called. */
+  connectorRestarts: number;
   /** Fail the next model load with this status and error type. */
   loadFailure: { status: number; type: string; message: string } | null;
   /**
@@ -84,13 +151,22 @@ export interface Scenario {
    * used to be offered for a model that was already starting.
    */
   statusDelayMs: number;
+  /**
+   * Delay the fetches a turn makes BEFORE it opens the stream
+   * (`/api/tools`, `/api/connectors`).
+   *
+   * That gap is where the previous turn's answer stays on screen if the
+   * streaming buffer is not cleared synchronously. On loopback it is a few
+   * milliseconds and invisible; through a tunnel it is long enough to read.
+   */
+  preStreamDelayMs: number;
   /** Delay between chat frames, so a spec can act mid-stream. */
   frameDelayMs: number;
   /** Base64 PNG the next image render returns. Null renders nothing. */
   imageResult: string | null;
-  /** What `/api/images/progress` reports. */
-  imageProgress: { running: boolean; step: number; total: number };
-  /** Delay before the image render answers, so a spec can act mid-render. */
+  /** Denoise counter a running job reports. */
+  imageProgress: { step: number; total: number };
+  /** How long a render stays running, so a spec can act mid-render. */
   imageDelayMs: number;
   /** Every edit the stub has been asked for, in order. */
   edits: Array<{ prompt: string; model: string | null }>;
@@ -221,7 +297,57 @@ const DEFAULT_SCENARIO: Scenario = {
     },
   ],
   chatFrames: null,
+  chatRequests: [],
   chatFailure: null,
+  tools: [
+    {
+      type: 'function',
+      function: {
+        name: 'weather',
+        description: 'Get current weather for a place.',
+        parameters: {
+          type: 'object',
+          properties: { location: { type: 'string' } },
+          required: ['location'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'browse',
+        description: 'Fetch a web page.',
+        parameters: {
+          type: 'object',
+          properties: { url: { type: 'string' } },
+          required: ['url'],
+        },
+      },
+    },
+  ],
+  toolsNeedingApproval: ['browse'],
+  toolResults: {},
+  toolCalls: [],
+  // Off, as a fresh install is: connectors run arbitrary local programs.
+  connectors: {
+    enabled: false,
+    servers: [],
+    load_error: null,
+    config_path: '/tmp/mcp.json',
+    engine_servers: [],
+    engine_reachable: true,
+    subsystem_error: null,
+    configured: true,
+    needs_restart: false,
+    engine_running: true,
+    tools: [],
+    disabled_tools: [],
+    granted_tools: [],
+    auto_approve_all: false,
+  },
+  connectorCalls: [],
+  connectorResults: {},
+  connectorRestarts: 0,
   loadFailure: null,
   loadSettlesReady: false,
   removeFailure: null,
@@ -229,12 +355,13 @@ const DEFAULT_SCENARIO: Scenario = {
   download: null,
   statusPolls: 0,
   statusDelayMs: 0,
+  preStreamDelayMs: 0,
   frameDelayMs: 10,
   // A 1x1 transparent PNG: the specs assert the image is displayed and
   // saveable, not what it depicts.
   imageResult:
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-  imageProgress: { running: false, step: 0, total: 0 },
+  imageProgress: { step: 0, total: 0 },
   imageDelayMs: 0,
   edits: [],
   voices: ['af_heart', 'am_adam', 'bf_emma'],
@@ -270,6 +397,32 @@ function chatFrame(content: string): string {
 
 function usageFrame(tokens: number): string {
   return `data: ${JSON.stringify({ usage: { completion_tokens: tokens } })}\n\n`;
+}
+
+/**
+ * The frames one tool call arrives in.
+ *
+ * Split the way a real engine splits it: the first carries the id and name,
+ * the rest only append argument fragments. That is what the accumulator has
+ * to reassemble, so a single-frame fixture would not exercise it.
+ */
+export function toolCallFrames(
+  calls: Array<{ id: string; name: string; arguments: string }>,
+): string[] {
+  const frames = calls.flatMap((call, index) => [
+    `data: ${JSON.stringify({
+      choices: [
+        { delta: { tool_calls: [{ index, id: call.id, function: { name: call.name } }] } },
+      ],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      choices: [{ delta: { tool_calls: [{ index, function: { arguments: call.arguments } }] } }],
+    })}\n\n`,
+  ]);
+  return [
+    ...frames,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+  ];
 }
 
 function readBody(request: IncomingMessage): Promise<string> {
@@ -309,7 +462,25 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     removed: [],
     statusPolls: 0,
     edits: [],
+    chatRequests: [],
+    toolCalls: [],
+    toolResults: {},
+    tools: DEFAULT_SCENARIO.tools.map((tool) => ({ ...tool })),
     models: DEFAULT_SCENARIO.models.map((model) => ({ ...model })),
+    // Deep-copied for the same reason `models` is: the write routes mutate
+    // these arrays, and a shared reference leaks one spec's servers into
+    // another's list.
+    connectorCalls: [],
+    connectorResults: {},
+    connectorRestarts: 0,
+    connectors: {
+      ...DEFAULT_SCENARIO.connectors,
+      servers: [],
+      engine_servers: [],
+      tools: [],
+      disabled_tools: [],
+      granted_tools: [],
+    },
     residency: {
       ...DEFAULT_SCENARIO.residency,
       models: DEFAULT_SCENARIO.residency.models.map((model) => ({ ...model })),
@@ -325,6 +496,11 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
    * against whichever test happened to be running. Destroyed explicitly.
    */
   const sockets = new Set<import('node:net').Socket>();
+
+  /** The single render in flight, mirroring the server: only the last job
+   *  is kept, and an unknown id is a 404. */
+  let job: { id: string; finishesAt: number } | null = null;
+  let jobCounter = 0;
 
   const server = createServer(async (request: IncomingMessage, response: ServerResponse) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
@@ -487,11 +663,6 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       return;
     }
 
-    if (path === '/api/images/progress') {
-      json(response, 200, scenario.imageProgress);
-      return;
-    }
-
     if (path === '/api/residency') {
       json(response, 200, scenario.residency);
       return;
@@ -499,38 +670,58 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
 
     if (path === '/api/images/cancel') {
       await readBody(request);
-      scenario.imageProgress = { running: false, step: 0, total: 0 };
+      job = null;
       json(response, 200, { ok: true });
       return;
     }
 
-    if (path === '/v1/images/generations') {
-      await readBody(request);
-      if (scenario.imageDelayMs > 0) {
-        await new Promise<void>((done) => setTimeout(done, scenario.imageDelayMs));
-      }
-      json(response, 200, {
-        created: 1,
-        data: scenario.imageResult ? [{ b64_json: scenario.imageResult }] : [],
-        cancelled: false,
-      });
-      return;
-    }
-
-    if (path === '/api/images/edits') {
+    // Renders are jobs: the POST answers immediately and the page polls the
+    // result. Holding the connection for the render is what a Cloudflare
+    // tunnel cuts at 100 s with a 524.
+    if (path === '/api/images/jobs') {
       const body = JSON.parse((await readBody(request)) || '{}') as {
+        mode?: string;
         prompt?: string;
         image?: string;
         model?: string;
       };
-      scenario.edits.push({ prompt: body.prompt ?? '', model: body.model ?? null });
-      if (scenario.imageDelayMs > 0) {
-        await new Promise<void>((done) => setTimeout(done, scenario.imageDelayMs));
+      if (body.mode === 'edit') {
+        scenario.edits.push({ prompt: body.prompt ?? '', model: body.model ?? null });
+      }
+      job = { id: `job-${(jobCounter += 1)}`, finishesAt: Date.now() + scenario.imageDelayMs };
+      json(response, 200, {
+        id: job.id,
+        state: 'running',
+        b64_json: null,
+        cancelled: false,
+        error: null,
+      });
+      return;
+    }
+
+    if (path.startsWith('/api/images/jobs/')) {
+      const id = decodeURIComponent(path.slice('/api/images/jobs/'.length));
+      if (job === null || job.id !== id) {
+        apiError(response, 404, 'unknown_image_job', 'no such render');
+        return;
+      }
+      if (Date.now() < job.finishesAt) {
+        json(response, 200, {
+          id,
+          state: 'running',
+          b64_json: null,
+          cancelled: false,
+          error: null,
+          ...scenario.imageProgress,
+        });
+        return;
       }
       json(response, 200, {
-        created: 1,
-        data: scenario.imageResult ? [{ b64_json: scenario.imageResult }] : [],
+        id,
+        state: 'done',
+        b64_json: scenario.imageResult,
         cancelled: false,
+        error: null,
       });
       return;
     }
@@ -572,8 +763,145 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       return;
     }
 
+    if (path === '/api/tools') {
+      if (scenario.preStreamDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.preStreamDelayMs));
+      }
+      json(response, 200, {
+        tools: scenario.tools,
+        approval_required: scenario.toolsNeedingApproval,
+      });
+      return;
+    }
+
+    if (path === '/api/tools/call') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      scenario.toolCalls.push({
+        name: body.name,
+        arguments: body.arguments,
+        advertised: body.advertised ?? [],
+      });
+      // The real route's load-bearing gate: a call for a tool that was not
+      // advertised is refused rather than run.
+      if (!(body.advertised ?? []).includes(body.name)) {
+        json(response, 200, {
+          content: `tool '${body.name}' isn't available in this conversation`,
+          is_error: true,
+        });
+        return;
+      }
+      const canned = scenario.toolResults[body.name];
+      json(response, 200, {
+        content: canned?.content ?? `${body.name} ran`,
+        is_error: canned?.is_error ?? false,
+      });
+      return;
+    }
+
+    // The connector routes. Every write answers the WHOLE snapshot, exactly
+    // as the real ones do — so the panel has one shape to render and cannot
+    // show a stale half of it.
+    if (path === '/api/connectors') {
+      if (scenario.preStreamDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.preStreamDelayMs));
+      }
+      json(response, 200, scenario.connectors);
+      return;
+    }
+
+    if (path === '/api/connectors/settings') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      const state = scenario.connectors;
+      if (typeof body.enabled === 'boolean') state.enabled = body.enabled;
+      if (typeof body.auto_approve_all === 'boolean') {
+        state.auto_approve_all = body.auto_approve_all;
+      }
+      if (typeof body.tool === 'string' && typeof body.tool_enabled === 'boolean') {
+        state.disabled_tools = state.disabled_tools.filter((name) => name !== body.tool);
+        if (!body.tool_enabled) state.disabled_tools.push(body.tool);
+      }
+      if (typeof body.tool === 'string' && body.grant === true) {
+        if (!state.granted_tools.includes(body.tool)) state.granted_tools.push(body.tool);
+      }
+      if (body.reset_grants === true) state.granted_tools = [];
+      json(response, 200, state);
+      return;
+    }
+
+    if (path === '/api/connectors/servers') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      const entry = body.server ?? {};
+      const state = scenario.connectors;
+      const saved = {
+        name: entry.name,
+        transport: entry.transport ?? 'stdio',
+        command: entry.command ?? null,
+        args: entry.args ?? [],
+        env: entry.env ?? {},
+        url: entry.url ?? null,
+        enabled: entry.enabled !== false,
+        timeout: entry.timeout ?? 30,
+        summary:
+          entry.transport === 'sse'
+            ? (entry.url ?? '')
+            : [entry.command, ...(entry.args ?? [])].filter(Boolean).join(' '),
+      };
+      const index = state.servers.findIndex((server) => server.name === body.replacing);
+      if (index === -1) state.servers.push(saved);
+      else state.servers[index] = saved;
+      state.servers.sort((a, b) => a.name.localeCompare(b.name));
+      json(response, 200, state);
+      return;
+    }
+
+    if (path === '/api/connectors/servers/remove') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      const state = scenario.connectors;
+      state.servers = state.servers.filter((server) => server.name !== body.name);
+      state.granted_tools = state.granted_tools.filter(
+        (tool) => !tool.startsWith(`${body.name}__`),
+      );
+      json(response, 200, state);
+      return;
+    }
+
+    if (path === '/api/connectors/servers/enabled') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      const target = scenario.connectors.servers.find((server) => server.name === body.name);
+      if (target) target.enabled = body.enabled;
+      json(response, 200, scenario.connectors);
+      return;
+    }
+
+    if (path === '/api/connectors/restart') {
+      scenario.connectorRestarts += 1;
+      // The restart is what gives the child a config path, so the banner it
+      // was pressed from must clear.
+      scenario.connectors.configured = true;
+      scenario.connectors.needs_restart = false;
+      json(response, 200, { restarting: true, model: scenario.model });
+      return;
+    }
+
+    if (path === '/api/connectors/execute') {
+      const body = JSON.parse((await readBody(request)) || '{}');
+      scenario.connectorCalls.push({ name: body.name, arguments: body.arguments });
+      const canned = scenario.connectorResults[body.name];
+      json(response, 200, {
+        content: canned?.content ?? `${body.name} ran`,
+        is_error: canned?.is_error ?? false,
+      });
+      return;
+    }
+
     if (path === '/v1/chat/completions') {
-      await readBody(request);
+      const raw = await readBody(request);
+      const round = scenario.chatRequests.length;
+      try {
+        scenario.chatRequests.push(JSON.parse(raw || '{}'));
+      } catch {
+        scenario.chatRequests.push({});
+      }
 
       if (scenario.chatFailure) {
         const { status, type, message } = scenario.chatFailure;
@@ -587,11 +915,16 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
         'X-Accel-Buffering': 'no',
       });
 
-      const frames = scenario.chatFrames ?? [
-        chatFrame('Hello'),
-        chatFrame(' there.'),
-        usageFrame(2),
-      ];
+      // A nested array serves one round each, so a tool round trip can be
+      // scripted; a flat array is the same frames every round.
+      const scripted = scenario.chatFrames;
+      const frames = Array.isArray(scripted?.[0])
+        ? ((scripted as string[][])[round] ?? [chatFrame('Done.'), usageFrame(1)])
+        : ((scripted as string[] | null) ?? [
+            chatFrame('Hello'),
+            chatFrame(' there.'),
+            usageFrame(2),
+          ]);
 
       for (const frame of frames) {
         response.write(frame);

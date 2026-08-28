@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
+import type { WireTurn } from '@/api/chat';
 import type { DownloadJob, ModelEntry, ModelKind, StatusResponse } from '@/api/types';
 import { activePath, choicesAlong, deepestLeaf } from '@/chat/MessageTree';
+import { MAX_INSTRUCTION_LENGTH } from '@/chat/instructions';
 import { newId } from '@/lib/ids';
 import { HISTORY_BACKUP_KEY, HISTORY_KEY, deriveTitle, migrate } from './migrate';
 import { persist } from './persist';
@@ -10,7 +12,6 @@ import {
   SCHEMA_VERSION,
   type Conversation,
   type MessageNode,
-  type Role,
   type Settings,
 } from './types';
 
@@ -66,6 +67,12 @@ function loadSettings(): Settings {
           ? parsed.theme
           : DEFAULT_SETTINGS.theme,
       mathRendering: parsed.mathRendering === 'source' ? 'source' : DEFAULT_SETTINGS.mathRendering,
+      enabledTools: Array.isArray(parsed.enabledTools)
+        ? parsed.enabledTools.filter((name): name is string => typeof name === 'string')
+        : DEFAULT_SETTINGS.enabledTools,
+      // Only an explicit `true` turns it on: anything unparseable has to land
+      // on the asking side, not the silent one.
+      autoApproveBrowsing: parsed.autoApproveBrowsing === true,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -86,6 +93,46 @@ export interface Notice {
 
 type SelectionByKind = Record<ModelKind, string | null>;
 
+/**
+ * How an approval ended.
+ *
+ * `declined` and `unavailable` are kept apart deliberately: a decline is the
+ * user's own answer and is reported as an ordinary outcome, while nobody was
+ * asked in the `unavailable` case and it must not be attributed to them.
+ *
+ * `always` is `allowed` plus a durable grant, and only a connector tool can
+ * produce it — a browse approval is scoped to one answer by design.
+ */
+export type ApprovalDecision = 'allowed' | 'always' | 'declined' | 'unavailable';
+
+/**
+ * What the user is being asked to approve.
+ *
+ * One slot for both kinds rather than two: only one prompt can be up at a
+ * time (a second would replace the first on screen and leave its promise
+ * unsettled), so a second slot could only ever disagree with that.
+ */
+export type ApprovalRequest =
+  | {
+      /** A page fetch. The MODEL picks the URL, so seeing the exact
+       *  destination is the whole defence. */
+      kind: 'browse';
+      url: string;
+      host: string;
+    }
+  | {
+      /** A connector tool. The user has to know WHOSE `read_file` this is. */
+      kind: 'tool';
+      tool: string;
+      server: string;
+      short: string;
+      /** The model's arguments, formatted and display-safe. */
+      args: string;
+    };
+
+export type PendingApproval = ApprovalRequest & {
+  answer(decision: ApprovalDecision): void;
+};
 /**
  * Adopt the engine's served model as the text selection.
  *
@@ -149,6 +196,14 @@ interface StoreState {
   notices: Notice[];
   /** Bumped when a gated send is attempted, to flash the readiness surface. */
   attentionToken: number;
+  /**
+   * What a tool is waiting on the user to approve, if any.
+   *
+   * A `browse` names a host the MODEL chose, and a connector call names a
+   * program on this Mac. In both cases the user seeing what will actually run
+   * is the only thing between the model and an action it picked for itself.
+   */
+  pendingApproval: PendingApproval | null;
 
   settings: Settings;
 
@@ -159,6 +214,9 @@ interface StoreState {
   /** Pin, archive, rename. Deliberately does NOT touch `updatedAt` — see
    *  the action for why. */
   updateConversation(id: string, patch: Partial<Conversation>): void;
+  /** Set the open conversation's own system prompt, creating one if the user
+   *  has not started a conversation yet. */
+  setConversationInstructions(text: string): void;
   appendNode(
     node: Omit<MessageNode, 'id' | 'createdAt'> & Partial<Pick<MessageNode, 'id' | 'createdAt'>>,
   ): string;
@@ -175,6 +233,8 @@ interface StoreState {
   pushNotice(notice: Omit<Notice, 'id'>): void;
   dismissNotice(id: string): void;
   flagBlockedSend(): void;
+  askApproval(request: ApprovalRequest): Promise<ApprovalDecision>;
+  answerApproval(decision: ApprovalDecision): void;
 
   updateSettings(patch: Partial<Settings>): void;
 }
@@ -258,6 +318,7 @@ export const useStore = create<StoreState>()((set, get) => {
     download: null,
     notices: [],
     attentionToken: 0,
+    pendingApproval: null,
 
     settings: loadSettings(),
 
@@ -267,12 +328,14 @@ export const useStore = create<StoreState>()((set, get) => {
       // just opened on a blank one, otherwise leaves a column of identical
       // "New chat" rows that the user then has to delete one at a time.
       // Reuse is only safe when it is UNTITLED as well as empty: a renamed
-      // blank conversation is one the user deliberately made.
+      // blank conversation is one the user deliberately made, and so is one
+      // carrying a system prompt they typed before their first message.
       const existing = get().conversations.find(
         (conversation) =>
           conversation.nodes.length === 0 &&
           !conversation.hasCustomTitle &&
           conversation.title.trim() === '' &&
+          (conversation.customInstructions ?? '').trim() === '' &&
           !conversation.isArchived,
       );
       if (existing) {
@@ -333,6 +396,16 @@ export const useStore = create<StoreState>()((set, get) => {
       // moving a row to the top of "Today" for having been renamed is exactly
       // the opposite of what the user was trying to do.
       schedulePersist();
+    },
+
+    setConversationInstructions(text) {
+      // A prompt typed before the first message has to have somewhere to
+      // live, or it is silently lost the moment the user presses send.
+      if (get().activeId === null) get().createConversation();
+      updateActive((conversation) => ({
+        ...conversation,
+        customInstructions: text.slice(0, MAX_INSTRUCTION_LENGTH),
+      }));
     },
 
     appendNode(partial) {
@@ -478,6 +551,29 @@ export const useStore = create<StoreState>()((set, get) => {
       set((state) => ({ attentionToken: state.attentionToken + 1 }));
     },
 
+    askApproval(request) {
+      // One prompt at a time. A second would replace the first on screen and
+      // leave its promise unsettled, hanging the turn that is waiting on it.
+      if (get().pendingApproval !== null) return Promise.resolve('unavailable');
+      return new Promise<ApprovalDecision>((resolve) => {
+        set({
+          pendingApproval: {
+            ...request,
+            answer(decision) {
+              resolve(decision);
+            },
+          },
+        });
+      });
+    },
+
+    answerApproval(decision) {
+      const pending = get().pendingApproval;
+      if (pending === null) return;
+      set({ pendingApproval: null });
+      pending.answer(decision);
+    },
+
     updateSettings(patch) {
       set((state) => {
         const settings = { ...state.settings, ...patch };
@@ -550,14 +646,24 @@ export function useActivePath(): MessageNode[] {
 }
 
 /** The turns to send, stripped to what the wire accepts. */
-export function wireTurns(
-  path: MessageNode[],
-  system: string,
-): Array<{ role: Role; content: string }> {
+export function wireTurns(path: MessageNode[], system: string): WireTurn[] {
   const turns = path
-    // A failed turn is not history the model should continue from.
-    .filter((node) => node.status !== 'failed' && node.content !== '')
-    .map((node) => ({ role: node.role, content: node.content }));
+    .filter((node) => {
+      // A tool row is kept whatever its status. It answers a call the
+      // assistant turn above it made, and the model needs one result per id
+      // — a failed tool ran and its error IS the result.
+      if (node.role === 'tool') return true;
+      // A failed turn is not history the model should continue from. An empty
+      // one is dropped too, unless it carried tool calls: that is a real turn
+      // with no prose, and dropping it orphans the results under it.
+      return node.status !== 'failed' && (node.content !== '' || (node.toolCalls?.length ?? 0) > 0);
+    })
+    .map((node) => ({
+      role: node.role,
+      content: node.content,
+      ...(node.toolCalls?.length ? { tool_calls: node.toolCalls } : {}),
+      ...(node.toolCallId ? { tool_call_id: node.toolCallId } : {}),
+    }));
 
   return system.trim() === '' ? turns : [{ role: 'system', content: system }, ...turns];
 }

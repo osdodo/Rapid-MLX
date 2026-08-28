@@ -14,6 +14,7 @@ import uvicorn
 from . import __version__, auth
 from .app import WebConfig, create_app
 from .catalog import ModelCatalog
+from .connectors import ConnectorStore
 from .downloads import DownloadManager
 from .supervisor import (
     AttachedEngine,
@@ -198,7 +199,9 @@ def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) ->
     sys.stdout.flush()
 
 
-def _resolve_engine(args: argparse.Namespace, *, downloads_enabled: bool):
+def _resolve_engine(
+    args: argparse.Namespace, *, downloads_enabled: bool, connectors: ConnectorStore
+):
     if args.attach:
         if args.model:
             raise SystemExit(
@@ -218,6 +221,9 @@ def _resolve_engine(args: argparse.Namespace, *, downloads_enabled: bool):
         # never reaches the engine's logs.
         api_key=auth.generate_token(),
         serve_args=list(args.serve_arg),
+        # Re-read at every spawn, so a connector added an hour into the
+        # session is armed by the next model start.
+        mcp_config_path=connectors.launch_config_path,
     )
     downloads = DownloadManager(binary) if downloads_enabled else None
     return engine, ModelCatalog(binary), downloads
@@ -258,9 +264,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+    # Constructed before the engine: the supervisor reads its
+    # `launch_config_path` on every spawn.
+    connector_store = ConnectorStore()
+
     try:
         engine, catalog, downloads = _resolve_engine(
-            args, downloads_enabled=downloads_enabled
+            args, downloads_enabled=downloads_enabled, connectors=connector_store
         )
     except SupervisorError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -272,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_model=args.model if not args.attach else None,
         catalog=catalog,
         downloads=downloads,
+        connectors=connector_store,
     )
     app = create_app(config)
 
