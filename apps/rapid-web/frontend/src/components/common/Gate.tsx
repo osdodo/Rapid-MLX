@@ -65,7 +65,9 @@ export function Gate({
   return (
     <div className="bg-background fixed inset-0 z-30 flex items-center justify-center p-6">
       <form className="flex w-[min(320px,100%)] flex-col gap-3" onSubmit={submit}>
-        <Wordmark className="mb-1.5 text-center text-3xl" />
+        {/* `justify-center`, not `text-center`: the lockup is a flex row now,
+            and text alignment does not centre one. */}
+        <Wordmark className="mb-1.5 justify-center text-3xl" />
 
         <label htmlFor="token" className="sr-only">
           Access token

@@ -10,6 +10,8 @@ import {
 } from '@/components/ui/command';
 import { groupConversations, searchConversations } from '@/chat/ConversationSearch';
 import { formatRelativeTime } from '@/lib/format';
+import { SHEET_DESKTOP_SIZE } from '@/components/common/Sheet';
+import { cn } from '@/lib/utils';
 import { useStore } from '@/state/store';
 import { useMidnightTick } from '@/lib/useMidnightTick';
 
@@ -61,7 +63,15 @@ export function SearchPalette({
       }}
       title="Search conversations"
       description="Find a conversation by title or by anything said in it."
-      className="top-[12%] translate-y-0 sm:max-w-lg"
+      // The same footprint as the Model and Settings sheets. This one is built
+      // on `CommandDialog` rather than on `Sheet`, so it has to be told — the
+      // shared constant is what stops the two drifting apart.
+      //
+      // `flex flex-col` because `DialogContent` is a `grid` by default, and a
+      // grid child does not inherit the fixed height: the list would keep its
+      // own 420px cap and leave the rest of the box empty. `p-0` overrides the
+      // primitive's `p-6`, which would otherwise inset the search field.
+      className={cn(SHEET_DESKTOP_SIZE, 'flex flex-col gap-0 overflow-hidden p-0 sm:max-w-none')}
       showCloseButton={false}
       // cmdk filters by item text by default. Ours is already filtered — and
       // by message bodies, which are not in the item — so its filter would
@@ -73,7 +83,10 @@ export function SearchPalette({
         value={query}
         onValueChange={setQuery}
       />
-      <CommandList className="max-h-[min(60dvh,420px)]">
+      {/* Fills the dialog rather than capping at its own height: the box is a
+          fixed size now, so a 420px cap would leave dead space below the last
+          result. `min-h-0` is what lets a flex child actually scroll. */}
+      <CommandList className="max-h-none min-h-0 flex-1">
         <CommandEmpty>
           {conversations.length === 0 ? 'No conversations yet.' : 'Nothing matches.'}
         </CommandEmpty>

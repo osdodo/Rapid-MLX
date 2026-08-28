@@ -1,5 +1,6 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import type { ReactNode } from 'react';
+import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
@@ -15,6 +16,23 @@ import { DialogOverlay, DialogPortal } from '@/components/ui/dialog';
  * were divs toggled by a `hidden` class, so content behind them stayed
  * reachable and Escape closed all of them at once.
  */
+
+/**
+ * The desktop footprint shared by every modal window.
+ *
+ * Exported because the search palette is built on `CommandDialog`, not on this
+ * component, and the two must not drift — a literal copied into both is
+ * exactly how they would.
+ *
+ * A DEFINITE size, not a ceiling (`h`/`w`, never `max-h`). With a ceiling each
+ * window sized to its own content — Settings ran to 630px while the model
+ * picker sat at 259px — so opening one after another made the dialog jump.
+ * The picker's content is unbounded anyway: a real catalog is ~179 aliases.
+ *
+ * `sm:`-scoped throughout. On a phone these stay content-sized bottom sheets;
+ * a fixed height there would push a two-row picker over most of the screen.
+ */
+export const SHEET_DESKTOP_SIZE = 'sm:h-[min(80dvh,760px)] sm:w-[min(760px,100%-48px)]';
 
 export interface SheetProps {
   open: boolean;
@@ -35,7 +53,8 @@ export function Sheet({ open, onClose, title, actions, children }: SheetProps) {
             'bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 fixed inset-x-0 bottom-0 z-20 flex max-h-[88dvh] flex-col rounded-t-xl border-t shadow-lg duration-200',
             'data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom',
             'sm:data-[state=closed]:zoom-out-95 sm:data-[state=open]:zoom-in-95 sm:data-[state=closed]:slide-out-to-bottom-0 sm:data-[state=open]:slide-in-from-bottom-0',
-            'sm:inset-auto sm:top-1/2 sm:left-1/2 sm:max-h-[min(70dvh,640px)] sm:w-[min(560px,100%-48px)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-xl sm:border',
+            SHEET_DESKTOP_SIZE,
+            'sm:inset-auto sm:top-1/2 sm:left-1/2 sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-xl sm:border',
           )}
           aria-label={title}
         >
@@ -45,9 +64,21 @@ export function Sheet({ open, onClose, title, actions, children }: SheetProps) {
             </DialogPrimitive.Title>
             <div className="flex shrink-0 items-center gap-1">
               {actions}
+              {/* An icon, matching the sidebar's own close control, rather
+                  than the word "Done". "Done" implies the sheet is committing
+                  something — but every sheet here writes as the user acts, so
+                  there is nothing to confirm and no way to cancel. The label
+                  stays in `aria-label`/`title`, which is also what keeps
+                  `getByRole('button', { name: 'Close' })` working. */}
               <DialogPrimitive.Close asChild>
-                <Button variant="ghost" size="sm">
-                  Done
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="text-muted-foreground size-8"
+                  aria-label="Close"
+                  title="Close"
+                >
+                  <X />
                 </Button>
               </DialogPrimitive.Close>
             </div>
