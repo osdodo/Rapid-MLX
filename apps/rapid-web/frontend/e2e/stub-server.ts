@@ -52,6 +52,16 @@ export interface Scenario {
   removeFailure: { status: number; type: string; message: string } | null;
   /** Aliases the stub has been asked to delete, in order. */
   removed: string[];
+  /** What `/api/downloads/status` reports. Null means idle. */
+  download: {
+    state: 'running' | 'done' | 'failed' | 'cancelled';
+    alias?: string;
+    done_bytes?: number;
+    total_bytes?: number | null;
+    detail?: string | null;
+  } | null;
+  /** How many times `/api/downloads/status` has been requested. */
+  statusPolls: number;
   /** Delay between chat frames, so a spec can act mid-stream. */
   frameDelayMs: number;
 }
@@ -92,6 +102,8 @@ const DEFAULT_SCENARIO: Scenario = {
   loadFailure: null,
   removeFailure: null,
   removed: [],
+  download: null,
+  statusPolls: 0,
   frameDelayMs: 10,
 };
 
@@ -138,6 +150,7 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
   const scenario: Scenario = {
     ...DEFAULT_SCENARIO,
     removed: [],
+    statusPolls: 0,
     models: DEFAULT_SCENARIO.models.map((model) => ({ ...model })),
     ...overrides,
   };
@@ -145,12 +158,12 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
   /**
    * Every socket this server has accepted.
    *
-   * `server.close()` stops listening but WAITS for open connections, and this
-   * stub deliberately holds the download feed open forever — mirroring
-   * app.py:539-550. So a plain close hangs until the test times out, and the
-   * failure surfaces as "Tearing down stub exceeded the test timeout" against
-   * whichever test happened to be running, which points nowhere near the
-   * cause. They are destroyed explicitly instead.
+   * `server.close()` stops listening but WAITS for open connections. The chat
+   * stream is still SSE and a spec can abandon one mid-flight, and keep-alive
+   * connections linger regardless — so a plain close can hang until the test
+   * times out, surfacing as "Tearing down stub exceeded the test timeout"
+   * against whichever test happened to be running, which points nowhere near
+   * the cause. They are destroyed explicitly instead.
    */
   const sockets = new Set<import('node:net').Socket>();
 
@@ -273,14 +286,26 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       return;
     }
 
-    if (path === '/api/downloads/stream') {
-      // Deliberately never closed, matching app.py:539-550.
-      response.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no',
-      });
-      response.write(`data: ${JSON.stringify({ state: 'idle' })}\n\n`);
+    if (path === '/api/models/pull') {
+      const body = JSON.parse((await readBody(request)) || '{}') as { model?: string };
+      const entry = scenario.models.find((model) => model.alias === body.model);
+      scenario.download = {
+        state: 'running',
+        alias: body.model ?? '',
+        done_bytes: 0,
+        total_bytes: entry?.size_bytes ?? null,
+      };
+      json(response, 200, { ok: true, ...scenario.download });
+      return;
+    }
+
+    if (path === '/api/downloads/status') {
+      // A plain JSON poll. This replaced an SSE feed that trycloudflare
+      // buffered indefinitely — see `fetchDownload` in src/api/models.ts.
+      // Counted so a spec can prove the page stops asking once a download
+      // reaches a terminal state.
+      scenario.statusPolls += 1;
+      json(response, 200, scenario.download ?? { state: 'idle' });
       return;
     }
 

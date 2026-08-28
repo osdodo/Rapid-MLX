@@ -542,17 +542,33 @@ def create_app(config: WebConfig) -> FastAPI:
             return _json_error(409, "no download is running", "no_download")
         return JSONResponse({"ok": True})
 
-    @app.get("/api/downloads/stream")
-    async def download_stream(request: Request):
+    @app.get("/api/downloads/status")
+    async def download_status():
+        """Current download job, polled by the page.
+
+        Deliberately a poll rather than the SSE feed this replaced.
+        Measured against a real ``trycloudflare`` tunnel: headers arrived
+        in 1.8 s and then **not one body byte in 65 s**, while the same
+        endpoint on loopback delivered its first frame in 0.0 s.
+        Cloudflare also strips the ``X-Accel-Buffering: no`` hint (it is
+        an nginx convention), and padding the first frame to 2 KiB did
+        not shake the response loose either.
+
+        The chat stream survives the same tunnel because it emits tokens
+        continuously; a download feed that sends 25 bytes and then a
+        keepalive every 15 s is too sparse to break through the buffer.
+
+        Progress is low-frequency data — a bar that updates once a
+        second is indistinguishable from one that updates ten times a
+        second — so holding a long-lived connection open for it bought
+        nothing and cost every intermediary's buffering behaviour.
+        """
         if config.downloads is None:
             return _json_error(
                 403, "downloads are disabled on this server", "downloads_disabled"
             )
-        return StreamingResponse(
-            _download_events(config.downloads, request),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        job = config.downloads.job
+        return JSONResponse(job.to_dict() if job is not None else {"state": "idle"})
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -636,47 +652,6 @@ def create_app(config: WebConfig) -> FastAPI:
     )
 
     return app
-
-
-async def _download_events(
-    downloads: DownloadManager, request: Request
-) -> AsyncIterator[bytes]:
-    """SSE feed of download progress.
-
-    Event-driven rather than timer-driven: the manager signals on every
-    change, so a fast download reports promptly without a tight poll
-    loop burning CPU while nothing is happening.
-
-    The feed does **not** close when a job reaches a terminal state. An
-    earlier version did, and it was wrong in a way that only shows up on
-    the second download: the manager keeps the last finished job, so a
-    client connecting afterwards immediately saw ``done``/``cancelled``,
-    got ``[DONE]``, and the connection closed — then a newly started
-    download had no live feed at all and the page showed no progress.
-    The client decides when it is finished watching.
-
-    The heartbeat on timeout is not cosmetic either. Tunnels and mobile
-    networks drop idle connections, and a silent SSE stream looks idle;
-    without periodic bytes the phone loses the feed and never learns the
-    download finished.
-    """
-    last: dict | None = None
-    while True:
-        if await request.is_disconnected():
-            return
-
-        job = downloads.job
-        payload = job.to_dict() if job is not None else {"state": "idle"}
-
-        if payload != last:
-            yield f"data: {json.dumps(payload)}\n\n".encode()
-            last = payload
-        else:
-            # SSE comment frame — ignored by EventSource, but it is
-            # traffic, which is what keeps the connection alive.
-            yield b": keepalive\n\n"
-
-        await downloads.wait_for_change(timeout=15.0)
 
 
 def _decode_json_body(response: httpx.Response) -> dict:

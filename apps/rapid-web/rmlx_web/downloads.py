@@ -181,9 +181,6 @@ class DownloadManager:
         self._task: asyncio.Task | None = None
         self._output_tail: list[str] = []
         self._lock = asyncio.Lock()
-        # Bumped on every state change so the SSE endpoint can wait
-        # instead of polling on a timer.
-        self._changed = asyncio.Event()
 
     @property
     def job(self) -> DownloadJob | None:
@@ -191,15 +188,6 @@ class DownloadManager:
 
     def is_running(self) -> bool:
         return self._job is not None and self._job.state is DownloadState.RUNNING
-
-    async def wait_for_change(self, timeout: float) -> None:
-        """Block until the job changes, or ``timeout`` elapses."""
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._changed.wait(), timeout=timeout)
-        self._changed.clear()
-
-    def _notify(self) -> None:
-        self._changed.set()
 
     async def start(self, alias: str, *, total_bytes: int | None) -> DownloadJob:
         async with self._lock:
@@ -227,12 +215,10 @@ class DownloadManager:
             except OSError as exc:
                 self._job.state = DownloadState.FAILED
                 self._job.detail = str(exc)
-                self._notify()
                 raise DownloadError(f"could not run {self._binary}: {exc}") from exc
 
             self._process = process
             self._task = asyncio.create_task(self._supervise(process))
-            self._notify()
             return self._job
 
     async def _supervise(self, process: asyncio.subprocess.Process) -> None:
@@ -264,7 +250,6 @@ class DownloadManager:
                 job.done_bytes = max(job.done_bytes, done)
                 if total > 0:
                     job.total_bytes = total
-                self._notify()
                 continue
 
             self._output_tail.append(line)
@@ -289,7 +274,6 @@ class DownloadManager:
                 job.detail = self._tail_text() or f"pull exited with code {code}"
 
         self._process = None
-        self._notify()
 
     def _tail_text(self, lines: int = 6) -> str:
         return " | ".join(self._output_tail[-lines:])
@@ -306,7 +290,6 @@ class DownloadManager:
             # relabel the non-zero exit as a failure.
             job.state = DownloadState.CANCELLED
             job.detail = "cancelled"
-            self._notify()
 
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)

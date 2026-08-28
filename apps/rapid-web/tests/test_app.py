@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import json
 import re
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,11 +22,6 @@ from rmlx_web.app import WebConfig, create_app
 from rmlx_web.catalog import CatalogError, ModelEntry, RemovalError
 from rmlx_web.downloads import DownloadError, DownloadJob, DownloadState
 from rmlx_web.supervisor import ChildState, ChildStatus
-
-
-async def _never_disconnected():
-    return False
-
 
 TOKEN = "test-token-value"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -708,12 +702,6 @@ class FakeDownloads:
     async def shutdown(self):
         return None
 
-    async def wait_for_change(self, timeout):
-        # Model the real manager: block until something changes. A fake
-        # that returns instantly turns the SSE loop into a busy spin,
-        # which hangs the test rather than exercising it.
-        await asyncio.sleep(min(timeout, 0.05))
-
 
 class TestPullGates:
     def test_downloads_disabled_is_refused(self):
@@ -1055,98 +1043,60 @@ class TestDownloadCapabilityReporting:
         assert body["allow_downloads"] is True
 
 
-class TestDownloadStream:
-    """The SSE feed must survive a job reaching a terminal state.
+class TestDownloadStatus:
+    """The polled progress endpoint.
 
-    An earlier version closed the stream on ``done``/``cancelled``. That
-    looks right until the second download: the manager keeps the last
-    finished job, so a client connecting afterwards immediately saw the
-    terminal frame, got ``[DONE]``, and the connection closed — leaving
-    a newly started download with no live feed and the page showing no
-    progress at all. Caught in end-to-end testing, not by the unit tests
-    that existed at the time.
-
-    The generator is driven directly rather than through an HTTP client.
-    ``httpx.ASGITransport`` buffers a response to completion before
-    returning it, so an endless SSE feed never yields a first chunk and
-    the test hangs instead of asserting anything.
+    This replaced an SSE feed. The feed was correct on loopback but
+    unusable through a ``trycloudflare`` tunnel: headers arrived in
+    1.8 s and then not one body byte in 65 s, measured against a real
+    tunnel. Cloudflare strips ``X-Accel-Buffering: no``, and padding the
+    first frame to 2 KiB did not shake it loose. Chat survives the same
+    tunnel because it emits tokens continuously; a feed that sends 25
+    bytes then a keepalive every 15 s is too sparse to break the buffer.
     """
 
-    @staticmethod
-    def _events(downloads):
-        request = SimpleNamespace(is_disconnected=_never_disconnected)
-        return app_module._download_events(downloads, request)
+    def test_a_running_job_is_reported(self):
+        job = DownloadJob(alias="bonsai-1.7b-2bit", total_bytes=500)
+        job.done_bytes = 125
+        with build_client(downloads=FakeDownloads(job=job)) as client:
+            body = client.get("/api/downloads/status", headers=AUTH).json()
 
-    @pytest.mark.asyncio
-    async def test_a_terminal_job_does_not_close_the_feed(self):
+        assert body["alias"] == "bonsai-1.7b-2bit"
+        assert body["state"] == "running"
+        assert body["done_bytes"] == 125
+        assert body["total_bytes"] == 500
+
+    def test_an_idle_manager_reports_idle(self):
+        with build_client(downloads=FakeDownloads(job=None)) as client:
+            body = client.get("/api/downloads/status", headers=AUTH).json()
+
+        # A synthetic state, not a null job: the page switches on
+        # ``state`` alone and should not have to handle a missing body.
+        assert body == {"state": "idle"}
+
+    def test_a_finished_job_is_still_reported(self):
+        # The manager retains the last finished job, and the page needs
+        # to see it: a poll that started after the pull ended must still
+        # learn it succeeded, or the strip hangs at its last percentage.
         finished = DownloadJob(alias="already-done", total_bytes=100)
         finished.state = DownloadState.DONE
         finished.done_bytes = 100
 
-        events = self._events(FakeDownloads(job=finished))
+        with build_client(downloads=FakeDownloads(job=finished)) as client:
+            body = client.get("/api/downloads/status", headers=AUTH).json()
 
-        first = await asyncio.wait_for(anext(events), timeout=5)
-        assert b"already-done" in first
-        assert b"[DONE]" not in first
+        assert body["state"] == "done"
+        assert body["alias"] == "already-done"
 
-        # Still live: a client that arrives after a finished download has
-        # to be able to watch the next one on the same connection. With
-        # nothing changing the server emits a keepalive comment frame,
-        # which is proof the loop did not terminate.
-        second = await asyncio.wait_for(anext(events), timeout=5)
-        assert second.startswith(b":")
-
-        await events.aclose()
-
-    @pytest.mark.asyncio
-    async def test_a_new_download_is_reported_on_an_existing_feed(self):
-        finished = DownloadJob(alias="already-done", total_bytes=100)
-        finished.state = DownloadState.DONE
-
-        downloads = FakeDownloads(job=finished)
-        events = self._events(downloads)
-
-        await asyncio.wait_for(anext(events), timeout=5)
-
-        # The exact case the closed-on-terminal bug broke.
-        await downloads.start("next-model", total_bytes=500)
-        frames = []
-        for _ in range(3):
-            frames.append(await asyncio.wait_for(anext(events), timeout=5))
-            if b"next-model" in frames[-1]:
-                break
-
-        assert any(b"next-model" in frame for frame in frames)
-        await events.aclose()
-
-    @pytest.mark.asyncio
-    async def test_an_idle_manager_reports_idle(self):
-        events = self._events(FakeDownloads(job=None))
-        first = await asyncio.wait_for(anext(events), timeout=5)
-        assert b'"idle"' in first
-        await events.aclose()
-
-    @pytest.mark.asyncio
-    async def test_a_disconnected_client_ends_the_feed(self):
-        async def disconnected():
-            return True
-
-        request = SimpleNamespace(is_disconnected=disconnected)
-        events = app_module._download_events(FakeDownloads(), request)
-
-        # Without this the generator would keep polling the manager for a
-        # client that is gone.
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(anext(events), timeout=5)
-
-    def test_the_stream_requires_a_token(self):
+    def test_status_requires_a_token(self):
         with build_client(downloads=FakeDownloads()) as client:
-            assert client.get("/api/downloads/stream").status_code == 401
+            assert client.get("/api/downloads/status").status_code == 401
 
-    def test_the_stream_is_refused_when_downloads_are_disabled(self):
+    def test_status_is_refused_when_downloads_are_disabled(self):
         with build_client(downloads=None) as client:
-            response = client.get("/api/downloads/stream", headers=AUTH)
+            response = client.get("/api/downloads/status", headers=AUTH)
         assert response.status_code == 403
+        assert response.json()["error"]["type"] == "downloads_disabled"
 
 
 class TestNoAuthMode:

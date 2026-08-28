@@ -216,9 +216,12 @@ Attaching a tunnel puts this on the public internet, so:
   is simply unreadable to it. Downgrade and it stays that way, so export
   anything you cannot lose first.
 - Text chat only. No images, audio, tools or MCP.
-- Downloads are one at a time, and progress is lost from the page if you
-  reload mid-download — the download itself continues, and reopening the
-  model sheet reconnects to it.
+- Downloads are one at a time. Progress is polled once a second rather than
+  streamed, so reloading mid-download reconnects to the running pull and picks
+  its progress back up. (The progress feed used to be server-sent events, which
+  worked on loopback but was buffered indefinitely by `trycloudflare` — headers
+  arrived, the body never did. Chat streaming is unaffected: it emits tokens
+  continuously, which is enough to break through that buffering.)
 - `--attach` mode cannot list or switch models: listing needs the `rapid-mlx`
   CLI and switching needs ownership of the engine process, and an attached
   server has neither.

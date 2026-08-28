@@ -261,21 +261,3 @@ class TestCancellation:
         assert job.state is DownloadState.CANCELLED
 
 
-class TestChangeNotification:
-    @pytest.mark.asyncio
-    async def test_wait_for_change_returns_on_progress(self, pull_stub):
-        manager = DownloadManager(pull_stub(hang=True))
-        await manager.start("m", total_bytes=1000)
-
-        # Event-driven rather than timer-driven: a fast download must
-        # report promptly without a tight poll loop.
-        await asyncio.wait_for(manager.wait_for_change(timeout=10), timeout=15)
-
-        await manager.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_wait_for_change_returns_on_timeout_without_raising(self):
-        manager = DownloadManager("/bin/true")
-        # The SSE loop relies on this returning quietly so it can emit a
-        # keepalive frame; raising would kill the feed.
-        await manager.wait_for_change(timeout=0.05)

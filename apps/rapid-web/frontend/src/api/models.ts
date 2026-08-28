@@ -1,5 +1,4 @@
 import { request, requestJson } from './client';
-import { readJsonEventStream } from './sse';
 import type { DownloadJob, ModelsResponse, RemovalResult, StatusResponse } from './types';
 
 export function fetchStatus(signal?: AbortSignal): Promise<StatusResponse> {
@@ -55,18 +54,21 @@ export async function cancelDownload(): Promise<void> {
 }
 
 /**
- * The download progress feed.
+ * The current download job, or ``{ state: 'idle' }`` when there is none.
  *
- * The server deliberately never closes this stream, even after a job reaches a
- * terminal state (app.py:539-550). Closing on done/cancelled looks right and
- * passes every single-download test, but the manager retains the last finished
- * job — so a client connecting afterwards would immediately see the terminal
- * frame, get ``[DONE]`` and disconnect, and a *subsequent* download would then
- * have no live feed at all. The caller is therefore responsible for aborting
- * once it has seen what it needs.
+ * Polled, NOT streamed — and the SSE feed this replaced was not removed for
+ * tidiness. Measured against a real ``trycloudflare`` tunnel: response headers
+ * arrived in 1.8 s and then not one body byte in 65 s, while the same endpoint
+ * on loopback delivered its first frame in 0.0 s. Cloudflare strips the
+ * ``X-Accel-Buffering: no`` hint (an nginx convention it does not honour), and
+ * padding the first frame to 2 KiB did not shake it loose either.
+ *
+ * The chat stream survives the same tunnel because it emits tokens
+ * continuously; a download feed that sends 25 bytes and then a keepalive every
+ * 15 s is far too sparse to break through the buffer. Progress is
+ * low-frequency data, so a poll costs nothing a long-lived connection was
+ * buying.
  */
-export async function* watchDownloads(signal: AbortSignal): AsyncGenerator<DownloadJob> {
-  const response = await request('/api/downloads/stream', { signal });
-  if (!response.body) return;
-  yield* readJsonEventStream<DownloadJob>(response.body, signal);
+export function fetchDownload(signal?: AbortSignal): Promise<DownloadJob> {
+  return requestJson<DownloadJob>('/api/downloads/status', signal ? { signal } : {});
 }

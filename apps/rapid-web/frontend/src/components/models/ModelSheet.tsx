@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import {
   cancelDownload,
+  fetchDownload,
   fetchModels,
   loadModel,
   pullModel,
   removeModel,
-  watchDownloads,
 } from '@/api/models';
 import { asApiError } from '@/api/errors';
 import type { DownloadJob, ModelEntry, StatusResponse } from '@/api/types';
@@ -26,6 +26,10 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
   const selected = useStore((state) => state.selectedAlias);
   const allowDownloads = useStore((state) => state.allowDownloads);
   const download = useStore((state) => state.download);
+  // The STATE alone, not the job: the poll effect keys on this, and
+  // subscribing to the whole job would tear it down and rebuild it on every
+  // byte of progress.
+  const downloadState = useStore((state) => state.download?.state ?? null);
   const setModels = useStore((state) => state.setModels);
   const setDownload = useStore((state) => state.setDownload);
   const selectAlias = useStore((state) => state.selectAlias);
@@ -36,7 +40,6 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
   const [failure, setFailure] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ModelEntry | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
-  const watching = useRef<AbortController | null>(null);
 
   const refresh = useMemo(
     () => async (force: boolean) => {
@@ -59,40 +62,74 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
   useEffect(() => {
     if (!open) return;
     // Fetching on open, not deriving state from props.
+    //
+    // `force`, since the Refresh button was removed: opening the picker is a
+    // deliberate act, not a poll, so it should not be served a disk scan up to
+    // the server's TTL old. Without this there would be no way at all to see a
+    // model pulled from the Mac a moment ago.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void refresh(false);
+    void refresh(true);
   }, [open, refresh]);
 
-  // Re-attach to a download that may already be running. The server keeps the
-  // feed open after a job finishes (app.py:539-550), so a client connecting
-  // late still sees the current state rather than nothing.
+  // Poll the current download. Re-attaches to a job that was already running,
+  // so reopening the sheet mid-download shows real progress rather than
+  // nothing.
+  //
+  // A poll rather than a stream because trycloudflare buffers the SSE feed
+  // this replaced indefinitely — see `fetchDownload` for the measurements.
+  //
+  // It runs in exactly two situations, and stops otherwise:
+  //
+  // * `null` — we do not know yet. One discovery request on open, which is
+  //   what re-attaches to a pull started before this page loaded.
+  // * `running` — there is progress to follow.
+  //
+  // A terminal job is NOT polled. The server retains the last finished job
+  // indefinitely, so asking again can only ever return the same answer; the
+  // old loop kept requesting once a second for the life of the sheet. Both
+  // places that start a pull put a `running` job in the store, so this effect
+  // re-runs and resumes on its own when the next download begins.
   useEffect(() => {
-    if (!open || !allowDownloads || watching.current) return;
+    if (!open || !allowDownloads) return;
+    if (downloadState !== null && downloadState !== 'running') return;
 
     const controller = new AbortController();
-    watching.current = controller;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Only a completion we actually WATCHED means the disk changed. Arriving
+    // to find a retained `done` from a previous session does not — and the
+    // sheet's open effect has already re-read the catalog by then.
+    const watching = downloadState === 'running';
+    let failures = 0;
 
-    void (async () => {
+    const tick = async () => {
+      let again: boolean;
       try {
-        for await (const job of watchDownloads(controller.signal)) {
-          setDownload(job.state === 'idle' ? null : job);
-          // A finished download changes what is on disk, so the list has to
-          // be re-read or the row still says "remote".
-          if (job.state === 'done') void refresh(true);
-        }
+        const job = await fetchDownload(controller.signal);
+        if (controller.signal.aborted) return;
+        failures = 0;
+        setDownload(job.state === 'idle' ? null : job);
+        // A finished download changes what is on disk, so the list has to be
+        // re-read or the row still says "remote".
+        if (job.state === 'done' && watching) void refresh(true);
+        again = job.state === 'running';
       } catch {
-        // Aborted, or the connection dropped. Either way the feed is over and
-        // the strip keeps whatever it last showed.
-      } finally {
-        if (watching.current === controller) watching.current = null;
+        // A dropped request is not a reason to abandon a live download, but a
+        // server that is simply gone must not be polled forever.
+        failures += 1;
+        again = failures < 5;
       }
-    })();
+      // Scheduled AFTER the response, not on an interval: a slow request must
+      // not stack up a queue of overlapping polls.
+      if (again && !controller.signal.aborted) timer = setTimeout(() => void tick(), 1000);
+    };
+
+    void tick();
 
     return () => {
       controller.abort();
-      if (watching.current === controller) watching.current = null;
+      if (timer !== undefined) clearTimeout(timer);
     };
-  }, [open, allowDownloads, setDownload, refresh]);
+  }, [open, allowDownloads, downloadState, setDownload, refresh]);
 
   const chatModels = useMemo(
     () =>
@@ -176,16 +213,7 @@ export function ModelSheet({ open, onClose }: { open: boolean; onClose(): void }
   };
 
   return (
-    <Sheet
-      open={open}
-      onClose={onClose}
-      title="Model"
-      actions={
-        <Button variant="ghost" size="sm" onClick={() => void refresh(true)} disabled={loading}>
-          {loading ? 'Refreshing…' : 'Refresh'}
-        </Button>
-      }
-    >
+    <Sheet open={open} onClose={onClose} title="Model">
       <div className="bg-background sticky top-0 z-1 px-3.5 pt-3 pb-2">
         <label htmlFor="model-search" className="sr-only">
           Search models
