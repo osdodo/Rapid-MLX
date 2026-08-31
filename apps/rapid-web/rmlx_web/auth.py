@@ -177,3 +177,15 @@ def content_type_is_json(content_type: str | None) -> bool:
     if not content_type:
         return False
     return content_type.split(";", 1)[0].strip().lower() == "application/json"
+
+
+def content_type_is_multipart(content_type: str | None) -> bool:
+    """Recognise a browser-generated multipart form with a boundary."""
+    if not content_type:
+        return False
+    media_type, separator, parameters = content_type.partition(";")
+    return (
+        media_type.strip().lower() == "multipart/form-data"
+        and bool(separator)
+        and "boundary=" in parameters.lower()
+    )

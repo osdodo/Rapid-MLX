@@ -21,6 +21,10 @@ dependencies = [
     # to propagate client disconnects back to the child. `requests` is
     # synchronous and would tie up a worker per in-flight generation.
     "httpx>=0.25.0",
+    # Multipart is used for bounded binary image/audio uploads. Sending the
+    # bytes directly avoids the ~33% Base64 expansion and several full-size
+    # browser/server memory copies.
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]

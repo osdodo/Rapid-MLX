@@ -39,6 +39,16 @@ function headers(): HeadersInit {
   return base;
 }
 
+function uploadHeaders(): HeadersInit {
+  const base: Record<string, string> = {
+    // Non-safelisted on purpose: a cross-origin browser must preflight this
+    // upload, and the server never grants CORS.
+    'X-Rapid-Upload': '1',
+  };
+  if (token) base['Authorization'] = `Bearer ${token}`;
+  return base;
+}
+
 /**
  * Fetch with the auth and content-type headers this server requires.
  *
@@ -68,6 +78,24 @@ export async function request(path: string, options: RequestOptions = {}): Promi
 /** ``request`` plus JSON decoding, for the endpoints that return a document. */
 export async function requestJson<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const response = await request(path, options);
+  return (await response.json()) as T;
+}
+
+/** Upload binary data without Base64 expansion or a manually-set boundary. */
+export async function uploadJson<T>(
+  path: string,
+  body: FormData,
+  signal?: AbortSignal,
+): Promise<T> {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: uploadHeaders(),
+    body,
+    credentials: 'omit',
+  };
+  if (signal) init.signal = signal;
+  const response = await fetch(path, init);
+  if (!response.ok) throw await errorFromResponse(response);
   return (await response.json()) as T;
 }
 

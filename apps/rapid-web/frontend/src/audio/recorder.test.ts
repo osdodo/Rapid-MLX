@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { formatDuration, pickMimeType } from './recorder';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MAX_RECORDING_MS, Recorder, formatDuration, pickMimeType } from './recorder';
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 /**
  * The recorded container is NOT what gets uploaded.
@@ -37,5 +42,41 @@ describe('formatDuration', () => {
 
   it('floors rather than rounding, so a timer never shows a second early', () => {
     expect(formatDuration(1_999)).toBe('0:01');
+  });
+});
+
+describe('recording limit', () => {
+  it('automatically asks the UI to stop before a long take is transcoded', async () => {
+    vi.useFakeTimers();
+    const stopTrack = vi.fn();
+    vi.stubGlobal('navigator', {
+      mediaDevices: {
+        getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })),
+      },
+    });
+    class FakeMediaRecorder {
+      static isTypeSupported = () => true;
+      state = 'inactive';
+      mimeType = 'audio/webm';
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      start() {
+        this.state = 'recording';
+      }
+      stop() {
+        this.state = 'inactive';
+        this.onstop?.();
+      }
+    }
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+
+    const reachedLimit = vi.fn();
+    const recorder = new Recorder();
+    await recorder.start(reachedLimit);
+    await vi.advanceTimersByTimeAsync(MAX_RECORDING_MS);
+
+    expect(reachedLimit).toHaveBeenCalledOnce();
+    recorder.cancel();
+    expect(stopTrack).toHaveBeenCalledOnce();
   });
 });

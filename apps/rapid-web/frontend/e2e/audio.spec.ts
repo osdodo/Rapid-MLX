@@ -421,17 +421,6 @@ test.describe('speech to text', () => {
 test('a recording is uploaded as WAV, not as the recorded container', async ({ page }) => {
   const stub = await startStub({ engineState: 'ready', model: 'qwen3-4b' });
   try {
-    // Capture the upload the page actually makes.
-    let uploaded: string | null = null;
-    await page.route('**/api/audio/transcriptions', async (route) => {
-      uploaded = (route.request().postDataJSON() as { audio: string }).audio;
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ text: 'ok', language: 'en', duration: 1 }),
-      });
-    });
-
     // WebKit cannot grant a microphone headlessly, so `MediaRecorder` and
     // `getUserMedia` are replaced with doubles that emit a REAL webm/mp4-class
     // blob — produced here as an encoded WAV at a non-target rate, so a
@@ -499,10 +488,10 @@ test('a recording is uploaded as WAV, not as the recorded container', async ({ p
     await page.waitForTimeout(400);
     await page.getByRole('button', { name: 'Stop recording' }).click();
 
-    await expect.poll(() => uploaded).not.toBeNull();
+    await expect.poll(() => stub.scenario.audioUpload).not.toBeNull();
 
     // Decode the header the SERVER was sent.
-    const header = Buffer.from(uploaded!, 'base64');
+    const header = Buffer.from(stub.scenario.audioUpload!, 'base64');
     expect(header.subarray(0, 4).toString()).toBe('RIFF');
     expect(header.subarray(8, 12).toString()).toBe('WAVE');
     expect(header.readUInt16LE(20)).toBe(1); // PCM

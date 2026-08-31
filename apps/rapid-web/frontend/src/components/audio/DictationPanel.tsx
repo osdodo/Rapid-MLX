@@ -64,21 +64,6 @@ export function DictationPanel() {
   // The microphone must not stay live if the surface goes away mid-take.
   useEffect(() => () => recorder.current?.cancel(), []);
 
-  const begin = useCallback(async () => {
-    const instance = recorder.current ?? new Recorder();
-    recorder.current = instance;
-    try {
-      await instance.start();
-      setElapsed(0);
-      setRecording(true);
-    } catch (cause) {
-      pushNotice({
-        tone: 'error',
-        title: cause instanceof RecorderError ? cause.message : 'Recording could not start.',
-      });
-    }
-  }, [pushNotice]);
-
   const finish = useCallback(async () => {
     const instance = recorder.current;
     if (!instance) return;
@@ -130,6 +115,21 @@ export function DictationPanel() {
       setBusy(false);
     }
   }, [pushNotice, terms, model.alias]);
+
+  const begin = useCallback(async () => {
+    const instance = recorder.current ?? new Recorder();
+    recorder.current = instance;
+    try {
+      await instance.start(() => void finish());
+      setElapsed(0);
+      setRecording(true);
+    } catch (cause) {
+      pushNotice({
+        tone: 'error',
+        title: cause instanceof RecorderError ? cause.message : 'Recording could not start.',
+      });
+    }
+  }, [finish, pushNotice]);
 
   return (
     <div className="flex flex-col gap-5">

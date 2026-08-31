@@ -217,15 +217,12 @@ async def proxy_multipart(
 ) -> httpx.Response:
     """POST a file upload built HERE, not relayed from the client.
 
-    The browser sends the file as base64 inside a JSON body and this
-    rebuilds the multipart. That is deliberate: the middleware's CSRF
-    control rejects the CORS-simple content types, and ``multipart/
-    form-data`` is one of them — so relaying the client's own multipart
-    would need a second, weaker policy for one route. Re-encoding costs
-    ~33% on the wire and keeps one rule.
+    The web layer accepts a size-bounded multipart form guarded by a custom
+    CSRF header, reads the validated file, and rebuilds the engine request
+    here. The browser's boundary and metadata are never relayed verbatim.
 
     ``Content-Type`` is omitted from the headers so httpx can set the
-    multipart boundary itself.
+    engine-side multipart boundary itself.
     """
     url = f"{base_url.rstrip('/')}{path}"
     headers = {}

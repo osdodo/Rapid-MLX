@@ -60,10 +60,8 @@ test('a result can be edited, and the edit chains off it', async ({ page }) => {
 test('a file can be imported to edit, under the real CSP', async ({ page }) => {
   const stub = await startStub({ engineState: 'ready', model: 'flux2-klein-4b' });
   try {
-    // The page's CSP is `img-src 'self' data:`. An object URL is REFUSED by
-    // it, so measuring the picked file through `createObjectURL` made the
-    // size probe fire `error` and every good file was reported unreadable.
-    // Only a real browser under the real header catches that.
+    // Imported files use object URLs to avoid Base64 copies, so the real CSP
+    // must explicitly admit blob: previews.
     const violations: string[] = [];
     page.on('console', (message) => {
       if (/Content Security Policy/i.test(message.text())) violations.push(message.text());

@@ -176,6 +176,8 @@ export interface Scenario {
   voicesFailure: { status: number; type: string; message: string } | null;
   /** Text `/api/audio/transcriptions` returns. */
   transcript: string;
+  /** Base64 bytes of the last uploaded recording. */
+  audioUpload: string | null;
   /** What `/api/residency` reports. */
   residency: {
     memory_limit_bytes: number;
@@ -367,6 +369,7 @@ const DEFAULT_SCENARIO: Scenario = {
   voices: ['af_heart', 'am_adam', 'bf_emma'],
   voicesFailure: null,
   transcript: 'this is a transcription',
+  audioUpload: null,
   residency: {
     memory_limit_bytes: 25 * 1024 ** 3,
     memory_used_bytes: 9_750_000_000,
@@ -431,6 +434,28 @@ function readBody(request: IncomingMessage): Promise<string> {
     request.on('data', (chunk: Buffer) => (body += chunk));
     request.on('end', () => resolveBody(body));
   });
+}
+
+function readBytes(request: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolveBody) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => resolveBody(Buffer.concat(chunks)));
+  });
+}
+
+async function readForm(request: IncomingMessage): Promise<FormData> {
+  const body = await readBytes(request);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (Array.isArray(value)) value.forEach((entry) => headers.append(name, entry));
+    else if (value !== undefined) headers.set(name, value);
+  }
+  return await new Request('http://stub.local/upload', {
+    method: 'POST',
+    headers,
+    body: new Uint8Array(body),
+  }).formData();
 }
 
 function json(response: ServerResponse, status: number, payload: unknown): void {
@@ -513,7 +538,7 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     response.setHeader(
       'Content-Security-Policy',
       "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
-        "connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; " +
+        "connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; " +
         "frame-ancestors 'none'; base-uri 'none'",
     );
 
@@ -679,12 +704,18 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     // result. Holding the connection for the render is what a Cloudflare
     // tunnel cuts at 100 s with a 524.
     if (path === '/api/images/jobs') {
-      const body = JSON.parse((await readBody(request)) || '{}') as {
-        mode?: string;
-        prompt?: string;
-        image?: string;
-        model?: string;
-      };
+      const multipart = request.headers['content-type']?.startsWith('multipart/form-data');
+      const body = multipart
+        ? await readForm(request).then((form) => ({
+            mode: 'edit',
+            prompt: String(form.get('prompt') ?? ''),
+            model: form.get('model') === null ? undefined : String(form.get('model')),
+          }))
+        : (JSON.parse((await readBody(request)) || '{}') as {
+            mode?: string;
+            prompt?: string;
+            model?: string;
+          });
       if (body.mode === 'edit') {
         scenario.edits.push({ prompt: body.prompt ?? '', model: body.model ?? null });
       }
@@ -754,7 +785,11 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
     }
 
     if (path === '/api/audio/transcriptions') {
-      await readBody(request);
+      const form = await readForm(request);
+      const file = form.get('file');
+      if (file !== null && typeof file !== 'string') {
+        scenario.audioUpload = Buffer.from(await file.arrayBuffer()).toString('base64');
+      }
       json(response, 200, {
         text: scenario.transcript,
         language: 'en',

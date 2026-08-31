@@ -9,7 +9,6 @@ subprocess rather than importing ``vllm_mlx``: the seam is mockable.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import re
@@ -29,6 +28,7 @@ from rmlx_web.supervisor import ChildState, ChildStatus, ResidencyOutcome
 TOKEN = "test-token-value"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 JSON_CT = {"Content-Type": "application/json"}
+UPLOAD = {"X-Rapid-Upload": "1"}
 
 
 class FakeEngine:
@@ -228,6 +228,16 @@ class TestAuthGate:
         assert response.status_code == 415
         assert response.json()["error"]["type"] == "unsupported_media_type"
 
+    def test_multipart_without_the_csrf_header_is_refused(self):
+        with build_client() as client:
+            response = client.post(
+                "/api/audio/transcriptions",
+                headers=AUTH,
+                files={"file": ("recording.wav", b"RIFFfake", "audio/wav")},
+            )
+        assert response.status_code == 415
+        assert response.json()["error"]["type"] == "unsupported_media_type"
+
 
 class TestSecurityHeaders:
     def test_index_carries_a_restrictive_csp(self):
@@ -249,6 +259,11 @@ class TestSecurityHeaders:
         # downloads fine, so the bytes look correct and the audio takes the
         # blame.
         assert "media-src 'self' blob:" in csp
+
+    def test_img_src_allows_revocable_blob_previews(self):
+        with build_client() as client:
+            csp = client.get("/").headers["Content-Security-Policy"]
+        assert "img-src 'self' data: blob:" in csp
 
 
 class TestIndexIsSelfContained:
@@ -634,13 +649,9 @@ class TestImageJobs:
         with build_client() as client:
             started = client.post(
                 "/api/images/jobs",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "mode": "edit",
-                    "image": base64.b64encode(b"\x89PNGfake").decode(),
-                    "prompt": "make it night",
-                    "model": "flux2-klein-4b",
-                },
+                headers={**AUTH, **UPLOAD},
+                files={"image": ("input.png", b"\x89PNGfake", "image/png")},
+                data={"prompt": "make it night", "model": "flux2-klein-4b"},
             )
             assert started.status_code == 200
             body = _await_job(client, started.json()["id"])
@@ -851,36 +862,32 @@ class TestImageJobs:
         with build_client() as client:
             response = client.post(
                 "/api/images/jobs",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "mode": "edit",
-                    "image": base64.b64encode(b"x").decode(),
-                    "prompt": "  ",
-                },
+                headers={**AUTH, **UPLOAD},
+                files={"image": ("input.png", b"x", "image/png")},
+                data={"prompt": "  "},
             )
         assert response.status_code == 400
         assert response.json()["error"]["type"] == "invalid_body"
 
-    def test_a_non_base64_image_is_refused(self):
+    def test_an_edit_without_a_file_is_refused(self):
         with build_client() as client:
             response = client.post(
                 "/api/images/jobs",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "mode": "edit",
-                    "image": "not base64!!",
-                    "prompt": "make it night",
-                },
+                headers={**AUTH, **UPLOAD},
+                files={"not_image": ("x.txt", b"x", "text/plain")},
+                data={"prompt": "make it night"},
             )
         assert response.status_code == 400
 
     def test_an_oversize_image_is_refused_here(self):
-        oversize = base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()
         with build_client() as client:
             response = client.post(
                 "/api/images/jobs",
-                headers={**AUTH, **JSON_CT},
-                json={"mode": "edit", "image": oversize, "prompt": "make it night"},
+                headers={**AUTH, **UPLOAD},
+                files={
+                    "image": ("input.png", b"x" * (MAX_IMAGE_BYTES + 1), "image/png")
+                },
+                data={"prompt": "make it night"},
             )
         # Refused before the relay rather than after another hop.
         assert response.status_code == 413
@@ -1054,7 +1061,7 @@ class TestAudio:
         assert response.status_code == 503
         assert "espeak-ng" in response.json()["error"]["message"]
 
-    def test_transcription_takes_base64_and_sends_multipart(self, monkeypatch):
+    def test_transcription_relays_a_bounded_multipart_upload(self, monkeypatch):
         captured = {}
 
         async def fake_post(self, url, **kwargs):
@@ -1073,49 +1080,46 @@ class TestAudio:
         with build_client() as client:
             response = client.post(
                 "/api/audio/transcriptions",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "audio": base64.b64encode(b"RIFFfake").decode(),
-                    "model": "whisper-large-v3-turbo",
-                },
+                headers={**AUTH, **UPLOAD},
+                files={"file": ("recording.wav", b"RIFFfake", "audio/wav")},
+                data={"model": "whisper-large-v3-turbo"},
             )
 
         assert response.status_code == 200
         assert response.json()["text"] == "hello there"
-        # Base64 in, multipart out: the middleware's CSRF control rejects
-        # multipart from the browser, so it is rebuilt here.
         assert captured["files"]["file"][1] == b"RIFFfake"
         assert captured["data"]["model"] == "whisper-large-v3-turbo"
         # No Content-Type of our own, or httpx cannot set the boundary.
         assert "Content-Type" not in captured["headers"]
         assert captured["headers"]["Authorization"] == "Bearer engine-side-key"
 
-    def test_a_non_base64_body_is_refused(self):
+    def test_json_audio_is_refused(self):
         with build_client() as client:
             response = client.post(
                 "/api/audio/transcriptions",
                 headers={**AUTH, **JSON_CT},
-                json={"audio": "not base64!!"},
+                json={"audio": "legacy-base64"},
             )
-        assert response.status_code == 400
-        assert response.json()["error"]["type"] == "invalid_body"
+        assert response.status_code == 415
+        assert response.json()["error"]["type"] == "unsupported_media_type"
 
     def test_an_empty_recording_is_refused(self):
         with build_client() as client:
             response = client.post(
                 "/api/audio/transcriptions",
-                headers={**AUTH, **JSON_CT},
-                json={"audio": ""},
+                headers={**AUTH, **UPLOAD},
+                files={"file": ("recording.wav", b"", "audio/wav")},
             )
         assert response.status_code == 400
 
     def test_an_oversize_recording_is_refused_here(self):
-        oversize = base64.b64encode(b"x" * (MAX_AUDIO_BYTES + 1)).decode()
         with build_client() as client:
             response = client.post(
                 "/api/audio/transcriptions",
-                headers={**AUTH, **JSON_CT},
-                json={"audio": oversize},
+                headers={**AUTH, **UPLOAD},
+                files={
+                    "file": ("recording.wav", b"x" * (MAX_AUDIO_BYTES + 1), "audio/wav")
+                },
             )
         # Refused before the relay rather than after another hop.
         assert response.status_code == 413
@@ -1134,11 +1138,8 @@ class TestAudio:
         with build_client() as client:
             client.post(
                 "/api/audio/transcriptions",
-                headers={**AUTH, **JSON_CT},
-                json={
-                    "audio": base64.b64encode(b"x").decode(),
-                    "filename": 'evil"; name="model',
-                },
+                headers={**AUTH, **UPLOAD},
+                files={"file": ('evil"; name="model', b"x", "audio/wav")},
             )
 
         # The name is advisory (the engine spools to a .wav temp file

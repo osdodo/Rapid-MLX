@@ -1,12 +1,12 @@
-import { request, requestJson } from './client';
+import { request, requestJson, uploadJson } from './client';
 import type { ImageJob, ImageJobSnapshot } from './types';
 
 export interface StartOptions {
   prompt: string;
   /** Generation only — the edit backends derive their canvas from the source. */
   size?: string | undefined;
-  /** Base64 PNG/JPEG bytes without a `data:` prefix. Present means edit. */
-  image?: string | undefined;
+  /** PNG/JPEG bytes. Present means edit. */
+  image?: Blob | undefined;
   model?: string | undefined;
   signal?: AbortSignal | undefined;
 }
@@ -19,9 +19,8 @@ export interface StartOptions {
  * Cloudflare cut it at 100 s with a 524. This POST returns immediately and
  * the result is collected by polling.
  *
- * Sent as JSON with the source base64-encoded, never as a multipart: the
- * server's CSRF control rejects the CORS-simple content types and rebuilds
- * the multipart itself.
+ * Edits use a custom-header multipart upload, which forces a cross-origin
+ * browser to preflight without expanding the image into Base64.
  */
 export function startImageJob({
   prompt,
@@ -30,13 +29,19 @@ export function startImageJob({
   model,
   signal,
 }: StartOptions): Promise<ImageJob> {
+  if (image) {
+    const form = new FormData();
+    form.append('image', image, image.type === 'image/jpeg' ? 'input.jpg' : 'input.png');
+    form.append('prompt', prompt);
+    if (model) form.append('model', model);
+    return uploadJson<ImageJob>('/api/images/jobs', form, signal);
+  }
   return requestJson<ImageJob>('/api/images/jobs', {
     method: 'POST',
     body: {
-      mode: image ? 'edit' : 'generation',
+      mode: 'generation',
       prompt,
-      ...(image ? { image } : {}),
-      ...(size && !image ? { size } : {}),
+      ...(size ? { size } : {}),
       ...(model ? { model } : {}),
     },
     ...(signal ? { signal } : {}),

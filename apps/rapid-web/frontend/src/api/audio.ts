@@ -1,4 +1,4 @@
-import { request, requestJson } from './client';
+import { request, requestJson, uploadJson } from './client';
 
 /**
  * The audio lane.
@@ -61,9 +61,8 @@ export interface TranscribeOptions {
 /**
  * Transcribe a recording.
  *
- * Sent as base64 inside JSON rather than as a multipart upload: the server's
- * CSRF control rejects the CORS-simple content types and `multipart/form-data`
- * is one of them. The ~33% wire cost buys one security policy instead of two.
+ * The custom upload header makes multipart non-simple for CORS, preserving the
+ * server's CSRF boundary without Base64's wire and memory expansion.
  */
 export async function transcribe({
   audio,
@@ -71,32 +70,11 @@ export async function transcribe({
   context,
   signal,
 }: TranscribeOptions): Promise<Transcription> {
-  return requestJson<Transcription>('/api/audio/transcriptions', {
-    method: 'POST',
-    body: {
-      audio: await toBase64(audio),
-      filename: filenameFor(audio.type),
-      ...(model ? { model } : {}),
-      ...(context ? { context } : {}),
-    },
-    ...(signal ? { signal } : {}),
-  });
-}
-
-/**
- * Base64 without `FileReader`'s data-URI wrapper.
- *
- * Chunked: `String.fromCharCode(...bytes)` on a multi-megabyte recording
- * exceeds the argument limit and throws `RangeError`.
- */
-async function toBase64(blob: Blob): Promise<string> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let binary = '';
-  const CHUNK = 0x8000;
-  for (let index = 0; index < bytes.length; index += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + CHUNK));
-  }
-  return btoa(binary);
+  const form = new FormData();
+  form.append('file', audio, filenameFor(audio.type));
+  if (model) form.append('model', model);
+  if (context) form.append('context', context);
+  return uploadJson<Transcription>('/api/audio/transcriptions', form, signal);
 }
 
 /**

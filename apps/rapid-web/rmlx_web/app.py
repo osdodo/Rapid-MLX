@@ -10,8 +10,6 @@ engine's log tail.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import hashlib
 import json
@@ -26,6 +24,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.datastructures import UploadFile
 
 from . import auth, connectors, proxy, tools
 from .catalog import CatalogError, ModelCatalog, RemovalError
@@ -44,6 +43,7 @@ from .supervisor import (
     ResidencyOutcome,
     SupervisorError,
 )
+from .uploads import UploadBodyLimitMiddleware
 
 STATIC_DIR = Path(__file__).parent / "static"
 ASSETS_DIR = STATIC_DIR / "assets"
@@ -56,6 +56,12 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 # The engine's ``_MAX_EDIT_IMAGE_BYTES``, for the same reason.
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+# Multipart framing and the small metadata fields share the request body with
+# the file. One MiB is ample headroom without turning the file cap into a late
+# parser-time check.
+MAX_UPLOAD_REQUEST_BYTES = max(MAX_AUDIO_BYTES, MAX_IMAGE_BYTES) + 1024 * 1024
+_UPLOAD_PATHS = frozenset({"/api/images/jobs", "/api/audio/transcriptions"})
 
 # Filenames reaching a multipart part. Restricted rather than sanitised: the
 # name is advisory (the engine spools every upload to a ``.wav`` temp file
@@ -77,6 +83,24 @@ def _upload_filename(candidate: object) -> str:
     if isinstance(candidate, str) and _UPLOAD_NAME_RE.match(candidate):
         return candidate
     return "recording.wav"
+
+
+async def _read_upload(upload: UploadFile, limit: int) -> bytes | JSONResponse:
+    content = bytearray()
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > limit:
+            return _json_error(
+                413,
+                f"upload is larger than {limit // (1024 * 1024)} MB",
+                "payload_too_large",
+            )
+    if not content:
+        return _json_error(400, "the uploaded file was empty", "invalid_body")
+    return bytes(content)
 
 
 class _HashedAssets(StaticFiles):
@@ -227,6 +251,10 @@ def create_app(config: WebConfig) -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
+    app.add_middleware(
+        UploadBodyLimitMiddleware,
+        limits={path: MAX_UPLOAD_REQUEST_BYTES for path in _UPLOAD_PATHS},
+    )
     app.state.config = config
     app.state.lifecycle = lifecycle
 
@@ -257,16 +285,22 @@ def create_app(config: WebConfig) -> FastAPI:
         ):
             return _json_error(403, "cross-origin request refused", "origin_refused")
 
-        # Bodies must be JSON. This is a CSRF control rather than a
-        # parsing convenience — see auth.content_type_is_json.
-        if request.method in ("POST", "PUT", "PATCH") and not auth.content_type_is_json(
-            request.headers.get("content-type")
-        ):
-            return _json_error(
-                415,
-                "requests must be sent as application/json",
-                "unsupported_media_type",
+        if request.method in ("POST", "PUT", "PATCH"):
+            content_type = request.headers.get("content-type")
+            multipart_upload = (
+                path in _UPLOAD_PATHS
+                and auth.content_type_is_multipart(content_type)
+                and request.headers.get("x-rapid-upload") == "1"
             )
+            # Multipart is accepted only on the two upload routes and only
+            # with a non-safelisted header. A cross-origin browser must
+            # preflight that header, and this server never grants CORS.
+            if not multipart_upload and not auth.content_type_is_json(content_type):
+                return _json_error(
+                    415,
+                    "requests must be JSON or an approved multipart upload",
+                    "unsupported_media_type",
+                )
 
         presented = auth.extract_bearer(request.headers.get("authorization"))
         if not auth.token_matches(config.token, presented):
@@ -677,26 +711,40 @@ def create_app(config: WebConfig) -> FastAPI:
         with no bytes flowing for minutes and Cloudflare cut it at 100 s
         with a 524. The page polls ``/api/images/jobs/{id}`` instead.
 
-        ``mode`` picks the shape. An edit carries its source as base64 and
-        is rebuilt into the multipart the engine expects — the middleware's
-        CSRF control rejects ``multipart/form-data``, so relaying the
-        browser's own would need a second, weaker policy. Same reasoning as
-        ``/api/audio/transcriptions``.
+        Generation uses JSON. An edit uses a bounded multipart upload so the
+        browser and server never materialise Base64 copies of the source.
         """
-        try:
-            payload = await request.json()
-        except (ValueError, json.JSONDecodeError):
-            return _json_error(400, "request body was not valid JSON", "invalid_json")
-        if not isinstance(payload, dict):
-            return _json_error(
-                400, "request body must be a JSON object", "invalid_json"
-            )
-
-        mode = payload.get("mode", "generation")
-        if mode not in ("generation", "edit"):
-            return _json_error(
-                400, "`mode` must be 'generation' or 'edit'", "invalid_body"
-            )
+        is_edit = auth.content_type_is_multipart(request.headers.get("content-type"))
+        payload: dict = {}
+        content: bytes | None = None
+        if is_edit:
+            async with request.form(max_files=1, max_fields=8) as form:
+                image = form.get("image")
+                if not isinstance(image, UploadFile):
+                    return _json_error(400, "`image` must be a file", "invalid_body")
+                read = await _read_upload(image, MAX_IMAGE_BYTES)
+                if isinstance(read, JSONResponse):
+                    return read
+                content = read
+                payload = {key: form.get(key) for key in ("prompt", "model")}
+        else:
+            try:
+                decoded = await request.json()
+            except (ValueError, json.JSONDecodeError):
+                return _json_error(
+                    400, "request body was not valid JSON", "invalid_json"
+                )
+            if not isinstance(decoded, dict):
+                return _json_error(
+                    400, "request body must be a JSON object", "invalid_json"
+                )
+            payload = decoded
+            if payload.get("mode", "generation") != "generation":
+                return _json_error(
+                    415,
+                    "image edits must use multipart upload",
+                    "unsupported_media_type",
+                )
 
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -705,26 +753,6 @@ def create_app(config: WebConfig) -> FastAPI:
 
         model = payload.get("model")
         model = model if isinstance(model, str) and model else None
-
-        content: bytes | None = None
-        if mode == "edit":
-            encoded = payload.get("image")
-            if not isinstance(encoded, str) or not encoded:
-                return _json_error(
-                    400, "`image` must be a base64-encoded string", "invalid_body"
-                )
-            try:
-                content = base64.b64decode(encoded, validate=True)
-            except (ValueError, binascii.Error):
-                return _json_error(400, "`image` was not valid base64", "invalid_body")
-            if not content:
-                return _json_error(400, "the image was empty", "invalid_body")
-            if len(content) > MAX_IMAGE_BYTES:
-                return _json_error(
-                    413,
-                    f"that image is larger than {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
-                    "payload_too_large",
-                )
 
         engine = config.engine
         base_url = engine.base_url
@@ -736,7 +764,8 @@ def create_app(config: WebConfig) -> FastAPI:
                 "engine_unavailable",
             )
 
-        if mode == "edit":
+        if is_edit:
+            assert content is not None
             fields = {"prompt": prompt, "n": "1", "response_format": "b64_json"}
             if model:
                 fields["model"] = model
@@ -1402,41 +1431,21 @@ def create_app(config: WebConfig) -> FastAPI:
 
     @app.post("/api/audio/transcriptions")
     async def audio_transcriptions(request: Request):
-        """Transcribe an upload sent as base64 inside a JSON body.
-
-        JSON rather than a relayed multipart because the middleware's CSRF
-        control rejects the CORS-simple content types, and
-        ``multipart/form-data`` is one of them. Re-encoding here keeps one
-        policy instead of carving an exception for a single route.
-        """
-        try:
-            payload = await request.json()
-        except (ValueError, json.JSONDecodeError):
-            return _json_error(400, "request body was not valid JSON", "invalid_json")
-        if not isinstance(payload, dict):
+        """Transcribe a bounded multipart upload without Base64 expansion."""
+        if not auth.content_type_is_multipart(request.headers.get("content-type")):
             return _json_error(
-                400, "request body must be a JSON object", "invalid_json"
+                415, "audio must use multipart upload", "unsupported_media_type"
             )
-
-        encoded = payload.get("audio")
-        if not isinstance(encoded, str) or not encoded:
-            return _json_error(
-                400, "`audio` must be a base64-encoded string", "invalid_body"
-            )
-        try:
-            content = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error):
-            return _json_error(400, "`audio` was not valid base64", "invalid_body")
-        if not content:
-            return _json_error(400, "the recording was empty", "invalid_body")
-        # Checked before the relay so an oversize upload is refused here
-        # rather than after being pushed across another hop.
-        if len(content) > MAX_AUDIO_BYTES:
-            return _json_error(
-                413,
-                f"that recording is larger than {MAX_AUDIO_BYTES // (1024 * 1024)} MB",
-                "payload_too_large",
-            )
+        async with request.form(max_files=1, max_fields=8) as form:
+            audio = form.get("file")
+            if not isinstance(audio, UploadFile):
+                return _json_error(400, "`file` must be an audio file", "invalid_body")
+            read = await _read_upload(audio, MAX_AUDIO_BYTES)
+            if isinstance(read, JSONResponse):
+                return read
+            content = read
+            filename = _upload_filename(audio.filename)
+            metadata = {key: form.get(key) for key in ("model", "language", "context")}
 
         lease = lifecycle.acquire_activity()
         if lease is None:
@@ -1455,7 +1464,7 @@ def create_app(config: WebConfig) -> FastAPI:
 
         fields = {"response_format": "json"}
         for key in ("model", "language", "context"):
-            value = payload.get(key)
+            value = metadata.get(key)
             if isinstance(value, str) and value:
                 fields[key] = value
 
@@ -1470,7 +1479,7 @@ def create_app(config: WebConfig) -> FastAPI:
                     # decodes the CONTAINER, so a name cannot make an
                     # undecodable upload readable. The page transcodes to WAV
                     # before sending — libsndfile reads neither mp4 nor webm.
-                    filename=_upload_filename(payload.get("filename")),
+                    filename=filename,
                     content=content,
                     fields=fields,
                 )
@@ -1611,7 +1620,7 @@ def _apply_security_headers(response) -> None:
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "media-src 'self' blob:; "
         "frame-ancestors 'none'; "
         "base-uri 'none'",

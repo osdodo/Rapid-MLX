@@ -34,7 +34,12 @@ import {
   type Aspect,
   type Resolution,
 } from '@/images/size';
-import { ImageSourceError, readImageSource, type ImageSource } from '@/images/source';
+import {
+  ImageSourceError,
+  readImageSource,
+  sourceFromBase64,
+  type ImageSource,
+} from '@/images/source';
 
 /**
  * Text-to-image, and instruction editing of an image.
@@ -107,6 +112,13 @@ export function ImagesView({
   const submitted = useRef('');
   const controller = useRef<AbortController | null>(null);
   const filePicker = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const url = source?.url;
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [source]);
 
   const rendering = starting || jobId !== null;
 
@@ -187,12 +199,7 @@ export function ImagesView({
           // so this does not have to depend on `source` and restart the poll.
           setSource((previous) =>
             previous
-              ? {
-                  ...previous,
-                  data: rendered,
-                  mediaType: 'image/png',
-                  label: submitted.current,
-                }
+              ? sourceFromBase64(rendered, submitted.current)
               : previous,
           );
           finish();
@@ -257,7 +264,7 @@ export function ImagesView({
       // the image model was hot-loaded beside it.
       const job = await startImageJob({
         prompt: text,
-        ...(source ? { image: source.data } : { size: outputSize(aspect, resolution) }),
+        ...(source ? { image: source.blob } : { size: outputSize(aspect, resolution) }),
         ...(imageAlias ? { model: imageAlias } : {}),
         signal: abort.signal,
       });
@@ -289,7 +296,7 @@ export function ImagesView({
   /** Edit the image on the canvas — the common case, and no file dialog. */
   const editResult = useCallback(() => {
     if (image === null) return;
-    setSource({ data: image, mediaType: 'image/png', label: caption || 'Rendered image' });
+    setSource(sourceFromBase64(image, caption || 'Rendered image'));
     setPrompt('');
   }, [image, caption]);
 
@@ -316,9 +323,9 @@ export function ImagesView({
   // no render behind it yet, and the thing being edited is what the user must
   // be looking at while they describe the change.
   const canvas = source
-    ? { data: source.data, mediaType: source.mediaType, alt: source.label }
+    ? { url: source.url, alt: source.label }
     : image
-      ? { data: image, mediaType: 'image/png', alt: caption }
+      ? { url: `data:image/png;base64,${image}`, alt: caption }
       : null;
 
   return (
@@ -331,7 +338,7 @@ export function ImagesView({
         {canvas ? (
           <figure className="m-0 flex max-h-full flex-col items-center gap-3">
             <img
-              src={`data:${canvas.mediaType};base64,${canvas.data}`}
+              src={canvas.url}
               alt={canvas.alt}
               className="max-h-[52dvh] rounded-lg border object-contain shadow-sm"
             />
@@ -531,7 +538,7 @@ function EditSourceStrip({
   return (
     <div className="mb-2.5 flex items-center gap-2.5 border-b pb-2.5">
       <img
-        src={`data:${source.mediaType};base64,${source.data}`}
+        src={source.url}
         alt=""
         className="size-9 shrink-0 rounded-md border object-cover"
       />

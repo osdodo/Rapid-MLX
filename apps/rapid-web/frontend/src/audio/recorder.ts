@@ -14,6 +14,9 @@ import { toWav } from './wav';
 /** Matches the engine's own ceiling, so a take that cannot be sent is not made. */
 export const MAX_RECORDING_BYTES = 25 * 1024 * 1024;
 
+/** Keep enough headroom below the byte cap for timer throttling and WAV framing. */
+export const MAX_RECORDING_MS = 12 * 60 * 1000;
+
 /** A take under this is a mis-tap, not speech. */
 export const MIN_RECORDING_MS = 250;
 
@@ -65,12 +68,13 @@ export class Recorder {
   private stream: MediaStream | null = null;
   private chunks: Blob[] = [];
   private startedAt = 0;
+  private limitTimer: ReturnType<typeof setTimeout> | null = null;
 
   get recording(): boolean {
     return this.recorder !== null;
   }
 
-  async start(): Promise<void> {
+  async start(onLimit?: () => void): Promise<void> {
     if (this.recorder) return;
 
     if (typeof MediaRecorder === 'undefined' || !navigator.mediaDevices) {
@@ -102,6 +106,9 @@ export class Recorder {
     this.recorder = recorder;
     this.startedAt = Date.now();
     recorder.start();
+    if (onLimit) {
+      this.limitTimer = setTimeout(onLimit, MAX_RECORDING_MS);
+    }
   }
 
   /** Stop and resolve with the take, transcoded to WAV. Throws if it was too
@@ -111,6 +118,10 @@ export class Recorder {
     if (!recorder) throw new RecorderError('Nothing was being recorded.', 'empty');
 
     const durationMs = Date.now() - this.startedAt;
+    if (this.limitTimer !== null) {
+      clearTimeout(this.limitTimer);
+      this.limitTimer = null;
+    }
     const recorded = await new Promise<Blob>((resolve) => {
       recorder.onstop = () => resolve(new Blob(this.chunks, { type: recorder.mimeType }));
       recorder.stop();
@@ -119,6 +130,11 @@ export class Recorder {
 
     if (durationMs < MIN_RECORDING_MS || recorded.size === 0) {
       throw new RecorderError('That recording was too short.', 'empty');
+    }
+    // Check time before WebAudio expands the compressed take into a full
+    // decoded buffer. Background-tab timer throttling can delay auto-stop.
+    if (durationMs > MAX_RECORDING_MS + 1000) {
+      throw new RecorderError('Recordings are limited to 12 minutes.', 'tooLarge');
     }
 
     // Transcoded HERE, not sent as recorded: the engine decodes with
@@ -155,6 +171,10 @@ export class Recorder {
   }
 
   private release(): void {
+    if (this.limitTimer !== null) {
+      clearTimeout(this.limitTimer);
+      this.limitTimer = null;
+    }
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.recorder = null;

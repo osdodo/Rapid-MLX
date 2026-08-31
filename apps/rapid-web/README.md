@@ -147,8 +147,15 @@ Attaching a tunnel puts this on the public internet, so:
 - **The web token and the engine's token are different secrets.** The proxy
   strips the client's `Authorization` and substitutes the engine's, so the web
   token never reaches the engine or its logs.
-- **Cross-origin requests are refused** via `Origin` / `Sec-Fetch-Site`, and
-  bodies must be `application/json`.
+- **Cross-origin requests are refused** via `Origin` / `Sec-Fetch-Site`.
+  Mutations use `application/json`; image and audio uploads use Multipart plus
+  a required non-simple header, which forces a cross-origin browser to
+  preflight and be refused.
+- **Uploads are bounded before parsing.** Image and audio files are limited to
+  25 MiB, the whole Multipart request to 26 MiB, and an upload that stops
+  delivering bytes for 15 seconds is terminated. Dictation automatically
+  stops at 12 minutes before browser-side WAV transcoding can exhaust memory;
+  imported images are capped at 20 megapixels for the same reason.
 - **Browse destinations are IP-pinned after validation.** Every initial URL
   and redirect hop is resolved once, all answers must be public, and the
   socket connects only to those validated addresses while preserving the

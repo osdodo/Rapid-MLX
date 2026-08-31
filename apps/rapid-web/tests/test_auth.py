@@ -173,3 +173,8 @@ class TestContentTypeGate:
     )
     def test_simple_content_types_are_refused(self, content_type):
         assert not auth.content_type_is_json(content_type)
+
+    def test_multipart_requires_a_boundary(self):
+        assert auth.content_type_is_multipart("multipart/form-data; boundary=abc")
+        assert not auth.content_type_is_multipart("multipart/form-data")
+        assert not auth.content_type_is_multipart("application/json")

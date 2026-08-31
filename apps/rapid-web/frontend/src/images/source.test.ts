@@ -4,9 +4,8 @@ import { ImageSourceError, readImageSource } from './source';
 /**
  * The probe's URL scheme is the point of these specs.
  *
- * The page runs under `img-src 'self' data:`, so an object URL is refused and
- * the probe fires `error` — which surfaced as "that file isn't a readable
- * image" for every perfectly good file.
+ * Imported files stay binary and use a revocable object URL for measurement
+ * and preview, so no multi-megabyte Base64 copies are created.
  */
 
 /** Captures what the size probe was pointed at, and reports `dimensions`. */
@@ -34,20 +33,30 @@ function pngFile(name = 'photo.png'): File {
   });
 }
 
+function stubObjectUrls() {
+  const createObjectURL = vi.fn(() => 'blob:source-image');
+  const revokeObjectURL = vi.fn();
+  vi.stubGlobal('URL', { createObjectURL, revokeObjectURL });
+  return { createObjectURL, revokeObjectURL };
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe('readImageSource', () => {
-  it('measures from a data: URL, never a blob:', async () => {
+  it('measures and retains a revocable blob URL', async () => {
+    const urls = stubObjectUrls();
     const probe = stubImage({ width: 512, height: 512 });
     const source = await readImageSource(pngFile());
 
-    expect(probe.src).toMatch(/^data:image\/png;base64,/);
-    expect(probe.src).not.toMatch(/^blob:/);
-    // The same encoding the request carries, so measuring costs nothing extra.
-    expect(probe.src).toBe(`data:image/png;base64,${source.data}`);
+    expect(probe.src).toBe('blob:source-image');
+    expect(source.url).toBe('blob:source-image');
+    expect(source.blob).toBeInstanceOf(File);
+    expect(urls.createObjectURL).toHaveBeenCalledOnce();
+    expect(urls.revokeObjectURL).not.toHaveBeenCalled();
   });
 
   it('sniffs the format rather than trusting the file type', async () => {
+    stubObjectUrls();
     stubImage({ width: 8, height: 8 });
     const mislabelled = new File([new Uint8Array([0, 1, 2, 3])], 'x.png', {
       type: 'image/png',
@@ -56,12 +65,21 @@ describe('readImageSource', () => {
     await expect(readImageSource(mislabelled)).rejects.toBeInstanceOf(ImageSourceError);
   });
 
-  it("refuses an image past the engine's pixel ceiling", async () => {
+  it("refuses an image past the engine's edge ceiling", async () => {
+    const urls = stubObjectUrls();
     stubImage({ width: 9000, height: 9000 });
     await expect(readImageSource(pngFile())).rejects.toThrow(/8192 px/);
+    expect(urls.revokeObjectURL).toHaveBeenCalledWith('blob:source-image');
+  });
+
+  it('uses a phone-safe pixel cap below the engine ceiling', async () => {
+    stubObjectUrls();
+    stubImage({ width: 5000, height: 5000 });
+    await expect(readImageSource(pngFile())).rejects.toThrow(/20 megapixels/);
   });
 
   it('names the source by its filename, without the extension', async () => {
+    stubObjectUrls();
     stubImage({ width: 64, height: 64 });
     const source = await readImageSource(pngFile('beach sunset.png'));
 
