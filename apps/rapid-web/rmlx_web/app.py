@@ -10,7 +10,6 @@ engine's log tail.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import contextlib
@@ -26,6 +25,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from . import auth, connectors, proxy, tools
 from .catalog import CatalogError, ModelCatalog, RemovalError
@@ -36,6 +36,7 @@ from .downloads import (
     check_disk_budget,
 )
 from .images import ImageJobError, ImageJobManager, ImageJobState
+from .lifecycle import EngineLifecycle, TransitionStart
 from .supervisor import (
     AttachedEngine,
     ChildState,
@@ -87,41 +88,14 @@ class _HashedAssets(StaticFiles):
         return response
 
 
-class StreamTracker:
-    """Counts chat streams currently being relayed.
-
-    Model switching kills the engine process, so ``/api/models/load`` uses
-    this to refuse with a 409 rather than destroy an in-flight generation.
-    A plain integer suffices: one event loop, and asyncio yields only at
-    awaits.
-    """
-
-    def __init__(self) -> None:
-        self._active = 0
-
-    @property
-    def active(self) -> int:
-        return self._active
-
-    @contextlib.contextmanager
-    def track(self):
-        self._active += 1
-        try:
-            yield
-        finally:
-            # Must decrement even when the client vanishes mid-stream, or
-            # switching stays impossible for the rest of the session.
-            self._active -= 1
-
-
 @dataclass
 class WebConfig:
     """Everything the HTTP layer needs that is decided at startup."""
 
-    # ``None`` disables the bearer entirely, which is the default. Not a
-    # boolean beside a token: two fields could disagree, and that failure
-    # mode is "auth silently off".
-    token: str | None
+    # Required even on loopback: a user can attach a tunnel to a loopback
+    # listener, so the bind address cannot decide whether authentication is
+    # necessary.
+    token: str
     engine: EngineSupervisor | AttachedEngine
     # Loaded once the event loop is running: an asyncio subprocess is bound
     # to the loop that created it, so spawning under a throwaway
@@ -137,6 +111,10 @@ class WebConfig:
     # unlike downloads, there is no mode in which connectors cannot be
     # configured — the master switch is the off state.
     connectors: ConnectorStore = field(default_factory=ConnectorStore)
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError("a non-empty web access token is required")
 
 
 # Catalog kind -> the engine's own modality vocabulary. `audio` never
@@ -205,10 +183,10 @@ async def _switch(config: WebConfig, alias: str, entry=None) -> None:
 
 
 def create_app(config: WebConfig) -> FastAPI:
-    streams = StreamTracker()
+    lifecycle = EngineLifecycle()
     # Renders run detached from the request that started them, so they are
     # counted here for their whole life rather than by a route.
-    image_jobs = ImageJobManager(streams)
+    image_jobs = ImageJobManager(lifecycle)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -220,18 +198,16 @@ def create_app(config: WebConfig) -> FastAPI:
         # startup would leave the port unbound for all of it — the phone
         # would see "connection refused" instead of a page saying "loading".
         if config.initial_model and isinstance(config.engine, EngineSupervisor):
-            app.state.boot = asyncio.create_task(_boot(config))
-        else:
-            app.state.boot = None
+            lifecycle.start_transition(
+                kind="initial-load",
+                model=config.initial_model,
+                work=lambda: _boot(config),
+            )
 
         try:
             yield
         finally:
-            boot = app.state.boot
-            if boot is not None and not boot.done():
-                boot.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await boot
+            await lifecycle.shutdown()
             with contextlib.suppress(Exception):
                 await app.state.http.aclose()
             # A pull left running would keep writing to the cache with
@@ -252,13 +228,23 @@ def create_app(config: WebConfig) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.config = config
+    app.state.lifecycle = lifecycle
+
+    def _transition_unavailable() -> JSONResponse:
+        pending = lifecycle.pending
+        model = pending.model if pending is not None else "the requested model"
+        return _json_error(
+            503,
+            f"{model} is still loading; wait for it to finish",
+            "engine_unavailable",
+        )
 
     @app.middleware("http")
     async def _guard(request: Request, call_next):
         path = request.url.path
 
-        # ``/api/config`` is open because it is how the page learns whether
-        # a token is needed at all. It reveals only that one bit.
+        # ``/api/config`` is open so the page can learn that it must present
+        # the login gate before it has a token. It reveals only that one bit.
         if path == "/" or path == "/api/config" or path.startswith("/static"):
             response = await call_next(request)
             _apply_security_headers(response)
@@ -282,15 +268,9 @@ def create_app(config: WebConfig) -> FastAPI:
                 "unsupported_media_type",
             )
 
-        # There is usually no bearer: it is opt-in via --token. The Origin
-        # and content-type checks above are NOT tied to it, and without a
-        # token they are the only thing between this port and any web page
-        # the user happens to have open, since a browser can reach a
-        # loopback port even when the network cannot.
-        if config.token is not None:
-            presented = auth.extract_bearer(request.headers.get("authorization"))
-            if not auth.token_matches(config.token, presented):
-                return _json_error(401, "missing or invalid token", "unauthorized")
+        presented = auth.extract_bearer(request.headers.get("authorization"))
+        if not auth.token_matches(config.token, presented):
+            return _json_error(401, "missing or invalid token", "unauthorized")
 
         response = await call_next(request)
         _apply_security_headers(response)
@@ -316,12 +296,12 @@ def create_app(config: WebConfig) -> FastAPI:
 
     @app.get("/api/config")
     async def public_config() -> JSONResponse:
-        """Unauthenticated: does this server require a token?
+        """Unauthenticated boot contract: this server requires a token.
 
         The only unauthenticated JSON endpoint. The page needs the answer
         before it can decide whether to show a login prompt.
         """
-        return JSONResponse({"auth_required": config.token is not None})
+        return JSONResponse({"auth_required": True})
 
     @app.post("/api/auth")
     async def check_auth() -> JSONResponse:
@@ -345,10 +325,16 @@ def create_app(config: WebConfig) -> FastAPI:
         engine = config.engine
         snapshot = engine.status()
         body = snapshot.to_dict()
+        if lifecycle.pending is not None:
+            body.update(
+                state=ChildState.STARTING.value,
+                model=lifecycle.pending.model,
+                detail="model transition is pending",
+            )
         body["can_switch"] = engine.can_switch
         # The log tail is only useful when something went wrong, and it
         # can contain file paths; withhold it otherwise.
-        if snapshot.state is ChildState.FAILED:
+        if lifecycle.pending is None and snapshot.state is ChildState.FAILED:
             body["recent_output"] = snapshot.recent_output[-20:]
         return JSONResponse(body)
 
@@ -372,11 +358,16 @@ def create_app(config: WebConfig) -> FastAPI:
             return _json_error(503, str(exc), "catalog_error")
 
         snapshot = config.engine.status()
+        pending = lifecycle.pending
         return JSONResponse(
             {
                 "models": [entry.to_dict() for entry in entries],
-                "loaded": snapshot.model,
-                "state": snapshot.state.value,
+                "loaded": pending.model if pending is not None else snapshot.model,
+                "state": (
+                    ChildState.STARTING.value
+                    if pending is not None
+                    else snapshot.state.value
+                ),
                 "can_switch": config.engine.can_switch,
                 "allow_downloads": config.downloads is not None,
             }
@@ -422,15 +413,6 @@ def create_app(config: WebConfig) -> FastAPI:
                 "kind_not_loadable",
             )
 
-        # Switching restarts the engine, destroying any generation in
-        # progress — including one belonging to whoever is at the Mac.
-        if streams.active:
-            return _json_error(
-                409,
-                "a chat response is still streaming; try again once it finishes",
-                "busy_streaming",
-            )
-
         snapshot = engine.status()
         if snapshot.model == alias and snapshot.state is ChildState.READY:
             # Already there; a double-tap on a phone is easy and a restart
@@ -449,9 +431,28 @@ def create_app(config: WebConfig) -> FastAPI:
         if alias in snapshot.resident and snapshot.state is ChildState.READY:
             return JSONResponse({"ok": True, "model": alias, "state": "ready"})
 
-        # Detached, answering immediately: a load takes minutes, far past
-        # any phone browser's fetch timeout. The page polls /api/status.
-        app.state.boot = asyncio.create_task(_switch(config, alias, entry))
+        # Admission and pending-state publication happen synchronously before
+        # the response. No second request can enqueue another transition or
+        # start engine work in the detached task's scheduling window.
+        started = lifecycle.start_transition(
+            kind="model-load",
+            model=alias,
+            work=lambda: _switch(config, alias, entry),
+        )
+        if started is TransitionStart.BUSY_ACTIVITY:
+            return _json_error(
+                409,
+                "a response is still running; try again once it finishes",
+                "busy_streaming",
+            )
+        if started is TransitionStart.BUSY_TRANSITION:
+            pending = lifecycle.pending
+            return _json_error(
+                409,
+                f"{pending.model if pending else 'a model'} is still loading; "
+                "wait for it to finish",
+                "busy_loading",
+            )
         return JSONResponse({"ok": True, "model": alias, "state": "starting"})
 
     @app.post("/api/models/pull")
@@ -602,9 +603,14 @@ def create_app(config: WebConfig) -> FastAPI:
                 400, "request body must be a JSON object", "invalid_json"
             )
 
+        lease = lifecycle.acquire_activity()
+        if lease is None:
+            return _transition_unavailable()
+
         engine = config.engine
         base_url = engine.base_url
         if base_url is None:
+            lease.release()
             snapshot = engine.status()
             # 503 rather than 502: the engine is not broken, it is not
             # there yet. The page retries on 503 and gives up on 502.
@@ -618,7 +624,7 @@ def create_app(config: WebConfig) -> FastAPI:
             # Counted for the whole life of the relay, so a concurrent
             # /api/models/load refuses rather than killing the engine.
             async def tracked() -> AsyncIterator[bytes]:
-                with streams.track():
+                try:
                     async for chunk in proxy.proxy_streaming(
                         app.state.http,
                         base_url=base_url,
@@ -627,6 +633,8 @@ def create_app(config: WebConfig) -> FastAPI:
                         api_key=engine.api_key,
                     ):
                         yield chunk
+                finally:
+                    lease.release()
 
             return StreamingResponse(
                 tracked(),
@@ -637,9 +645,10 @@ def create_app(config: WebConfig) -> FastAPI:
                     # buffering that would deliver the stream all at once.
                     "X-Accel-Buffering": "no",
                 },
+                background=BackgroundTask(lease.release),
             )
 
-        with streams.track():
+        with lease:
             try:
                 upstream = await proxy.proxy_unary(
                     app.state.http,
@@ -1191,20 +1200,28 @@ def create_app(config: WebConfig) -> FastAPI:
             return _json_error(
                 409, "this server cannot restart the engine", "switching_disabled"
             )
-        if streams.active:
-            return _json_error(
-                409,
-                "a response is still streaming; stop it before restarting",
-                "engine_busy",
-            )
         snapshot = engine.status()
         alias = snapshot.model
         if alias is None:
             return _json_error(409, "no model is loaded", "no_model")
 
-        # Detached, like every other start: a respawn is minutes on a cold
-        # cache, and the page reads `/api/status` for progress either way.
-        asyncio.create_task(_boot_alias(config, alias))
+        started = lifecycle.start_transition(
+            kind="connector-restart",
+            model=alias,
+            work=lambda: _boot_alias(config, alias),
+        )
+        if started is TransitionStart.BUSY_ACTIVITY:
+            return _json_error(
+                409,
+                "a response is still running; stop it before restarting",
+                "engine_busy",
+            )
+        if started is TransitionStart.BUSY_TRANSITION:
+            return _json_error(
+                409,
+                "the engine is already changing models",
+                "busy_loading",
+            )
         return JSONResponse({"restarting": True, "model": alias})
 
     @app.post("/api/connectors/execute")
@@ -1341,9 +1358,14 @@ def create_app(config: WebConfig) -> FastAPI:
                 400, "request body must be a JSON object", "invalid_json"
             )
 
+        lease = lifecycle.acquire_activity()
+        if lease is None:
+            return _transition_unavailable()
+
         engine = config.engine
         base_url = engine.base_url
         if base_url is None:
+            lease.release()
             snapshot = engine.status()
             return _json_error(
                 503,
@@ -1351,7 +1373,7 @@ def create_app(config: WebConfig) -> FastAPI:
                 "engine_unavailable",
             )
 
-        with streams.track():
+        with lease:
             try:
                 upstream = await proxy.proxy_audio_json(
                     app.state.http,
@@ -1416,9 +1438,14 @@ def create_app(config: WebConfig) -> FastAPI:
                 "payload_too_large",
             )
 
+        lease = lifecycle.acquire_activity()
+        if lease is None:
+            return _transition_unavailable()
+
         engine = config.engine
         base_url = engine.base_url
         if base_url is None:
+            lease.release()
             snapshot = engine.status()
             return _json_error(
                 503,
@@ -1432,7 +1459,7 @@ def create_app(config: WebConfig) -> FastAPI:
             if isinstance(value, str) and value:
                 fields[key] = value
 
-        with streams.track():
+        with lease:
             try:
                 upstream = await proxy.proxy_multipart(
                     app.state.http,

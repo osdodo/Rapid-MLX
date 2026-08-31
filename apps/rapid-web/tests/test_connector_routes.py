@@ -7,6 +7,9 @@ and refuses, not what the engine answers.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +40,26 @@ def build(store, engine=None):
             )
         )
     )
+
+
+def test_unauthenticated_non_browser_cannot_mutate_connector_state(store):
+    """No Origin is normal for scripts, so the bearer is the security boundary."""
+    with build(store) as client:
+        add = client.post(
+            "/api/connectors/servers",
+            headers=JSON_CT,
+            json=stdio_payload(command="npx", args=["-y", "attacker-package"]),
+        )
+        enable = client.post(
+            "/api/connectors/settings",
+            headers=JSON_CT,
+            json={"enabled": True},
+        )
+
+    assert add.status_code == 401
+    assert enable.status_code == 401
+    assert store.servers == []
+    assert store.is_enabled is False
 
 
 def fake_engine_mcp(
@@ -341,6 +364,40 @@ class TestRestart:
 
         assert response.status_code == 409
         assert response.json()["error"]["type"] == "switching_disabled"
+
+    def test_double_request_is_single_flight_and_shutdown_cancels_it(self, store):
+        class BlockingEngine(FakeEngine):
+            def __init__(self):
+                super().__init__(model="qwen3.5-9b-4bit")
+                self.entered = threading.Event()
+                self.cancelled = threading.Event()
+
+            async def start(self, model, *, modality="text"):
+                self.started.append(model)
+                self.entered.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        engine = BlockingEngine()
+        with build(store, engine) as client:
+            first = client.post(
+                "/api/connectors/restart", headers={**AUTH, **JSON_CT}, json={}
+            )
+            assert engine.entered.wait(timeout=10)
+            duplicate = client.post(
+                "/api/connectors/restart", headers={**AUTH, **JSON_CT}, json={}
+            )
+            status = client.get("/api/status", headers=AUTH)
+
+            assert first.status_code == 200
+            assert duplicate.status_code == 200
+            assert engine.started == ["qwen3.5-9b-4bit"]
+            assert status.json()["state"] == "starting"
+
+        assert engine.cancelled.is_set()
 
 
 class TestExecute:

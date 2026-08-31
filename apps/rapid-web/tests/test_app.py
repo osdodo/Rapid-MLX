@@ -924,7 +924,6 @@ class TestImageJobs:
         engine = FakeEngine()
         app = create_app(WebConfig(token=TOKEN, engine=engine, catalog=FakeCatalog()))
         app.state.http = httpx.AsyncClient()
-        app.state.boot = None
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -1423,7 +1422,6 @@ class TestSwitchBlockedByActiveStream:
         # it before deciding anything, so it has to exist even though the
         # patched proxy never uses it.
         app.state.http = httpx.AsyncClient()
-        app.state.boot = None
         return httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         )
@@ -1531,6 +1529,72 @@ class TestSwitchBlockedByActiveStream:
                 json={"model": "bonsai-1.7b-2bit"},
             )
             assert response.status_code == 200
+
+
+class TestAtomicModelTransition:
+    @pytest.mark.asyncio
+    async def test_load_is_single_flight_and_blocks_new_chat(self, monkeypatch):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def blocked_switch(config, alias, entry):
+            calls.append(alias)
+            entered.set()
+            await release.wait()
+
+        async def forbidden_unary(*args, **kwargs):
+            pytest.fail("chat must not reach the old engine during a transition")
+
+        monkeypatch.setattr(app_module, "_switch", blocked_switch)
+        monkeypatch.setattr(app_module.proxy, "proxy_unary", forbidden_unary)
+
+        app = create_app(
+            WebConfig(token=TOKEN, engine=FakeEngine(), catalog=FakeCatalog())
+        )
+        app.state.http = httpx.AsyncClient()
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        )
+        try:
+            first = await client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "bonsai-1.7b-2bit"},
+            )
+            await asyncio.wait_for(entered.wait(), timeout=10)
+
+            duplicate = await client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "bonsai-1.7b-2bit"},
+            )
+            conflict = await client.post(
+                "/api/models/load",
+                headers={**AUTH, **JSON_CT},
+                json={"model": "qwen3.5-9b-4bit"},
+            )
+            status = await client.get("/api/status", headers=AUTH)
+            chat = await client.post(
+                "/v1/chat/completions",
+                headers={**AUTH, **JSON_CT},
+                json={"messages": [], "stream": False},
+            )
+
+            assert first.status_code == 200
+            assert duplicate.status_code == 200
+            assert duplicate.json()["state"] == "starting"
+            assert conflict.status_code == 409
+            assert conflict.json()["error"]["type"] == "busy_loading"
+            assert status.json()["state"] == "starting"
+            assert status.json()["model"] == "bonsai-1.7b-2bit"
+            assert chat.status_code == 503
+            assert calls == ["bonsai-1.7b-2bit"]
+        finally:
+            release.set()
+            await app.state.lifecycle.shutdown()
+            await client.aclose()
+            await app.state.http.aclose()
 
 
 class FakeDownloads:
@@ -1957,74 +2021,10 @@ class TestDownloadStatus:
         assert response.json()["error"]["type"] == "downloads_disabled"
 
 
-class TestNoAuthMode:
-    """``token=None`` disables the bearer, which is the default.
-
-    The thing worth pinning here is what does *not* get disabled with
-    it. Without a token, the Origin and content-type checks become the
-    only barrier between this port and any web page the user happens to
-    have open — a page can reach a loopback port through the browser
-    even though it cannot reach the network the port is on.
-    """
-
-    def test_api_is_reachable_without_a_token(self):
-        with build_client(token=None) as client:
-            response = client.get("/api/status")
-        assert response.status_code == 200
-
-    def test_a_stray_authorization_header_is_ignored(self):
-        # A phone with a token cached from an earlier authenticated run
-        # must not be locked out when the server is restarted without one.
-        with build_client(token=None) as client:
-            response = client.get(
-                "/api/status", headers={"Authorization": "Bearer leftover"}
-            )
-        assert response.status_code == 200
-
-    def test_cross_site_requests_are_still_refused(self):
-        with build_client(token=None) as client:
-            response = client.post(
-                "/api/models/load",
-                headers={
-                    **JSON_CT,
-                    "Origin": "https://evil.example",
-                    "Sec-Fetch-Site": "cross-site",
-                },
-                json={"model": "bonsai-1.7b-2bit"},
-            )
-        # The whole point: with no token this is the only control left.
-        assert response.status_code == 403
-        assert response.json()["error"]["type"] == "origin_refused"
-
-    def test_simple_content_types_are_still_refused(self):
-        with build_client(token=None) as client:
-            response = client.post(
-                "/api/models/load",
-                headers={"Content-Type": "text/plain"},
-                content='{"model": "bonsai-1.7b-2bit"}',
-            )
-        # text/plain is a CORS "simple" type: a cross-origin page can
-        # send it with no preflight.
-        assert response.status_code == 415
-
-    def test_downloads_are_still_gated(self, monkeypatch):
-        monkeypatch.setattr(app_module, "check_disk_budget", lambda size: None)
-        with build_client(token=None, downloads=None) as client:
-            response = client.post(
-                "/api/models/pull",
-                headers=JSON_CT,
-                json={"model": "bonsai-1.7b-2bit"},
-            )
-        assert response.status_code == 403
-
-    def test_unknown_aliases_are_still_refused(self):
-        with build_client(token=None) as client:
-            response = client.post(
-                "/api/models/load",
-                headers=JSON_CT,
-                json={"model": "attacker/arbitrary-repo"},
-            )
-        assert response.status_code == 404
+class TestMandatoryAuthMode:
+    def test_an_empty_token_cannot_disable_authentication(self):
+        with pytest.raises(ValueError, match="non-empty web access token"):
+            WebConfig(token=None, engine=FakeEngine())  # type: ignore[arg-type]
 
 
 class TestPublicConfig:
@@ -2034,11 +2034,6 @@ class TestPublicConfig:
         with build_client() as client:
             body = client.get("/api/config").json()
         assert body == {"auth_required": True}
-
-    def test_reports_no_auth_when_the_token_is_disabled(self):
-        with build_client(token=None) as client:
-            body = client.get("/api/config").json()
-        assert body == {"auth_required": False}
 
     def test_is_reachable_without_a_token(self):
         # The page needs this before it can decide whether to show a

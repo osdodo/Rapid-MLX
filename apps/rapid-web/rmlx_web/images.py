@@ -25,6 +25,8 @@ from uuid import uuid4
 
 import httpx
 
+from .lifecycle import ActivityLease, EngineLifecycle
+
 # What the job's work returns: the engine's status code and decoded body.
 ImageWork = Callable[[], Awaitable[tuple[int, dict]]]
 
@@ -71,8 +73,8 @@ class ImageJob:
 class ImageJobManager:
     """Runs at most one render at a time, detached from any request."""
 
-    def __init__(self, tracker) -> None:
-        self._tracker = tracker
+    def __init__(self, lifecycle: EngineLifecycle) -> None:
+        self._lifecycle = lifecycle
         self._job: ImageJob | None = None
         self._task: asyncio.Task | None = None
 
@@ -88,15 +90,18 @@ class ImageJobManager:
             raise ImageJobError(
                 "a render is already running; wait for it to finish or stop it"
             )
+        lease = self._lifecycle.acquire_activity()
+        if lease is None:
+            raise ImageJobError("the engine is changing models; wait for it to finish")
         job = ImageJob(id=uuid4().hex, model=model)
         self._job = job
-        self._task = asyncio.create_task(self._run(job, work))
+        self._task = asyncio.create_task(self._run(job, work, lease))
         return job
 
-    async def _run(self, job: ImageJob, work: ImageWork) -> None:
+    async def _run(self, job: ImageJob, work: ImageWork, lease: ActivityLease) -> None:
         # Counted for the JOB's life, not a request's: switching models
         # restarts the engine, which would destroy the render.
-        with self._tracker.track():
+        with lease:
             try:
                 status, body = await work()
             except httpx.HTTPError as exc:

@@ -75,8 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--token",
         metavar="TOKEN",
         help=(
-            "Require this access token. There is none by default — put your "
-            "tunnel's access control in front instead."
+            "Use this access token instead of the generated token stored at "
+            "~/.rapid-mlx/web-token."
         ),
     )
     parser.add_argument(
@@ -152,7 +152,7 @@ def _display_host(host: str) -> str:
         return "localhost"
 
 
-def _login_url(host: str, port: int, token: str | None) -> str:
+def _login_url(host: str, port: int, token: str) -> str:
     """URL that logs the browser in without retyping the token.
 
     The token goes in the **fragment**, never the query string: a
@@ -161,39 +161,25 @@ def _login_url(host: str, port: int, token: str | None) -> str:
     reads it, stores it, and strips it from the address bar.
     """
     base = f"http://{_display_host(host)}:{port}/"
-    if token is None:
-        return base
     return f"{base}#token={quote(token, safe='')}"
 
 
-def _print_banner(*, host: str, port: int, token: str | None, loopback: bool) -> None:
+def _print_banner(*, host: str, port: int, token: str, loopback: bool) -> None:
     url = f"http://{_display_host(host)}:{port}/"
     login_url = _login_url(host, port, token)
 
     print()
     print("  rmlx-web")
     print(f"  URL:   {url}")
-    if token is not None:
-        print(f"  Token: {token}")
-    else:
-        print("  Auth:  none")
+    print(f"  Token: {token}")
     print()
 
     # No QR code: a 25-row block pushed everything above it — including
     # the token — off a short terminal window. The link stays when there
     # is a token, since its fragment saves retyping 43 characters.
-    if token is not None:
-        print("  Open this link to sign in automatically:")
-        print(f"  {login_url}")
-        print()
-
-    if not loopback and token is None:
-        print(
-            "  WARNING: bound to a non-loopback address with no token. "
-            "Anyone on this network can reach this port."
-        )
-        print("  Pass --token to require one.")
-        print()
+    print("  Open this link to sign in automatically:")
+    print(f"  {login_url}")
+    print()
     # stdout is block-buffered when not a TTY, so under `rmlx-web > log &`
     # the token would not appear until the buffer filled.
     sys.stdout.flush()
@@ -245,24 +231,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # Opt-in, never forced. Every remote-access path here is a tunnel the
-    # user chose, and tunnels carry their own access control — a second
-    # secret in front of it only means retyping 43 characters on a phone.
-    needs_token = bool(args.token) or args.new_token
-
-    token: str | None = None
-    if needs_token:
-        try:
-            token = auth.load_or_create_token(
-                override=args.token,
-                rotate=args.new_token,
-            )
-        except OSError as exc:
-            print(
-                f"error: could not read or create the token file: {exc}",
-                file=sys.stderr,
-            )
-            return 1
+    # Always keep a first-party boundary. A tunnel may terminate on this
+    # loopback listener, so loopback is not evidence that callers are local.
+    try:
+        token = auth.load_or_create_token(
+            override=args.token,
+            rotate=args.new_token,
+        )
+    except OSError as exc:
+        print(
+            f"error: could not read or create the token file: {exc}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Constructed before the engine: the supervisor reads its
     # `launch_config_path` on every spawn.

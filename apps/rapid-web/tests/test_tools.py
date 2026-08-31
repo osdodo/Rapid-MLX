@@ -132,6 +132,121 @@ class TestSSRFGuard:
         with pytest.raises(tools.ToolError, match="no host"):
             await tools.validate_url("http:///path")
 
+    @pytest.mark.asyncio
+    async def test_rejects_when_any_dns_answer_is_private(self, monkeypatch):
+        async def mixed_answers(host):
+            return [
+                ipaddress.ip_address("93.184.216.34"),
+                ipaddress.ip_address("127.0.0.1"),
+            ]
+
+        monkeypatch.setattr(tools, "resolve_host", mixed_answers)
+        with pytest.raises(tools.ToolError, match="private/loopback"):
+            await tools.validate_url("https://mixed.example/")
+
+    @pytest.mark.asyncio
+    async def test_fetch_pins_ip_but_preserves_host_and_tls_name(self, monkeypatch):
+        captured = {}
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "text/plain"}
+
+            async def aiter_bytes(self):
+                yield b"pinned"
+
+        class Stream:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *args):
+                return None
+
+        def fake_stream(self, method, url, **kwargs):
+            captured.update(
+                method=method,
+                url=str(url),
+                headers=kwargs["headers"],
+                extensions=kwargs["extensions"],
+                trust_env=self._trust_env,
+            )
+            return Stream()
+
+        monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+        body, content_type = await tools._fetch_from_address(
+            "https://rebind.example:8443/path?q=1",
+            ipaddress.ip_address("93.184.216.34"),
+        )
+
+        assert body == b"pinned"
+        assert content_type == "text/plain"
+        assert captured["url"] == "https://93.184.216.34:8443/path?q=1"
+        assert captured["headers"]["Host"] == "rebind.example:8443"
+        assert captured["extensions"] == {"sni_hostname": "rebind.example"}
+        assert captured["trust_env"] is False
+
+    @pytest.mark.asyncio
+    async def test_public_first_private_second_rebinding_never_reresolves(
+        self, monkeypatch
+    ):
+        resolutions = 0
+        connected = []
+
+        async def rebinding_answers(host):
+            nonlocal resolutions
+            resolutions += 1
+            if resolutions == 1:
+                return [ipaddress.ip_address("93.184.216.34")]
+            return [ipaddress.ip_address("127.0.0.1")]
+
+        async def fake_fetch(url, address):
+            connected.append(address)
+            return b"safe", "text/plain"
+
+        monkeypatch.setattr(tools, "resolve_host", rebinding_answers)
+        monkeypatch.setattr(tools, "_fetch_from_address", fake_fetch)
+
+        async with httpx.AsyncClient() as client:
+            result = await tools.run_browse(
+                client,
+                {"url": "https://rebind.example/page"},
+                {"https://rebind.example:443"},
+            )
+
+        assert not result.is_error
+        assert resolutions == 1
+        assert connected == [ipaddress.ip_address("93.184.216.34")]
+
+    @pytest.mark.asyncio
+    async def test_redirect_hop_is_resolved_and_checked_again(self, monkeypatch):
+        resolutions = 0
+        connected = []
+
+        async def rebinding_answers(host):
+            nonlocal resolutions
+            resolutions += 1
+            if resolutions == 1:
+                return [ipaddress.ip_address("93.184.216.34")]
+            return [ipaddress.ip_address("127.0.0.1")]
+
+        async def redirecting_fetch(url, address):
+            connected.append(address)
+            return b"", "/second-hop"
+
+        monkeypatch.setattr(tools, "resolve_host", rebinding_answers)
+        monkeypatch.setattr(tools, "_fetch_from_address", redirecting_fetch)
+
+        with pytest.raises(tools.ToolError, match="private/loopback"):
+            async with httpx.AsyncClient() as client:
+                await tools.run_browse(
+                    client,
+                    {"url": "https://redirect.example/first-hop"},
+                    {"https://redirect.example:443"},
+                )
+
+        assert resolutions == 2
+        assert connected == [ipaddress.ip_address("93.184.216.34")]
+
 
 class TestOrigin:
     def test_makes_the_default_port_explicit(self):

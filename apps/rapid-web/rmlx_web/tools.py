@@ -5,6 +5,11 @@ The page owns the tool loop — it is the thing streaming the answer — but the
 tools themselves run on the Mac, because a browser cannot fetch an arbitrary
 origin: every provider here would need CORS headers it does not send.
 
+The browse transport resolves and validates every destination, then connects
+only to the selected IP while preserving the original Host and TLS identity.
+That coupling is the SSRF boundary; validation without transport pinning would
+leave a DNS-rebinding time-of-check/time-of-use gap.
+
 Two enforcement points, not one. The page filters disabled tools out of the
 request body, and :func:`run_tool` refuses anything not in the list it was
 told was advertised. Omitting a tool from the body does not stop a malformed
@@ -21,7 +26,7 @@ import re
 import socket
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlparse, urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -667,16 +672,22 @@ async def resolve_host(
         raise ToolError(f"could not resolve host '{host}'") from None
 
     out = []
+    seen = set()
     for info in infos:
         try:
-            out.append(ipaddress.ip_address(info[4][0]))
+            address = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
+        if address not in seen:
+            seen.add(address)
+            out.append(address)
     return out
 
 
-async def validate_url(url: str) -> None:
-    """Reject before a socket opens. Raises :class:`ToolError`."""
+async def validate_url(
+    url: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Reject before a socket opens and return the only allowed destinations."""
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
@@ -692,7 +703,7 @@ async def validate_url(url: str) -> None:
                 f"host '{host}' is a private/loopback address ({literal}) and "
                 "cannot be browsed"
             )
-        return
+        return [literal]
 
     addresses = await resolve_host(host)
     if not addresses:
@@ -703,6 +714,7 @@ async def validate_url(url: str) -> None:
                 f"host '{host}' resolves to a private/loopback address "
                 f"({address}) and cannot be browsed"
             )
+    return addresses
 
 
 def origin_of(url: str) -> str:
@@ -736,20 +748,66 @@ def html_to_text(page: str) -> tuple[str | None, str]:
     return title, _BLANK_LINES.sub("\n\n", "\n".join(lines)).strip()
 
 
-async def _fetch_capped(client: httpx.AsyncClient, url: str) -> tuple[bytes, str]:
-    """One hop, aborting past the byte cap rather than buffering the whole body."""
-    async with client.stream(
-        "GET",
-        url,
-        headers={
-            "User-Agent": _BROWSE_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
-        },
-        timeout=BROWSE_TIMEOUT,
-        # Followed by hand so every hop is SSRF-checked before it connects.
-        follow_redirects=False,
-    ) as response:
-        if response.status_code >= 300 and response.status_code < 400:
+def _authority_for(url: str) -> str:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    host = host.encode("idna").decode("ascii")
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ToolError("URL has an invalid port") from exc
+    return f"{host}:{port}" if port is not None else host
+
+
+def _pinned_url(
+    url: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address
+) -> str:
+    parsed = urlsplit(url)
+    host = (
+        f"[{address}]" if isinstance(address, ipaddress.IPv6Address) else str(address)
+    )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ToolError("URL has an invalid port") from exc
+    authority = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, authority, parsed.path or "/", parsed.query, ""))
+
+
+async def _fetch_from_address(
+    url: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address
+) -> tuple[bytes, str]:
+    """Fetch one hop without resolving the original hostname again."""
+    parsed = urlsplit(url)
+    original_host = parsed.hostname or ""
+    extensions = (
+        {"sni_hostname": original_host.encode("idna").decode("ascii")}
+        if parsed.scheme.lower() == "https"
+        else None
+    )
+    # A fresh client prevents a connection pooled by pinned IP from being
+    # reused for a different Host/SNI. trust_env=False also prevents a proxy
+    # from resolving and connecting to the original hostname outside this gate.
+    async with (
+        httpx.AsyncClient(trust_env=False, follow_redirects=False) as pinned,
+        pinned.stream(
+            "GET",
+            _pinned_url(url, address),
+            headers={
+                "Host": _authority_for(url),
+                "User-Agent": _BROWSE_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+                "Accept-Encoding": "identity",
+            },
+            timeout=BROWSE_TIMEOUT,
+            extensions=extensions,
+            # Followed by hand so every hop is SSRF-checked before it connects.
+            follow_redirects=False,
+        ) as response,
+    ):
+        if 300 <= response.status_code < 400:
             return b"", response.headers.get("location", "")
         if response.status_code >= 400:
             raise ToolError(
@@ -763,6 +821,30 @@ async def _fetch_capped(client: httpx.AsyncClient, url: str) -> tuple[bytes, str
                     f"page exceeded {BROWSE_MAX_BYTES // (1024 * 1024)} MB cap"
                 )
         return bytes(chunks), response.headers.get("content-type", "")
+
+
+async def _fetch_capped(
+    url: str,
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+) -> tuple[bytes, str]:
+    """Try only validated addresses, bounded by one deadline for the hop."""
+    last_error: httpx.TransportError | None = None
+
+    async def attempt_all() -> tuple[bytes, str]:
+        nonlocal last_error
+        for address in addresses:
+            try:
+                return await _fetch_from_address(url, address)
+            except httpx.TransportError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise ToolError("no validated destination address")
+
+    try:
+        return await asyncio.wait_for(attempt_all(), timeout=BROWSE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise ToolError(f"request to {urlparse(url).hostname} timed out") from None
 
 
 async def run_browse(
@@ -783,8 +865,8 @@ async def run_browse(
     content_type = ""
     raw = b""
     for _ in range(BROWSE_MAX_REDIRECTS + 1):
-        await validate_url(current)
-        raw, header = await _fetch_capped(client, current)
+        addresses = await validate_url(current)
+        raw, header = await _fetch_capped(current, addresses)
         if raw:
             content_type = header
             break

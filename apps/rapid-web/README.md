@@ -51,23 +51,18 @@ It prints a URL:
 ```
   rmlx-web
   URL:   http://127.0.0.1:7788/
-  Auth:  none
+  Token: <generated access token>
 ```
 
 The alias is optional — without it the page starts with no model and you pick
 one there. The page is reachable immediately; a cold start can take several
 minutes and the header says when the model is ready.
 
-There is **no access token by default**. Remote access here always goes
-through a tunnel you chose, and that tunnel is where authentication belongs —
-Cloudflare Access, a tailnet ACL, HTTP basic auth in front. A second secret
-would only mean retyping 43 characters on a phone.
-
-`--token` requires one anyway, which is worth doing when screen-sharing or on
-an open LAN. `--new-token` generates and stores one at `~/.rapid-mlx/web-token`.
-The token travels in the URL fragment of the printed sign-in link, which
-browsers never send to a server, so it cannot land in an access log or a
-tunnel provider's history.
+An access token is generated and stored at `~/.rapid-mlx/web-token` on the
+first launch, then reused. `--token` supplies an explicit token and
+`--new-token` rotates the stored one. The token travels in the URL fragment of
+the printed sign-in link, which browsers never send to a server, so it cannot
+land in an access log or a tunnel provider's history.
 
 ### The page
 
@@ -102,12 +97,12 @@ cloudflared tunnel --url http://127.0.0.1:7788
 tailscale funnel 7788
 ```
 
-Put the tunnel's own access control in front of it — Cloudflare Access, a
-tailnet ACL — rather than exposing the URL and relying on nobody guessing it.
+Keep the tunnel's own access control in front of it — Cloudflare Access or a
+tailnet ACL — as defence in depth around the built-in token.
 
 `--host 0.0.0.0` works for LAN-only access, but on a cafe, hotel or office
-guest network the LAN is effectively public and nothing stands in front of the
-port; pass `--token` there.
+guest network the LAN is effectively public. The token remains required, but a
+tunnel or firewall boundary is still preferable to a bare network port.
 
 ## Options
 
@@ -117,8 +112,8 @@ port; pass `--token` there.
 | `--port` | Default `7788`. |
 | `--attach URL` | Use a `rapid-mlx serve` you started yourself instead of spawning one. |
 | `--attach-api-key` | Bearer for the `--attach` target, if it has one. |
-| `--token` | Require this access token. There is none by default. |
-| `--new-token` | Require a token, generating and storing one. Phones must re-enter it. |
+| `--token` | Use this access token instead of the stored generated token. |
+| `--new-token` | Rotate the stored token. Phones must re-enter it. |
 | `--allow-downloads` | Permit downloads when bound to a non-loopback address. |
 | `--rapid-mlx-bin` | Path to `rapid-mlx`, if it is not on `PATH`. |
 | `--serve-arg` | Extra argument passed through to `rapid-mlx serve`. Repeat per token. |
@@ -145,18 +140,20 @@ for its engine on every launch and no other process can obtain it.
 
 Attaching a tunnel puts this on the public internet, so:
 
-- **Authentication is the tunnel's job, not this tool's.** There is no token
-  unless `--token` asks for one; when it does, it is stored at
-  `~/.rapid-mlx/web-token`, mode 0600, and persistent so the phone is not
-  logged out on every restart. Everything below applies either way — those
-  checks are what stop a page you have open from driving this port through
-  your browser, which it can do because a browser reaches loopback even when
-  the network cannot.
+- **Authentication is required by the server.** The generated token is stored
+  at `~/.rapid-mlx/web-token`, mode 0600, and persists so the phone is not
+  logged out on every restart. Tunnel access control remains useful defence in
+  depth; it is not the server's only trust boundary.
 - **The web token and the engine's token are different secrets.** The proxy
   strips the client's `Authorization` and substitutes the engine's, so the web
   token never reaches the engine or its logs.
 - **Cross-origin requests are refused** via `Origin` / `Sec-Fetch-Site`, and
   bodies must be `application/json`.
+- **Browse destinations are IP-pinned after validation.** Every initial URL
+  and redirect hop is resolved once, all answers must be public, and the
+  socket connects only to those validated addresses while preserving the
+  original HTTP Host and TLS identity. Environment proxies are disabled for
+  this path so they cannot perform a second, unchecked resolution.
 - **Model names are validated against the catalog** before reaching a
   subprocess argument. An arbitrary `org/repo` would otherwise turn the picker
   into a remote fetch — or, for deletion, a remote delete. Removal passes the
@@ -182,8 +179,9 @@ Attaching a tunnel puts this on the public internet, so:
   connectors configured from Settings. They run on the Mac, not in the
   browser, because a page cannot fetch a cross-origin provider. `browse` asks
   before each new host: the model chooses the URL, so approving it is what
-  stops a page fetch becoming a way to post the conversation elsewhere. At
-  most 3 calls answer one message.
+  stops a page fetch becoming a way to post the conversation elsewhere. Its
+  server-side IP checks also block private, loopback and link-local targets.
+  At most 3 calls answer one message.
 - Downloads are one at a time, with progress polled once a second, so
   reloading mid-download reconnects to the running pull.
 - `--attach` mode cannot list or switch models: listing needs the CLI and

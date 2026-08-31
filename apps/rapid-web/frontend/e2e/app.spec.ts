@@ -44,8 +44,7 @@ async function seedStorage(page: Page, entries: Record<string, string>) {
 
 test.describe('boot and auth', () => {
   test('skips the gate entirely when the server needs no token', async ({ page, stub }) => {
-    // A loopback bind requires no token: the OS already guarantees the caller
-    // is a process on this Mac.
+    // Compatibility with older servers that advertised auth_required=false.
     await page.goto(stub.baseURL);
 
     await expect(page.getByLabel('Message')).toBeVisible();

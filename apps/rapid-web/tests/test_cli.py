@@ -65,18 +65,12 @@ class TestBanner:
         # Whatever else changes, the banner stays short enough to read.
         assert len(out.splitlines()) < 15
 
-    def test_warns_on_an_unprotected_non_loopback_bind(self, capsys, monkeypatch):
-        monkeypatch.setattr(cli, "_display_host", lambda host: "192.168.1.5")
-        cli._print_banner(host="0.0.0.0", port=7788, token=None, loopback=False)
-        out = capsys.readouterr().out
-
-        assert "WARNING" in out
-        assert "--token" in out
-
-    def test_no_warning_when_a_token_protects_the_bind(self, capsys, monkeypatch):
+    def test_a_non_loopback_bind_is_still_token_protected(self, capsys, monkeypatch):
         monkeypatch.setattr(cli, "_display_host", lambda host: "192.168.1.5")
         cli._print_banner(host="0.0.0.0", port=7788, token="tok", loopback=False)
-        assert "WARNING" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Token: tok" in out
+        assert "WARNING" not in out
 
     def test_no_warning_on_loopback(self, capsys, monkeypatch):
         cli._print_banner(host="127.0.0.1", port=7788, token="tok", loopback=True)
@@ -112,62 +106,47 @@ class TestDisplayHost:
 
 
 class TestTokenDecision:
-    """When a bearer is created at all.
+    def test_main_loads_a_token_without_an_auth_flag(self, monkeypatch):
+        captured = {}
 
-    The rule: only when asked for. Remote access always goes through a
-    tunnel the user chose, and that tunnel is where access control
-    belongs — a second secret only means retyping it on a phone.
-    """
+        def load_or_create_token(*, override, rotate):
+            captured.update(override=override, rotate=rotate)
+            return "generated-token"
 
-    @staticmethod
-    def _needs_token(*, loopback, token=None, new_token=False):
-        # Mirrors the expression in main(); kept in one place so the test
-        # asserts the rule rather than re-deriving it.
-        return bool(token) or new_token
+        monkeypatch.setattr(cli.auth, "load_or_create_token", load_or_create_token)
+        monkeypatch.setattr(cli, "ConnectorStore", lambda: object())
+        monkeypatch.setattr(
+            cli,
+            "_resolve_engine",
+            lambda *args, **kwargs: (object(), None, None),
+        )
+        monkeypatch.setattr(cli, "create_app", lambda config: config)
+        monkeypatch.setattr(cli, "_print_banner", lambda **kwargs: None)
+        monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
 
-    def test_loopback_needs_no_token(self):
-        assert self._needs_token(loopback=True) is False
+        assert cli.main([]) == 0
+        assert captured == {"override": None, "rotate": False}
 
-    def test_a_non_loopback_bind_does_not_force_one(self):
-        # --host 0.0.0.0 warns instead: the tunnel or the LAN's own
-        # access control is the gate, not a token this tool invents.
-        assert self._needs_token(loopback=False) is False
+    def test_explicit_and_rotated_tokens_reach_the_store(self, monkeypatch):
+        captured = {}
 
-    def test_an_explicit_token_opts_in(self):
-        assert self._needs_token(loopback=True, token="chosen") is True
+        def load_or_create_token(*, override, rotate):
+            captured.update(override=override, rotate=rotate)
+            return override or "rotated-token"
 
-    def test_rotating_opts_in(self):
-        assert self._needs_token(loopback=True, new_token=True) is True
+        monkeypatch.setattr(cli.auth, "load_or_create_token", load_or_create_token)
+        monkeypatch.setattr(cli, "ConnectorStore", lambda: object())
+        monkeypatch.setattr(
+            cli,
+            "_resolve_engine",
+            lambda *args, **kwargs: (object(), None, None),
+        )
+        monkeypatch.setattr(cli, "create_app", lambda config: config)
+        monkeypatch.setattr(cli, "_print_banner", lambda **kwargs: None)
+        monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
 
-    def test_the_rule_matches_the_cli_source(self):
-        # Guards against the expression in main() drifting away from the
-        # rule asserted above.
-        import inspect
-
-        source = inspect.getsource(cli.main)
-        assert "needs_token = bool(args.token) or args.new_token" in source
-
-
-class TestBannerWithoutToken:
-    def test_says_auth_is_off_rather_than_printing_a_token(self, capsys, monkeypatch):
-        cli._print_banner(host="127.0.0.1", port=7788, token=None, loopback=True)
-        out = capsys.readouterr().out
-
-        assert "Auth:  none" in out
-        assert "Token:" not in out
-
-    def test_the_login_url_has_no_fragment_without_a_token(self):
-        assert cli._login_url("127.0.0.1", 7788, None) == "http://127.0.0.1:7788/"
-        assert "#" not in cli._login_url("127.0.0.1", 7788, None)
-
-    def test_does_not_repeat_the_url_without_a_token(self, capsys):
-        # With no token the sign-in link is just the URL already printed
-        # above it, so repeating it says nothing.
-        cli._print_banner(host="127.0.0.1", port=7788, token=None, loopback=True)
-        out = capsys.readouterr().out
-
-        assert out.count("http://127.0.0.1:7788/") == 1
-        assert "Scan" not in out
+        assert cli.main(["--token", "chosen", "--new-token"]) == 0
+        assert captured == {"override": "chosen", "rotate": True}
 
 
 class TestOptionalModelArgument:
