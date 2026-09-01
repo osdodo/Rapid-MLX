@@ -110,14 +110,32 @@ export function gateConnectorCall(
  * through this before it is shown.
  */
 export function displaySafe(text: string): string {
+  return escapeUnsafeCharacters(text, new Set());
+}
+
+/**
+ * Make a connector result safe without flattening its layout.
+ *
+ * Results are shown in a preformatted tool detail and then passed back to the
+ * model. Newlines and tabs are meaningful there: the filesystem server, for
+ * example, returns one directory entry per line. Approval metadata still goes
+ * through `displaySafe`, where every control character is escaped because a
+ * forged line break could disguise what the user is approving.
+ */
+export function displaySafeResult(text: string): string {
+  return escapeUnsafeCharacters(text.replaceAll('\r\n', '\n'), new Set([0x09, 0x0a]));
+}
+
+function escapeUnsafeCharacters(text: string, allowedControls: ReadonlySet<number>): string {
   return [...text]
     .map((character) => {
       const code = character.codePointAt(0) ?? 0;
       const printable =
-        code >= 0x20 &&
-        code !== 0x7f &&
-        !(code >= 0x200b && code <= 0x206f) &&
-        code !== 0xfeff;
+        allowedControls.has(code) ||
+        (code >= 0x20 &&
+          code !== 0x7f &&
+          !(code >= 0x200b && code <= 0x206f) &&
+          code !== 0xfeff);
       return printable ? character : `\\u{${code.toString(16).toUpperCase()}}`;
     })
     .join('');

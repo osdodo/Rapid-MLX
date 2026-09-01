@@ -167,6 +167,7 @@ export const TOOL_GUIDANCE = [
   'You have just received results from a tool call.',
   'Answer from those results. Do not claim you lack access to real-time or external data — you have it.',
   'Quote concrete figures, dates and names from the results rather than paraphrasing vaguely.',
+  'Present lists and records as readable Markdown lists or tables, and state a requested total before a long listing.',
   'If the results do not answer the question, say exactly what is missing.',
   'Never invent a result the tool did not return.',
 ].join(' ');

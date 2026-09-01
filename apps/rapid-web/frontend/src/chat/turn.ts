@@ -7,6 +7,7 @@ import { activePath, branchAnchor, siblings } from './MessageTree';
 import {
   advertisedConnectorTools,
   displaySafe as displaySafeText,
+  displaySafeResult,
   formatArguments,
   gateConnectorCall,
   isConnectorTool,
@@ -335,7 +336,7 @@ async function runConnectorCall(
       arguments: call.function.arguments,
       signal: options.signal,
     });
-    return { content: displaySafeText(result.content), failed: result.is_error };
+    return { content: displaySafeResult(result.content), failed: result.is_error };
   } catch (cause) {
     const error = asApiError(cause);
     return { content: `${name} error: ${error.message}`, failed: true };

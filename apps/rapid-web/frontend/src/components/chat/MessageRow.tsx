@@ -13,6 +13,7 @@ import { Markdown } from '@/components/chat/Markdown';
 import { parseMarkdown, tokensOf } from '@/markdown/lex';
 import { streamingStore } from '@/chat/StreamingStore';
 import { withoutToolCallEcho } from '@/chat/toolEcho';
+import { normalizeDirectoryListing } from '@/chat/toolPresentation';
 import { CopyButton } from '@/components/common/CopyButton';
 import { cn } from '@/lib/utils';
 import { formatDuration, formatTokensPerSecond } from '@/lib/format';
@@ -172,7 +173,7 @@ function AssistantRow({
         // space to push into.
         <MessageActions className="w-full">
           <BranchSwitcher branch={branch} onBranch={onBranch} noun="response" busy={busy} />
-          <CopyButton text={node.content} />
+          <CopyButton text={normalizeDirectoryListing(node.content)} />
           <ActionButton label="Retry" icon={<RotateCw />} onClick={onRetry} disabled={busy} />
           <ActionButton label="Delete" icon={<Trash2 />} onClick={onDelete} disabled={busy} />
           {node.stats ? <Stats stats={node.stats} className="ml-auto pl-3" /> : null}
@@ -303,7 +304,7 @@ function SettledBody({
 }) {
   // Rendered, not stored: the transcript keeps what the model actually said,
   // so the echo can stop being hidden without the history having been edited.
-  const content = withoutToolCallEcho(node.content, node.toolCalls);
+  const content = normalizeDirectoryListing(withoutToolCallEcho(node.content, node.toolCalls));
   const tokens = useMemoTokens(content);
 
   return (

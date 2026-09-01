@@ -211,7 +211,7 @@ test('a connector tool is offered to the model and runs once approved', async ({
       ]),
       [`data: ${JSON.stringify({ choices: [{ delta: { content: 'The file says hi.' } }] })}\n\n`],
     ],
-    connectorResults: { filesystem__read_file: { content: 'hi' } },
+    connectorResults: { filesystem__read_file: { content: '[FILE] a.txt\n[DIR] notes' } },
   });
   try {
     await page.goto(stub.baseURL);
@@ -232,6 +232,12 @@ test('a connector tool is offered to the model and runs once approved', async ({
 
     expect(stub.scenario.connectorCalls).toHaveLength(1);
     expect(stub.scenario.connectorCalls[0]?.name).toBe('filesystem__read_file');
+    const followUp = stub.scenario.chatRequests[1] as {
+      messages?: Array<{ role?: string; content?: string }>;
+    };
+    expect(followUp.messages?.find((message) => message.role === 'tool')?.content).toBe(
+      '[FILE] a.txt\n[DIR] notes',
+    );
     // Allowing once must NOT persist: the next turn asks again.
     expect(stub.scenario.connectors.granted_tools).toEqual([]);
 

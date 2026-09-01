@@ -4,6 +4,7 @@ import type { ToolCall } from '@/api/chat';
 import {
   advertisedConnectorTools,
   displaySafe,
+  displaySafeResult,
   formatArguments,
   gateConnectorCall,
   isConnectorTool,
@@ -192,6 +193,24 @@ describe('displaySafe', () => {
   it('keeps non-Latin text readable', () => {
     // Escaping by codepoint range must not mangle a legitimate description.
     expect(displaySafe('读取文件')).toBe('读取文件');
+  });
+});
+
+describe('displaySafeResult', () => {
+  it('preserves the line and column layout of tool output', () => {
+    expect(displaySafeResult('[FILE] a.txt\n[DIR]\tfolder')).toBe(
+      '[FILE] a.txt\n[DIR]\tfolder',
+    );
+  });
+
+  it('normalizes CRLF without exposing a carriage return', () => {
+    expect(displaySafeResult('one\r\ntwo')).toBe('one\ntwo');
+  });
+
+  it('still escapes characters that can spoof displayed output', () => {
+    expect(displaySafeResult('safe\nread\u202Eelif\u0000')).toBe(
+      'safe\nread\\u{202E}elif\\u{0}',
+    );
   });
 });
 
