@@ -86,6 +86,11 @@ class RmlxWeb < Formula
     sha256 "62f875393d7f270851f20523dd2e29f082bcc82292d66db2b64ea71f64b6e1c1"
   end
 
+  resource "python-multipart" do
+    url "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz"
+    sha256 "be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e"
+  end
+
   resource "starlette" do
     url "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz"
     sha256 "d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b"
@@ -122,6 +127,10 @@ class RmlxWeb < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/rmlx-web --version")
+
+    # Starlette imports multipart support only when an upload is parsed, so
+    # serving the HTML shell below would not catch a missing resource.
+    system libexec/"bin/python", "-c", "import python_multipart"
 
     # The engine must be reachable as a command: rmlx_web resolves it with
     # shutil.which at startup, so a broken dependency surfaces here rather
