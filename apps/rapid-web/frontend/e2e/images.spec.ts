@@ -27,6 +27,10 @@ test('a chat model loaded means the surface explains what to do', async ({ page 
     // the user has to know before they go and do it.
     await expect(page.getByText(/Choose an image model/)).toBeVisible();
     await expect(page.getByText(/one model at a time/)).toBeVisible();
+    await expect(page.getByLabel('Prompt')).toHaveAttribute(
+      'placeholder',
+      'Choose an image model first',
+    );
     await expect(page.getByRole('button', { name: 'Generate' })).toBeDisabled();
   } finally {
     await stub.close();

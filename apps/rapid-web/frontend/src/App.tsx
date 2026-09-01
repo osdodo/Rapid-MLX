@@ -357,6 +357,11 @@ function Chat() {
           <ImagesView
             onChooseModel={() => setSettingsPage('models')}
             onSelectModel={chooseModel}
+            blockedPlaceholder={
+              readiness.kind === 'noModel' && readiness.canSwitch
+                ? 'Choose an image model first'
+                : composerPlaceholder(readiness)
+            }
             // The same lifecycle surface the chat uses, so a model that is
             // downloading, starting or failed reports itself identically on
             // both. Built here rather than inside ImagesView so there is one

@@ -82,10 +82,13 @@ const SUGGESTIONS = [
 export function ImagesView({
   onChooseModel,
   onSelectModel,
+  blockedPlaceholder,
   band,
 }: {
   onChooseModel(): void;
   onSelectModel(alias: string): void;
+  /** The current image model's lifecycle step, shared with the status band. */
+  blockedPlaceholder: string;
   /** The shared readiness surface — downloading, starting, failed. */
   band?: ReactNode;
 }) {
@@ -429,7 +432,11 @@ export function ImagesView({
             onChange={(event) => setPrompt(event.target.value)}
             placeholder={
               !ready
-                ? `Start ${loaded ?? 'an image model'} first`
+                ? wrongCapability
+                  ? editing
+                    ? 'Choose an edit-capable model first'
+                    : 'Choose a text-to-image model first'
+                  : blockedPlaceholder
                 : editing
                   ? 'Describe what you want to change…'
                   : 'Describe the image…'

@@ -209,6 +209,10 @@ test('a text-to-image model cannot be asked for an edit', async ({ page }) => {
     // loaded and running, it just takes the other request shape, which no
     // lifecycle band can say.
     await expect(page.getByText(/z-image-turbo is text-to-image only/)).toBeVisible();
+    await expect(page.getByLabel('Prompt')).toHaveAttribute(
+      'placeholder',
+      'Choose an edit-capable model first',
+    );
     await page.getByLabel('Prompt').fill('make it night');
     await expect(page.getByRole('button', { name: 'Edit image', exact: true })).toBeDisabled();
   } finally {
