@@ -121,6 +121,40 @@ export interface Scenario {
   connectorResults: Record<string, { content: string; is_error?: boolean }>;
   /** How many times the restart route was called. */
   connectorRestarts: number;
+  /**
+   * `/api/plugins`, mutated in place by the settings route exactly as the real
+   * registry is — a spec that flips a switch and then asserts on the snapshot
+   * would otherwise be asserting on its own fixture.
+   *
+   * Plugin tools execute through `/api/tools/call` like the built-ins, so
+   * their canned answers live in `toolResults` and their calls in `toolCalls`.
+   */
+  plugins: {
+    plugins: Array<{
+      name: string;
+      title: string;
+      description: string;
+      version: string;
+      enabled: boolean;
+      config_complete: boolean;
+      has_router: boolean;
+      tools: Array<{
+        name: string;
+        short: string;
+        title: string;
+        description: string;
+        parameters: unknown;
+        requires_approval: boolean;
+        enabled: boolean;
+      }>;
+      config: Array<Record<string, unknown>>;
+    }>;
+    load_errors: Array<{ name: string; message: string }>;
+    granted_tools: string[];
+    disabled_tools: string[];
+  };
+  /** Every plugin settings patch the stub received, in order. */
+  pluginPatches: Array<Record<string, unknown>>;
   /** Fail the next model load with this status and error type. */
   loadFailure: { status: number; type: string; message: string } | null;
   /**
@@ -350,6 +384,9 @@ const DEFAULT_SCENARIO: Scenario = {
   connectorCalls: [],
   connectorResults: {},
   connectorRestarts: 0,
+  // No plugins installed, as a fresh install is.
+  plugins: { plugins: [], load_errors: [], granted_tools: [], disabled_tools: [] },
+  pluginPatches: [],
   loadFailure: null,
   loadSettlesReady: false,
   removeFailure: null,
@@ -506,6 +543,8 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
       disabled_tools: [],
       granted_tools: [],
     },
+    plugins: { plugins: [], load_errors: [], granted_tools: [], disabled_tools: [] },
+    pluginPatches: [],
     residency: {
       ...DEFAULT_SCENARIO.residency,
       models: DEFAULT_SCENARIO.residency.models.map((model) => ({ ...model })),
@@ -830,6 +869,59 @@ export async function startStub(overrides: Partial<Scenario> = {}) {
         content: canned?.content ?? `${body.name} ran`,
         is_error: canned?.is_error ?? false,
       });
+      return;
+    }
+
+    // The plugin routes. Reads answer the snapshot; the settings route
+    // mutates it in place and answers the whole thing, exactly as the real
+    // registry does.
+    if (path === '/api/plugins') {
+      if (scenario.preStreamDelayMs > 0) {
+        await new Promise<void>((done) => setTimeout(done, scenario.preStreamDelayMs));
+      }
+      json(response, 200, scenario.plugins);
+      return;
+    }
+
+    if (path === '/api/plugins/settings') {
+      const patch = JSON.parse((await readBody(request)) || '{}');
+      scenario.pluginPatches.push(patch);
+      const state = scenario.plugins;
+      const owner = state.plugins.find((entry) => entry.name === patch.plugin);
+      if (owner && typeof patch.enabled === 'boolean') owner.enabled = patch.enabled;
+      if (typeof patch.tool === 'string' && typeof patch.tool_enabled === 'boolean') {
+        for (const entry of state.plugins) {
+          const found = entry.tools.find((item) => item.name === patch.tool);
+          if (found) found.enabled = patch.tool_enabled;
+        }
+        state.disabled_tools = state.plugins
+          .flatMap((entry) => entry.tools)
+          .filter((item) => !item.enabled)
+          .map((item) => item.name);
+      }
+      if (typeof patch.tool === 'string' && patch.grant === true) {
+        if (!state.granted_tools.includes(patch.tool)) state.granted_tools.push(patch.tool);
+      }
+      if (patch.reset_grants === true) state.granted_tools = [];
+      if (owner && patch.config && typeof patch.config === 'object') {
+        for (const field of owner.config) {
+          if (!(String(field.key) in patch.config)) continue;
+          // A secret answers `has_value` and never a value, as the real
+          // snapshot does — a mask the form could round-trip would become the
+          // stored value the first time someone forgot to strip it.
+          if (field.kind === 'secret') {
+            field.has_value = patch.config[String(field.key)] !== '';
+          } else {
+            field.value = patch.config[String(field.key)];
+          }
+        }
+        owner.config_complete = owner.config.every(
+          (field) =>
+            field.required !== true ||
+            (field.kind === 'secret' ? field.has_value === true : Boolean(field.value)),
+        );
+      }
+      json(response, 200, state);
       return;
     }
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -36,6 +36,7 @@ from .downloads import (
 )
 from .images import ImageJobError, ImageJobManager, ImageJobState
 from .lifecycle import EngineLifecycle, TransitionStart
+from .plugins import PluginError, PluginRegistry, run_plugin_tool
 from .supervisor import (
     AttachedEngine,
     ChildState,
@@ -135,6 +136,11 @@ class WebConfig:
     # unlike downloads, there is no mode in which connectors cannot be
     # configured — the master switch is the off state.
     connectors: ConnectorStore = field(default_factory=ConnectorStore)
+    # Plugins are pip-installed Python running IN THIS PROCESS, so the master
+    # switch is per plugin and defaults off. The factory yields an EMPTY
+    # registry on purpose: discovery reads ``sys.path``, which no test fixture
+    # isolates, so it is ``cli.py`` that calls ``discover()``.
+    plugins: PluginRegistry = field(default_factory=PluginRegistry)
 
     def __post_init__(self) -> None:
         if not self.token:
@@ -922,6 +928,10 @@ def create_app(config: WebConfig) -> FastAPI:
 
         The page sends the enabled subset back on the chat request, so this
         is the source of truth for the schemas the model is shown.
+
+        Plugin tools are NOT listed here — they change at runtime and this
+        response is cached for the page's lifetime. ``/api/plugins`` carries
+        them, with their own approval flags.
         """
         return JSONResponse(
             {
@@ -970,12 +980,22 @@ def create_app(config: WebConfig) -> FastAPI:
                 400, "`approved_origins` must be an array of strings", "invalid_body"
             )
 
-        result = await tools.run_tool(
-            app.state.http,
-            name=name,
-            arguments=arguments,
-            advertised=set(advertised),
-            approved_origins=set(origins),
+        result = await (
+            run_plugin_tool(
+                config.plugins,
+                app.state.http,
+                name=name,
+                arguments=arguments,
+                advertised=set(advertised),
+            )
+            if config.plugins.owns(name)
+            else tools.run_tool(
+                app.state.http,
+                name=name,
+                arguments=arguments,
+                advertised=set(advertised),
+                approved_origins=set(origins),
+            )
         )
         return JSONResponse(result.to_dict())
 
@@ -1490,6 +1510,79 @@ def create_app(config: WebConfig) -> FastAPI:
 
         return JSONResponse(
             status_code=upstream.status_code, content=_decode_json_body(upstream)
+        )
+
+    # ------------------------------------------------------------- plugins
+    #
+    # Tools, settings and routes contributed by pip-installed packages. Kept
+    # off ``/api/tools`` because the page caches that for its whole lifetime
+    # (the built-in catalogue is constant for the process) whereas every
+    # switch below changes at runtime from the settings panel.
+    #
+    # The management routes are registered BEFORE the per-plugin routers so
+    # they win on registration order; ``RESERVED_NAMES`` refuses the colliding
+    # plugin names as well, because a plugin whose routes are unreachable for
+    # a reason invisible in its own source is worth refusing outright.
+
+    @app.get("/api/plugins")
+    async def get_plugins() -> JSONResponse:
+        return JSONResponse(config.plugins.snapshot())
+
+    @app.post("/api/plugins/settings")
+    async def set_plugin_settings(request: Request):
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        registry = config.plugins
+
+        plugin = payload.get("plugin")
+        tool = payload.get("tool")
+        try:
+            if isinstance(plugin, str) and isinstance(payload.get("enabled"), bool):
+                registry.set_enabled(plugin, payload["enabled"])
+            if isinstance(tool, str) and isinstance(payload.get("tool_enabled"), bool):
+                registry.set_tool_enabled(tool, payload["tool_enabled"])
+            if isinstance(tool, str) and payload.get("grant") is True:
+                registry.grant_tool(tool)
+            if payload.get("reset_grants") is True:
+                registry.reset_grants()
+            if isinstance(plugin, str) and isinstance(payload.get("config"), dict):
+                registry.set_config(plugin, payload["config"])
+        except PluginError as exc:
+            return _json_error(400, str(exc), "invalid_body")
+
+        return JSONResponse(registry.snapshot())
+
+    def _plugin_gate(name: str):
+        """Refuse a disabled plugin's own routes.
+
+        Starlette builds its router at startup and has no supported removal, so
+        a router cannot be unmounted when the switch flips. Gating per request
+        is what makes the toggle take effect at once — the route exists and
+        declines, matching ``/api/connectors/execute``'s 409.
+        """
+
+        async def guard() -> None:
+            if not config.plugins.is_enabled(name):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": {
+                            "message": f"the '{name}' plugin is turned off",
+                            "type": "plugin_disabled",
+                        }
+                    },
+                )
+
+        return guard
+
+    for _plugin in config.plugins.loaded:
+        if _plugin.spec.router is None:
+            continue
+        app.include_router(
+            _plugin.spec.router,
+            prefix=f"/api/plugins/{_plugin.spec.name}",
+            dependencies=[Depends(_plugin_gate(_plugin.spec.name))],
         )
 
     # After the API routes: a mount matches on prefix and swallows

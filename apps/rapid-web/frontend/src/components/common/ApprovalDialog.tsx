@@ -16,13 +16,17 @@ import { useStore } from '@/state/store';
  *
  * Two shapes, one dialog. A `browse` is approved by HOST — the model picks
  * the URL, so an unapproved fetch is an exfiltration primitive no SSRF check
- * can close, and the exact address is the whole defence. A connector call is
- * approved by TOOL, and names the server: "run read_file?" is unanswerable
- * without knowing whose.
+ * can close, and the exact address is the whole defence. A tool call is
+ * approved by TOOL, and names where it came from: "run read_file?" is
+ * unanswerable without knowing whose.
  *
- * Only the connector prompt offers "Always allow", and only per tool. A
- * browse grant covers the host for the rest of the answer and no longer,
- * because the next answer's URLs are chosen by the model too.
+ * `server` names a connector OR a plugin, and the wording deliberately says
+ * neither. Both are code on the Mac serving this page, which is the fact the
+ * answer turns on; naming the mechanism would only be right half the time.
+ *
+ * Only the tool prompt offers "Always allow", and only per tool. A browse
+ * grant covers the host for the rest of the answer and no longer, because the
+ * next answer's URLs are chosen by the model too.
  */
 export function ApprovalDialog() {
   const pending = useStore((state) => state.pendingApproval);
@@ -41,7 +45,7 @@ export function ApprovalDialog() {
           </AlertDialogTitle>
           <AlertDialogDescription>
             {pending?.kind === 'tool'
-              ? `The model asked to run this tool from the “${pending.server}” connector — a program on the Mac serving this page.`
+              ? `The model asked to run this tool from “${pending.server}” — code on the Mac serving this page.`
               : 'The model asked to read this page. Approving also covers later pages on the same host for this answer.'}
           </AlertDialogDescription>
         </AlertDialogHeader>

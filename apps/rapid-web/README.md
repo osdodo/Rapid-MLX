@@ -117,6 +117,109 @@ tunnel or firewall boundary is still preferable to a bare network port.
 | `--allow-downloads` | Permit downloads when bound to a non-loopback address. |
 | `--rapid-mlx-bin` | Path to `rapid-mlx`, if it is not on `PATH`. |
 | `--serve-arg` | Extra argument passed through to `rapid-mlx serve`. Repeat per token. |
+| `--list-plugins` | List installed plugins with their load status, and exit. |
+
+## Plugins
+
+A plugin is an ordinary Python package that adds tools to this server. Unlike
+an MCP connector — a separate program the engine spawns — a plugin runs inside
+`rmlx-web` itself, which makes it the cheaper way to wire up something small
+and local.
+
+Install one into the interpreter that runs `rmlx-web`, restart, and turn it on
+under **Settings → Tools**. `rmlx-web --list-plugins` prints what loaded, what
+failed and the exact `pip` path to use — worth running first, because a
+Homebrew install puts `rmlx-web` in a virtualenv your own `pip` is not.
+
+```sh
+$(brew --prefix rmlx-web)/libexec/bin/pip install rmlx-web-something
+```
+
+**Every plugin is off until you turn it on**, and a plugin that requires
+settings offers nothing to the model until they are filled in.
+
+### Writing one
+
+`examples/demo-plugin/` is a working plugin exercising the whole surface —
+tools, a per-tool approval requirement, settings including a secret, and an
+HTTP route. Install it with `pip install -e apps/rapid-web/examples/demo-plugin`
+to see it appear.
+
+The whole contract is one entry point:
+
+```toml
+[project.entry-points."rmlx_web.plugins"]
+myplugin = "my_plugin:register"
+```
+
+pointing at a zero-argument callable that returns a `PluginSpec`:
+
+```python
+from rmlx_web.plugins import ConfigField, PluginContext, PluginSpec, PluginTool
+
+async def search(context: PluginContext, args: dict) -> str:
+    response = await context.http.get(
+        "https://example.internal/search",
+        params={"q": args["query"]},
+        headers={"Authorization": f"Bearer {context.config['api_token']}"},
+    )
+    return response.text
+
+def register() -> PluginSpec:
+    return PluginSpec(
+        name="mine",
+        title="My Search",
+        description="Searches the internal index.",
+        tools=[
+            PluginTool(
+                name="search",                       # advertised as mine__search
+                title="Internal Search",             # what Settings calls it
+                description="Search the internal index.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+                handler=search,
+                requires_approval=False,
+            )
+        ],
+        config=[ConfigField(key="api_token", label="API token", kind="secret", required=True)],
+    )
+```
+
+Things worth knowing before you write one:
+
+- **Handlers must be `async`.** The same event loop streams every reply; one
+  blocking call stalls generation in every open tab. Use `asyncio.to_thread`
+  for libraries that cannot cooperate.
+- **Use `context.http`**, the server's shared client. A per-call client loses
+  connection reuse and leaks connections when a reply is abandoned.
+- **Tool names are namespaced** to `plugin__tool`, so two plugins can both
+  offer a `search`. The composite must fit 64 characters. `title` is what the
+  settings screen shows; without one it uses the bare name. Keep `description`
+  written for the model — it appears under a disclosure, not as a heading.
+- **`raise ToolError("...")` to tell the model something it can act on.** Any
+  other exception is reported generically and logged, because exception text
+  routinely quotes the value that caused it — which may be your API token, and
+  the transcript is kept and replayed on every following turn.
+- **A secret is never sent to the browser**, not even masked. The settings
+  screen reports only whether one is stored.
+- **A `router=APIRouter()`** is mounted at `/api/plugins/<name>` and inherits
+  the server's authentication; it refuses with 409 while the plugin is off.
+- One tool with a malformed schema is dropped and the rest of the plugin still
+  works — but a plugin that fails to import contributes nothing.
+
+### What the switch does, and does not
+
+Turning a plugin off stops its tools being offered and makes its routes refuse,
+immediately. It does **not** stop its code running: naming a plugin's tools and
+settings means importing it, so every *installed* plugin is imported at startup
+whatever the switch says. **`pip install` is the trust decision**; the switch is
+a capability decision. Install plugins you wrote or read.
+
+Installing or removing a plugin needs a restart to take effect. Switches and
+settings do not.
 
 ## How it works
 
@@ -183,12 +286,15 @@ Attaching a tunnel puts this on the public internet, so:
   represent. The migration keeps every message, but downgrading afterwards
   shows an empty list — export anything you cannot lose first.
 - Three built-in tools — `weather`, `web_search`, `browse` — plus MCP
-  connectors configured from Settings. They run on the Mac, not in the
-  browser, because a page cannot fetch a cross-origin provider. `browse` asks
-  before each new host: the model chooses the URL, so approving it is what
+  connectors and plugins configured from Settings. They run on the Mac, not in
+  the browser, because a page cannot fetch a cross-origin provider. `browse`
+  asks before each new host: the model chooses the URL, so approving it is what
   stops a page fetch becoming a way to post the conversation elsewhere. Its
   server-side IP checks also block private, loopback and link-local targets.
   At most 3 calls answer one message.
+- Plugins run in this process with no sandbox, and are imported at startup
+  whether or not they are switched on. `brew upgrade rmlx-web` rebuilds the
+  virtualenv and removes every installed plugin; reinstall them afterwards.
 - Downloads are one at a time, with progress polled once a second, so
   reloading mid-download reconnects to the running pull.
 - `--attach` mode cannot list or switch models: listing needs the CLI and

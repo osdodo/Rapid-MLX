@@ -1,6 +1,7 @@
 import { streamChat, type ToolCall, type ToolDefinition } from '@/api/chat';
 import { callConnectorTool, updateConnectorSettings, type ConnectorState } from '@/api/connectors';
 import { asApiError } from '@/api/errors';
+import { updatePluginSettings, type PluginState } from '@/api/plugins';
 import { useStore, wireTurns } from '@/state/store';
 import type { MessageNode } from '@/state/types';
 import { activePath, branchAnchor, siblings } from './MessageTree';
@@ -14,6 +15,13 @@ import {
   loadConnectorState,
 } from './connectors';
 import { composeSystemPrompt } from './instructions';
+import {
+  advertisedPluginTools,
+  approvalRequest,
+  gatePluginCall,
+  isPluginTool,
+  loadPluginState,
+} from './plugins';
 import { streamingStore } from './StreamingStore';
 import {
   MAX_TOOL_EXECUTIONS,
@@ -79,6 +87,8 @@ export async function runTurn({ assistantId, alias }: RunOptions): Promise<void>
   // mid-session, but a mid-turn change would leave the model advertised a
   // tool that vanished before it asked for it.
   const connectors = await loadConnectorState();
+  // Read per turn for the same reason, and against the same risk.
+  const plugins = await loadPluginState();
   const approvedOrigins = new Set<string>();
   // Grants approved during this turn. `always` is written through to the
   // server, but a plain `allowOnce` must not re-prompt for the same tool in
@@ -96,10 +106,11 @@ export async function runTurn({ assistantId, alias }: RunOptions): Promise<void>
       // than asking for a call that would be refused.
       const tools =
         executions < MAX_TOOL_EXECUTIONS
-          ? [
+          ? withoutShadowedTools([
               ...advertised(catalogue.tools, store.settings.enabledTools),
+              ...advertisedPluginTools(plugins),
               ...advertisedConnectorTools(connectors),
-            ]
+            ])
           : [];
 
       const outcome = await runOneStream({
@@ -127,18 +138,15 @@ export async function runTurn({ assistantId, alias }: RunOptions): Promise<void>
         executions += 1;
         results.push({
           call,
-          ...(isConnectorTool(connectors, call.function.name)
-            ? await runConnectorCall(call, {
-                connectors,
-                approvedTools,
-                signal: controller.signal,
-              })
-            : await runOneCall(call, {
-                catalogue,
-                enabled: store.settings.enabledTools,
-                approvedOrigins,
-                signal: controller.signal,
-              })),
+          ...(await dispatch(call, {
+            catalogue,
+            connectors,
+            plugins,
+            enabled: store.settings.enabledTools,
+            approvedOrigins,
+            approvedTools,
+            signal: controller.signal,
+          })),
         });
       }
 
@@ -276,6 +284,132 @@ async function runOneCall(
   } catch (cause) {
     const error = asApiError(cause);
     return { content: `${call.function.name} error: ${error.message}`, failed: true };
+  }
+}
+
+/**
+ * Keep the first definition of each name and DROP the rest.
+ *
+ * Three sources can produce the same name — a connector server called `jira`
+ * exposing `search` and a plugin called `jira` with a tool `search` both
+ * namespace to `jira__search`. Precedence is the array order the caller built:
+ * built-in, then plugin, then connector.
+ *
+ * The loser is removed rather than shadowed. Advertising two entries that
+ * resolve to one implementation is how someone ends up debugging a tool that
+ * "runs but returns the wrong thing", and it also sends the engine a duplicate
+ * function name in one request.
+ */
+export function withoutShadowedTools(all: ToolDefinition[]): ToolDefinition[] {
+  const seen = new Set<string>();
+  return all.filter((tool) => {
+    if (seen.has(tool.function.name)) return false;
+    seen.add(tool.function.name);
+    return true;
+  });
+}
+
+/**
+ * Route one call to whoever owns the name.
+ *
+ * Ownership is tested in the same order the advertised array was built, so a
+ * name that survived `withoutShadowedTools` dispatches to the source that kept
+ * it. Testing connectors first — as this did before plugins existed — would
+ * send a shadowed name to the source whose definition was dropped.
+ */
+async function dispatch(
+  call: ToolCall,
+  options: {
+    catalogue: { tools: ToolDefinition[]; approvalRequired: Set<string> };
+    connectors: ConnectorState | null;
+    plugins: PluginState | null;
+    enabled: string[];
+    approvedOrigins: Set<string>;
+    approvedTools: Set<string>;
+    signal: AbortSignal;
+  },
+): Promise<{ content: string; failed: boolean }> {
+  const name = call.function.name;
+  const builtIn = options.catalogue.tools.some((tool) => tool.function.name === name);
+
+  if (!builtIn && isPluginTool(options.plugins, name)) {
+    return runPluginCall(call, {
+      plugins: options.plugins,
+      approvedTools: options.approvedTools,
+      signal: options.signal,
+    });
+  }
+  if (!builtIn && isConnectorTool(options.connectors, name)) {
+    return runConnectorCall(call, {
+      connectors: options.connectors,
+      approvedTools: options.approvedTools,
+      signal: options.signal,
+    });
+  }
+  return runOneCall(call, {
+    catalogue: options.catalogue,
+    enabled: options.enabled,
+    approvedOrigins: options.approvedOrigins,
+    signal: options.signal,
+  });
+}
+
+/**
+ * One plugin call: gate, prompt if it needs approval, execute.
+ *
+ * Structurally the connector path, and for the same reasons — including the
+ * `approvedTools` check BEFORE the prompt, so a tool called twice in one
+ * answer asks once. Execution goes through `/api/tools/call` rather than a
+ * plugin-specific endpoint: that route already carries the `advertised` gate,
+ * and a second copy of it is the copy that drifts.
+ */
+async function runPluginCall(
+  call: ToolCall,
+  options: {
+    plugins: PluginState | null;
+    approvedTools: Set<string>;
+    signal: AbortSignal;
+  },
+): Promise<{ content: string; failed: boolean }> {
+  const name = call.function.name;
+  const decision = gatePluginCall(call, options.plugins);
+
+  if (decision.kind === 'refuse') return { content: decision.reason, failed: true };
+
+  if (decision.kind === 'approve' && !options.approvedTools.has(name)) {
+    // Every field is plugin-supplied — a pip package words this dialog — so
+    // `approvalRequest` escapes all of them.
+    const answer = await useStore.getState().askApproval(approvalRequest(decision));
+    if (answer === 'declined') {
+      return {
+        content: `The user declined to run '${name}'. Continue without it.`,
+        failed: true,
+      };
+    }
+    if (answer === 'unavailable') {
+      return {
+        content: `'${name}' was not run — the request was cancelled before it could be approved.`,
+        failed: true,
+      };
+    }
+    options.approvedTools.add(name);
+    if (answer === 'always') {
+      // Best effort, as on the connector path: a grant that failed to persist
+      // costs one more prompt next turn, which is the safe direction to fail in.
+      void updatePluginSettings({ tool: name, grant: true }).catch(() => {});
+    }
+  }
+
+  try {
+    const result = await execute(call, {
+      advertised: [name],
+      approvedOrigins: [],
+      signal: options.signal,
+    });
+    return { content: displaySafeResult(result.content), failed: result.is_error };
+  } catch (cause) {
+    const error = asApiError(cause);
+    return { content: `${name} error: ${error.message}`, failed: true };
   }
 }
 

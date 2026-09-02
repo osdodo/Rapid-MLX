@@ -16,6 +16,7 @@ from .app import WebConfig, create_app
 from .catalog import ModelCatalog
 from .connectors import ConnectorStore
 from .downloads import DownloadManager
+from .plugins import PluginRegistry
 from .supervisor import (
     AttachedEngine,
     EngineSupervisor,
@@ -111,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Extra argument forwarded verbatim to `rapid-mlx serve`. Repeat "
             "for each token, e.g. --serve-arg --max-model-len --serve-arg 8192."
+        ),
+    )
+    parser.add_argument(
+        "--list-plugins",
+        action="store_true",
+        help=(
+            "List installed plugins with their load status and exit. A flag "
+            "rather than a subcommand: `model` is an optional positional, and "
+            "adding subparsers beside one makes argparse ambiguous."
         ),
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -215,8 +225,43 @@ def _resolve_engine(
     return engine, ModelCatalog(binary), downloads
 
 
+def _print_plugins(registry: PluginRegistry) -> None:
+    """What ``--list-plugins`` prints.
+
+    The fastest answer to "why isn't my plugin showing up", which is the
+    support question this feature generates: it names the interpreter the
+    plugin has to be installed into, since a Homebrew install puts that in a
+    virtualenv the user's `pip` is not.
+    """
+    print()
+    if not registry.loaded and not registry.load_errors:
+        print("  No plugins installed.")
+    for plugin in registry.loaded:
+        state = "on" if registry.is_enabled(plugin.spec.name) else "off"
+        version = f" {plugin.version}" if plugin.version else ""
+        print(f"  {plugin.spec.name}{version}  [{state}]  {plugin.spec.title}")
+        for bare in sorted(plugin.tools):
+            print(f"      tool: {plugin.full_name(bare)}")
+    for error in registry.load_errors:
+        print(f"  {error.name or '(unknown)'}  [error]  {error.message}")
+    print()
+    print(
+        f"  Install a plugin into this interpreter:\n    {sys.executable} -m pip install <plugin>"
+    )
+    print()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Before anything that needs the engine: `_resolve_engine` requires
+    # `rapid-mlx` on PATH, and a broken install must not hide the answer to
+    # "is my plugin loaded".
+    if args.list_plugins:
+        registry = PluginRegistry()
+        registry.discover()
+        _print_plugins(registry)
+        return 0
 
     loopback = _is_loopback(args.host)
 
@@ -249,6 +294,16 @@ def main(argv: list[str] | None = None) -> int:
     # `launch_config_path` on every spawn.
     connector_store = ConnectorStore()
 
+    plugin_registry = PluginRegistry()
+    plugin_registry.discover()
+    for error in plugin_registry.load_errors:
+        # Told at startup, not left for the user to discover by hunting in the
+        # UI for a tool that is not there.
+        print(
+            f"  plugin {error.name or '(unknown)'}: {error.message}",
+            file=sys.stderr,
+        )
+
     try:
         engine, catalog, downloads = _resolve_engine(
             args, downloads_enabled=downloads_enabled, connectors=connector_store
@@ -264,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         catalog=catalog,
         downloads=downloads,
         connectors=connector_store,
+        plugins=plugin_registry,
     )
     app = create_app(config)
 

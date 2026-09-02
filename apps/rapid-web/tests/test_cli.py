@@ -213,3 +213,26 @@ class TestOptionalModelArgument:
         # as the catalog moves.
         help_text = cli.build_parser().format_help()
         assert "qwen" not in help_text.lower()
+
+
+class TestListPlugins:
+    """``--list-plugins``: the answer to "why isn't my plugin showing up"."""
+
+    def test_it_exits_before_the_engine_is_resolved(self, monkeypatch, capsys):
+        # `_resolve_engine` requires `rapid-mlx` on PATH, and a broken install
+        # must not hide whether a plugin loaded.
+        def refuse(*args, **kwargs):
+            raise AssertionError("the engine must not be resolved")
+
+        monkeypatch.setattr(cli, "_resolve_engine", refuse)
+
+        assert cli.main(["--list-plugins"]) == 0
+        assert "pip install" in capsys.readouterr().out
+
+    def test_it_is_a_flag_rather_than_a_subcommand(self):
+        # `model` is an optional positional; add_subparsers beside one makes
+        # argparse read `rmlx-web some-alias` as an unknown subcommand.
+        args = cli.build_parser().parse_args(["some-alias"])
+
+        assert args.model == "some-alias"
+        assert args.list_plugins is False

@@ -35,6 +35,11 @@ dependencies = [
 # first, or the two entry points coexist and shadow each other.
 rmlx-web = "rmlx_web.cli:main"
 
+# Plugins are discovered through the `rmlx_web.plugins` entry-point group,
+# declared by the PLUGIN rather than here — see README.md and
+# examples/demo-plugin. Nothing to add in this file; the group name is
+# recorded so it can be found from the host package.
+
 [project.optional-dependencies]
 test = [
     "pytest>=7.0",

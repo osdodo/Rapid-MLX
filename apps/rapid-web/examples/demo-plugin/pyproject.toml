@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rmlx-web-demo"
+version = "0.1.0"
+description = "Reference plugin for rmlx-web"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# No dependency on rmlx-web itself. A plugin is installed INTO the interpreter
+# that already runs it, so `from rmlx_web.plugins import ...` resolves anyway,
+# and declaring the dependency would let pip pull a second copy of the host.
+
+# The one line that makes this a plugin rather than an ordinary package.
+# Without it `--list-plugins` never mentions it.
+[project.entry-points."rmlx_web.plugins"]
+demo = "rmlx_web_demo:register"
+
+[tool.setuptools.packages.find]
+include = ["rmlx_web_demo*"]

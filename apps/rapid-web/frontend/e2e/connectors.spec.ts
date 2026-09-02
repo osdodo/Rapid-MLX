@@ -221,9 +221,11 @@ test('a connector tool is offered to the model and runs once approved', async ({
     // arguments once the call has run.
     const prompt = page.getByRole('alertdialog');
     await expect(prompt.getByText('Run read_file?')).toBeVisible();
-    // The prompt names the SERVER as well as the tool: "run read_file?" is
-    // unanswerable without knowing whose read_file it is.
-    await expect(prompt.getByText(/from the “filesystem” connector/)).toBeVisible();
+    // The prompt names the SOURCE as well as the tool: "run read_file?" is
+    // unanswerable without knowing whose read_file it is. The noun is left
+    // out — the same prompt also serves plugins, and both are code on the Mac
+    // serving the page, which is the fact the answer turns on.
+    await expect(prompt.getByText(/from “filesystem”/)).toBeVisible();
     // And the exact arguments the model chose.
     await expect(prompt.getByText('/tmp/notes.txt')).toBeVisible();
 

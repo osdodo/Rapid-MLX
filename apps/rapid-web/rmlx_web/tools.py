@@ -249,7 +249,18 @@ async def run_tool(
     if name not in advertised:
         return ToolResult(refusal_message(name, advertised), is_error=True)
 
-    definition = next(d for d in DEFINITIONS if d["function"]["name"] == name)
+    # `advertised` is the caller's claim about what the model was shown, not a
+    # subset of DEFINITIONS: a name this server has never heard of reaches here
+    # whenever the page's catalogue is wider than this module's. Without the
+    # default, the exhausted generator raises StopIteration inside a coroutine,
+    # which becomes a RuntimeError and a 500 rather than an answer the model
+    # can act on.
+    definition = next(
+        (d for d in DEFINITIONS if d["function"]["name"] == name), None
+    )
+    if definition is None:
+        return ToolResult(refusal_message(name, advertised), is_error=True)
+
     args = normalize_arguments(arguments, definition)
     if args is None:
         return ToolResult(

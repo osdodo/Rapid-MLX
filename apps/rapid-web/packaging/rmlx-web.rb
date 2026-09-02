@@ -122,6 +122,14 @@ class RmlxWeb < Formula
 
       It prints a URL and, when bound to anything other than loopback, an
       access token. No model is loaded at startup — pick one in the page.
+
+      Plugins install into this formula's own virtualenv, not your system
+      Python:
+        #{libexec}/bin/pip install <plugin>
+
+      `rmlx-web --list-plugins` confirms what loaded. Note that upgrading
+      rmlx-web rebuilds that virtualenv and removes every plugin in it, so
+      reinstall them after a `brew upgrade`.
     EOS
   end
 

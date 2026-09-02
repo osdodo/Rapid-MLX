@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { useStore } from '@/state/store';
 import type { Settings } from '@/state/types';
-import { loadTools } from '@/chat/tools';
+import { loadTools, MAX_TOOL_EXECUTIONS } from '@/chat/tools';
 import { EffectiveSystemPrompt } from '@/components/chat/ConversationInstructions';
 import type { ToolDefinition } from '@/api/chat';
 import { SHEET_DESKTOP_SIZE } from './Sheet';
@@ -37,6 +37,7 @@ import {
 } from './SettingsSection';
 import { ConnectorsPanel } from '@/components/connectors/ConnectorsPanel';
 import { ModelManagement } from '@/components/models/ModelManagement';
+import { PluginSections } from '@/components/plugins/PluginSections';
 
 /**
  * The settings window: a category rail on the left, one panel on the right.
@@ -425,12 +426,16 @@ function ToolsPanel() {
             subtitle="On the Mac serving this page, not in this browser — a browser cannot reach these providers directly."
           >
             <p className="text-muted-foreground m-0 text-xs">
-              At most 3 calls answer one message. After that the model has to reply from what it
-              already has.
+              At most {MAX_TOOL_EXECUTIONS} calls answer one message. After that the model has
+              to reply from what it already has.
             </p>
           </SettingsSection>
         </>
       )}
+
+      {/* Plugin sections load their own state and render nothing when none is
+          installed, so they sit outside the built-in catalogue's branch. */}
+      <PluginSections />
     </PanelBody>
   );
 }
