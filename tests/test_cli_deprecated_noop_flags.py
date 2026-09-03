@@ -157,15 +157,20 @@ def test_deprecated_flag_is_behaviorally_inert(flag, extra_argv, attr):
     "flag",
     [f[0] for f in _DEPRECATED_NOOP_FLAGS],
 )
-def test_deprecated_flag_hidden_from_help(flag):
+@pytest.mark.parametrize("surface", ["--help", "--help-all"])
+def test_deprecated_flag_hidden_from_help(flag, surface):
     """Deprecated no-op flags use ``argparse.SUPPRESS`` — they must not appear
-    in ``serve --help`` so we don't advertise dead knobs to new users."""
+    in ``serve --help`` so we don't advertise dead knobs to new users.
+
+    ``--help-all`` (issue #2354) is checked too: it reveals the advanced
+    tier, so a suppressed flag that regained a help string would surface
+    there first."""
     buf = io.StringIO()
     with (
-        patch.object(sys, "argv", ["rapid-mlx", "serve", "--help"]),
+        patch.object(sys, "argv", ["rapid-mlx", "serve", surface]),
         pytest.raises(SystemExit) as exc,
         redirect_stdout(buf),
     ):
         cli.main()
     assert exc.value.code == 0
-    assert flag not in buf.getvalue(), f"{flag} leaked into --help output"
+    assert flag not in buf.getvalue(), f"{flag} leaked into {surface} output"

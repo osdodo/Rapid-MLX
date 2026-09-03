@@ -102,8 +102,11 @@ def test_serve_parser_exposes_speculative_config() -> None:
     import subprocess
     import sys
 
+    # ``--speculative-config`` is advanced: issue #2354 moved it off the
+    # default help onto ``--help-all``. The deprecated aliases must stay
+    # hidden on BOTH surfaces.
     out = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help-all"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -117,6 +120,16 @@ def test_serve_parser_exposes_speculative_config() -> None:
     assert "[dflash]" in out.stdout, (
         "help text should reference the rapid-mlx[dflash] extras"
     )
+
+    default_help = subprocess.run(
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert default_help.returncode == 0, default_help.stderr
+    assert "--enable-dflash" not in default_help.stdout
+    assert "--spec-decode" not in default_help.stdout
 
 
 def _dflash_cli_args(**overrides):

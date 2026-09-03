@@ -17,8 +17,11 @@ def test_serve_parser_exposes_ddtree_speculative_config() -> None:
     import subprocess
     import sys
 
+    # ``--speculative-config`` is an advanced flag: issue #2354 moved it off
+    # the default help onto ``--help-all``. The deprecated ``--enable-ddtree``
+    # alias must stay hidden on BOTH surfaces.
     out = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help-all"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -26,6 +29,15 @@ def test_serve_parser_exposes_ddtree_speculative_config() -> None:
     assert out.returncode == 0, out.stderr
     assert "--speculative-config" in out.stdout
     assert "--enable-ddtree" not in out.stdout
+
+    default_help = subprocess.run(
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert default_help.returncode == 0, default_help.stderr
+    assert "--enable-ddtree" not in default_help.stdout
 
 
 def _ddtree_cli_args(**overrides):

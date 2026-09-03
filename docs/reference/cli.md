@@ -25,7 +25,13 @@
 | `rapid-mlx version` | Show version number |
 | `rapid-mlx help <cmd>` | Show help for a subcommand |
 
-Run `rapid-mlx <cmd> --help` for the full flag list of any subcommand.
+Run `rapid-mlx <cmd> --help` for the flag list of any subcommand. `serve`
+carries far more options than the rest, so its help is tiered: `--help` shows
+the common startup path (model, host, port, authentication, logging, and how to
+connect), and `rapid-mlx serve --help-all` adds the advanced and experimental
+groups (caching, KV-cache quantization, speculative decoding, prefill
+compression, profile overrides, deployment). Both surfaces list the same flags
+this page documents.
 
 `rapid-mlx models --cached --json` is the stable machine-readable cache
 inventory used by the Desktop app. Each row includes `repo`, `alias`,
@@ -62,8 +68,13 @@ rapid-mlx serve <model> [options]
 
 ### Options
 
-Every flag visible in `rapid-mlx serve --help`, grouped by category. Defaults
-are the argparse defaults from `vllm_mlx/cli.py`.
+Every flag accepted by `rapid-mlx serve`, grouped by category. Defaults are the
+argparse defaults from `vllm_mlx/cli.py`.
+
+The terminal help is tiered (issue #2354): `rapid-mlx serve --help` shows the
+core startup options only, and `rapid-mlx serve --help-all` prints every option
+below. Nothing is removed from the CLI — the tiering only affects what `--help`
+renders by default.
 
 #### Network and process
 

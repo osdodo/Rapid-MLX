@@ -2003,8 +2003,8 @@ def _add_pflash_args(parser) -> None:
         choices=["off", "auto", "always"],
         default=None,
         help="Enable PFlash long-prompt prefill compression "
-        "(off, auto, always). Default: 'always' for verified aliases "
-        "(Qwen3.5 / Qwen3.6 family per #287), 'off' for everything else.",
+        "(off, auto, always). Default: 'always' for bench-verified models "
+        "(Qwen3.5 / Qwen3.6 family), 'off' for everything else.",
     )
     parser.add_argument(
         "--pflash-threshold",
@@ -2017,10 +2017,10 @@ def _add_pflash_args(parser) -> None:
         type=float,
         default=None,
         help="Fraction of prompt tokens to keep when compressing. Unset lets "
-        "the engine resolve it: a per-alias ``pflash_keep_ratio`` override if "
-        "the alias pins one (e.g. 0.50 for a ternary arch), else the default "
-        "0.20 (the bench-validated profile in PR #649: TTFT 3.87x-8.5x, needle "
-        "recall 5/5). An explicit value here always wins.",
+        "the engine resolve it: the model profile's own ratio if it pins one "
+        "(e.g. 0.50 for a ternary architecture), else the bench-validated "
+        "default of 0.20 (TTFT 3.87x-8.5x, needle recall 5/5). An explicit "
+        "value here always wins.",
     )
     parser.add_argument(
         "--pflash-min-keep-tokens",
@@ -10369,6 +10369,311 @@ def _resolve_cli_version() -> str:
         return "dev"
 
 
+# ---------------------------------------------------------------------------
+# ``serve`` help tiering (issue #2354)
+#
+# ``serve`` carries ~110 flags. Rendering all of them in ``--help`` buried the
+# handful a first-time user actually needs (model, host, port, auth, logging)
+# under experimental scheduler and cache knobs. The flag surface itself is
+# unchanged — every option still parses exactly as before — but the DEFAULT
+# help renders only the core tier; ``--help-all`` renders everything.
+#
+# Grouping is data-driven (below) rather than sprinkled across the ~1100 lines
+# of ``add_argument`` calls, so the tier of a flag is reviewable in one place.
+# ---------------------------------------------------------------------------
+
+# (title, description, flags). Rendered by plain ``serve --help``.
+_SERVE_CORE_GROUPS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
+    (
+        "model",
+        "Which model to load and how it is named over the API.",
+        (
+            "--served-model-name",
+            "--embedding-model",
+            "--enable-audio",
+        ),
+    ),
+    (
+        "server",
+        "Where the OpenAI-compatible endpoint listens.",
+        (
+            "--host",
+            "--port",
+            "--log-level",
+            "--timeout",
+        ),
+    ),
+    (
+        "authentication and access",
+        "Who may reach the server. Review these before leaving loopback.",
+        (
+            "--api-key",
+            "--cors-origins",
+            "--trusted-hosts",
+            "--rate-limit",
+            "--max-request-bytes",
+        ),
+    ),
+    (
+        "generation",
+        "Request-time behavior shared by every client.",
+        (
+            "--max-tokens",
+            "--reasoning-parser",
+            "--no-thinking",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "--mcp-config",
+        ),
+    ),
+    (
+        "performance and memory",
+        "The knobs worth reaching for first on a memory-tight Mac.",
+        (
+            "--max-num-seqs",
+            "--max-concurrent-requests",
+            "--kv-cache-dtype",
+            "--reasoning",
+            "--enable-prefix-cache",
+            "--disable-prefix-cache",
+            "--gpu-memory-utilization",
+        ),
+    ),
+)
+
+# (title, flags). Hidden from plain ``--help``; rendered by ``--help-all``.
+_SERVE_ADVANCED_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "advanced: model loading",
+        (
+            "--force-disk-check",
+            "--mllm",
+            "--no-mllm",
+            "--resident-memory-limit-gb",
+            "--resident-model-idle-ttl",
+            "--disk-stream",
+            "--disk-stream-cache-gb",
+        ),
+    ),
+    (
+        "advanced: prompt and response caching",
+        (
+            "--prefix-cache-size",
+            "--prefix-cache-index",
+            "--cache-memory-mb",
+            "--cache-memory-percent",
+            "--no-memory-aware-cache",
+            "--idle-cache-clear-seconds",
+            "--hybrid-cache-entries",
+            "--response-cache-entries",
+            "--pin-system-prompt",
+        ),
+    ),
+    (
+        "advanced: KV cache",
+        (
+            "--kv-cache-quantization",
+            "--kv-cache-quantization-bits",
+            "--kv-cache-quantization-group-size",
+            "--kv-cache-min-quantize-tokens",
+            "--kv-cache-turboquant",
+            "--kv-cache-turboquant-bits",
+            "--kv-cache-turboquant-group-size",
+            "--kv-disk-checkpoint-interval",
+            "--metal-cap-kv-bytes-per-token",
+            "--use-paged-cache",
+            "--paged-cache-block-size",
+            "--max-cache-blocks",
+        ),
+    ),
+    (
+        "advanced: batching and streaming",
+        (
+            "--prefill-batch-size",
+            "--completion-batch-size",
+            "--prefill-step-size",
+            "--stream-interval",
+            "--gc-control",
+            "--no-gc-control",
+        ),
+    ),
+    (
+        "advanced: speculative decoding",
+        ("--speculative-config",),
+    ),
+    (
+        "advanced: long-prompt compression",
+        (
+            "--pflash",
+            "--pflash-threshold",
+            "--pflash-keep-ratio",
+            "--pflash-min-keep-tokens",
+            "--pflash-sink-tokens",
+            "--pflash-tail-tokens",
+            "--pflash-block-size",
+            "--pflash-query-window",
+            "--pflash-stride-blocks",
+            "--pflash-include-tools",
+        ),
+    ),
+    (
+        "advanced: vision",
+        (
+            "--vision-prefill-token-budget",
+            "--vision-min-pixels",
+            "--vision-max-pixels",
+        ),
+    ),
+    (
+        "advanced: sampling defaults",
+        (
+            "--default-temperature",
+            "--default-top-p",
+            "--default-top-k",
+            "--default-min-p",
+            "--default-repetition-penalty",
+            "--default-presence-penalty",
+            "--default-frequency-penalty",
+        ),
+    ),
+    (
+        "advanced: model profile overrides",
+        (
+            "--no-tool-call-parser",
+            "--no-reasoning-parser",
+            "--enable-tool-logits-bias",
+            "--force-hybrid",
+            "--no-hybrid",
+            "--force-spec-decode",
+            "--no-spec-decode",
+            "--force-openai-harmony-streaming",
+            "--no-openai-harmony-streaming",
+            "--relocate-mid-conversation-system",
+        ),
+    ),
+    (
+        "advanced: embeddings",
+        (
+            "--embedding-max-length",
+            "--embedding-overflow-policy",
+        ),
+    ),
+    (
+        "advanced: deployment",
+        (
+            "--listen-fd",
+            "--watchdog-ppid",
+            "--video-output-dir",
+        ),
+    ),
+)
+
+
+class _ServeFullHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """``serve`` help with every option, epilog kept verbatim."""
+
+
+class _ServeHelpFormatter(_ServeFullHelpFormatter):
+    """Default ``serve --help``: skips options tagged advanced.
+
+    Filtering happens at RENDER time (not by rewriting ``action.help`` to
+    ``argparse.SUPPRESS``), so the advanced help strings stay readable to
+    ``--help-all``, ``rapid-mlx help serve``, and tests that introspect
+    ``action.help`` directly.
+    """
+
+    @staticmethod
+    def _is_advanced(action) -> bool:
+        return bool(getattr(action, "rapid_mlx_advanced", False))
+
+    def add_usage(self, usage, actions, groups, prefix=None):
+        visible = [a for a in actions if not self._is_advanced(a)]
+        # Drop any mutually-exclusive group that lost a member: argparse
+        # renders those inline against the action list it was handed.
+        groups = [
+            g for g in groups if not any(self._is_advanced(a) for a in g._group_actions)
+        ]
+        super().add_usage(usage, visible, groups, prefix)
+
+    def add_argument(self, action):
+        if self._is_advanced(action):
+            return
+        super().add_argument(action)
+
+
+class _ServeHelpAllAction(argparse.Action):
+    """``--help-all``: print the complete option list, then exit 0."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+        help=None,
+    ):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            default=default,
+            nargs=0,
+            help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.formatter_class = _ServeFullHelpFormatter
+        parser.print_help()
+        parser.exit()
+
+
+def _move_action_to_group(parser, action, group) -> None:
+    """Re-home an already-registered *action* under *group*.
+
+    Only the help renderer reads ``_group_actions``; parsing walks
+    ``parser._actions``, which is untouched. Moving after registration (as
+    opposed to threading a group object through ~110 ``add_argument`` calls)
+    keeps the tier table as the single reviewable source of truth.
+    """
+    for existing in parser._action_groups:
+        if existing is not group and action in existing._group_actions:
+            existing._group_actions.remove(action)
+    if action not in group._group_actions:
+        group._group_actions.append(action)
+    action.container = group
+
+
+def _organize_serve_help(parser: argparse.ArgumentParser) -> None:
+    """Sort the ``serve`` options into core / advanced help sections.
+
+    Flags absent from both tables stay in the default ``options`` section and
+    remain visible: a newly added flag is never silently invisible. The
+    default-help size budget in ``tests/test_serve_help_tiers.py`` is what
+    forces the follow-up decision about where it belongs.
+    """
+    by_option = {
+        opt: action for action in parser._actions for opt in action.option_strings
+    }
+    claimed: set[int] = set()
+
+    def _assign(title, description, flags, advanced):
+        group = parser.add_argument_group(title, description)
+        for flag in flags:
+            action = by_option.get(flag)
+            if action is None or id(action) in claimed:
+                continue
+            if action.help is argparse.SUPPRESS:
+                # Hidden/deprecated aliases stay hidden on every surface.
+                continue
+            claimed.add(id(action))
+            _move_action_to_group(parser, action, group)
+            if advanced:
+                action.rapid_mlx_advanced = True
+
+    for title, description, flags in _SERVE_CORE_GROUPS:
+        _assign(title, description, flags, advanced=False)
+    for title, flags in _SERVE_ADVANCED_GROUPS:
+        _assign(title, None, flags, advanced=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the full CLI parser (extracted from ``main`` so tests
     can assert effective flag defaults on the parsed namespace instead
@@ -10416,6 +10721,33 @@ Examples:
         "serve",
         help="Start OpenAI-compatible server",
         allow_abbrev=False,
+        description="Serve a local model over an OpenAI-compatible HTTP API.",
+        formatter_class=_ServeHelpFormatter,
+        epilog="""\
+Examples:
+  rapid-mlx serve qwen3.5-4b-4bit
+  rapid-mlx serve qwen3.5-9b-4bit --port 8000 --api-key sk-local
+  rapid-mlx serve mlx-community/Qwen3.5-9B-4bit --host 0.0.0.0
+
+Connecting:
+  Base URL   http://<host>:<port>/v1     (point any OpenAI client here)
+  Models     GET  /v1/models
+  Health     GET  /health
+  Auth       Authorization: Bearer <--api-key or $RAPID_MLX_API_KEY>
+
+This is the common path. Advanced and experimental options (KV-cache
+quantization, speculative decoding, prefill compression, profile overrides)
+are hidden here:
+
+  rapid-mlx serve --help-all      every option, grouped
+  docs/reference/cli.md           full reference with defaults
+  docs/guides/server.md           deployment and tuning guide
+""",
+    )
+    serve_parser.add_argument(
+        "--help-all",
+        action=_ServeHelpAllAction,
+        help="Show every option, including advanced and experimental ones",
     )
     serve_parser.add_argument(
         "model", nargs="?", type=str, help="Model to serve"
@@ -10450,11 +10782,11 @@ Examples:
         action="store_true",
         default=False,
         help=(
-            "Stream MoE routed-expert weights from disk instead of holding "
-            "them resident (opt-in). Loads the model lazily and installs "
-            "vllm_mlx.disk_stream_patch on every MoE layer before serving "
-            "starts. Only architectures registered in vllm_mlx.registry "
-            "are supported; an unregistered model_type fails at load time."
+            "Experimental. Stream mixture-of-experts weights from disk "
+            "instead of keeping them in memory, so a model larger than this "
+            "Mac's RAM can still be served — at a latency cost. Supported "
+            "only on known MoE architectures; anything else fails at load "
+            "time with an explicit error."
         ),
     )
     serve_parser.add_argument(
@@ -10462,9 +10794,9 @@ Examples:
         type=positive_finite_float,
         default=1.0,
         help=(
-            "Byte budget (GB) for the disk-stream expert LRU cache. Only "
-            "used when --disk-stream is set. Default: 1.0 GB, matching "
-            "vllm_mlx.expert_cache.ExpertCache's default."
+            "Memory budget (GB) for the disk-stream expert cache. Only "
+            "used when --disk-stream is set. Default: 1.0 GB. Raise it to "
+            "trade RAM for fewer disk reads."
         ),
     )
     serve_parser.add_argument(
@@ -10473,16 +10805,11 @@ Examples:
         default="127.0.0.1",
         help=(
             "Host to bind (default: 127.0.0.1, loopback-only). Pass "
-            '0.0.0.0 (or "") to expose the server on every '
-            "interface (LAN reachable) — only do this once the "
-            "bearer-auth posture has been reviewed. The wildcard "
-            "bind also widens the PortSweep collision window: macOS "
-            "lets a wildcard listener coexist with a more-specific "
-            "(127.0.0.1) listener on the same port, so a second "
-            "server may start and silently shadow the first on the "
-            "loopback path. The pre-flight bind check below probes "
-            "127.0.0.1 explicitly whenever --host is a wildcard "
-            "alias to keep that bypass closed."
+            '0.0.0.0 (or "") to expose the server on every interface, '
+            "reachable from the LAN — set --api-key first. Startup "
+            "refuses to bind a port another rapid-mlx server already "
+            "holds, including the loopback address behind a wildcard "
+            "bind."
         ),
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
@@ -10548,7 +10875,7 @@ Examples:
             "requests start decoding sooner instead of all sharing one "
             "full-wave prefill — at an aggregate-throughput cost on large MoE "
             "models, where staggered rows carry ragged offsets that push "
-            "batched attention onto a slower path (see #1861)."
+            "batched attention onto a slower path."
         ),
     )
     serve_parser.add_argument(
@@ -10637,7 +10964,7 @@ Examples:
         default=0,
         metavar="BYTES",
         help=(
-            "Override the per-token KV-cache size the D-METAL-CAP admission "
+            "Override the per-token KV-cache size the memory admission "
             "gate projects, in bytes. 0 (default) auto-derives an "
             "architecture-aware fp16 figure. Set this when running a "
             "quantized KV cache (--kv-cache-turboquant / "
@@ -10681,10 +11008,9 @@ Examples:
         default="radix",
         choices=("radix", "hash"),
         help=(
-            "Prefix-cache lookup index: 'radix' (default, R15-P1) uses a "
-            "token trie for O(prefix_len) lookups and surfaces dedup-bytes-"
-            "saved on /metrics; 'hash' falls back to the legacy bisect-over-"
-            "sorted-keys path."
+            "Prefix-cache lookup index: 'radix' (default) uses a token trie "
+            "for O(prefix_len) lookups and reports dedup-bytes-saved on "
+            "/metrics; 'hash' falls back to the legacy linear-scan path."
         ),
     )
     # KV cache quantization options
@@ -10708,10 +11034,10 @@ Examples:
         default="bf16",
         choices=["bf16", "int8", "int4"],
         help=(
-            "KV cache dtype (R15 #300, default: bf16). int8/int4 shrink the "
+            "KV cache dtype (default: bf16). int8/int4 shrink the "
             "KV cache 2x/4x for memory-constrained hosts, but the live-cache "
             "dequant-on-read costs O(context) per decode step — measured "
-            "-27%% (int4) / -36%% (int8) at 16k context (#1853). "
+            "-27%% (int4) / -36%% (int8) at 16k context. "
             "An explicit int8/int4 on a sliding-window (Gemma 3/4, "
             "GPT-OSS) or MLA (DeepSeek V3+, Kimi K2.5) model is rejected "
             "before the server reports ready; only auto/profile-selected "
@@ -10778,7 +11104,7 @@ Examples:
         choices=["v4", "k8v4", "none"],
         help="Enable TurboQuant KV-cache compression. ``v4`` (default when "
         "the flag is bare) is V-only 3-4 bit Lloyd-Max with K in FP16; "
-        "``k8v4`` is the R15 Phase 4 mix — K at 8-bit Walsh-Hadamard + V at "
+        "``k8v4`` mixes K at 8-bit Walsh-Hadamard with V at "
         "4-bit Lloyd-Max (~4.6x KV compression on dense models); ``none`` "
         "is the explicit off-switch — overrides the alias-driven "
         "``turboquant_tier=k8v4_verified`` default so the operator can A/B "
@@ -10815,11 +11141,11 @@ Examples:
         default=0,
         help=(
             "Token interval at which the scheduler snapshots KV state to "
-            "~/.cache/rapid-mlx/kv_checkpoints/ (R15 #296). 0 (default) "
-            "disables. Write-only today: no engine path reloads the "
+            "~/.cache/rapid-mlx/kv_checkpoints/. 0 (default) "
+            "disables. Write-only today: nothing reloads the "
             "snapshots yet, and each one blocks decode for O(context) — "
-            "enable only for external tooling that consumes the files "
-            "(#1853). Pairs with the RAPID_MLX_KV_CHECKPOINT_MAX_BYTES "
+            "enable only for external tooling that consumes the files. "
+            "Pairs with the RAPID_MLX_KV_CHECKPOINT_MAX_BYTES "
             "env var (default 20 GiB) for the oldest-first disk-cap "
             "eviction policy."
         ),
@@ -10841,8 +11167,8 @@ Examples:
         dest="speculative_config",
         default=None,
         help=(
-            "vLLM-style speculative decoding JSON config. This frontend "
-            "parses method/model/num_speculative_tokens now. DFlash "
+            "Speculative decoding config, as vLLM-style JSON with "
+            "method/model/num_speculative_tokens. DFlash "
             "requires the rapid-mlx[dflash] extra and is available with "
             '\'{"method":"dflash"}\', DDTree with '
             '\'{"method":"ddtree"}\', and MTP with '
@@ -11236,8 +11562,8 @@ Examples:
             "granite/granite3, nemotron/nemotron3, xlam, functionary/meetkai, "
             "glm47/glm4, minimax/minimax_m2, harmony/gpt-oss/gpt_oss, "
             "gemma4/gemma_4, seed_oss/seed. "
-            "Run `python -c 'from vllm_mlx.tool_parsers import ToolParserManager;"
-            "print(sorted(ToolParserManager.tool_parsers))'` for the live list. "
+            "An unknown name is rejected at startup with the full list of "
+            "accepted values; see docs/guides/tool-calling.md. "
             "Required for --enable-auto-tool-choice."
         ),
     )
@@ -11259,9 +11585,9 @@ Examples:
         default=None,
         choices=reasoning_choices,
         help=(
-            "Enable reasoning content extraction with specified parser. "
-            "Extracts <think>...</think> tags into reasoning_content field. "
-            f"Options: {', '.join(reasoning_choices)}."
+            "Extract chain-of-thought into the reasoning_content field "
+            "(<think>...</think> tags) using the named parser. Auto-detected "
+            "from the model when omitted."
         ),
     )
     serve_parser.add_argument(
@@ -11290,9 +11616,9 @@ Examples:
         action="store_true",
         default=False,
         help=(
-            "Force-disable tool-call parser auto-detection from the alias "
-            "profile. Escape hatch (SOP §10) when AliasProfile's auto-"
-            "selected parser misfires for a specific deployment. Mutually "
+            "Force-disable tool-call parser auto-detection from the model "
+            "profile. Escape hatch for when the auto-selected parser "
+            "misfires for a specific deployment. Mutually "
             "exclusive with --tool-call-parser."
         ),
     )
@@ -11320,7 +11646,7 @@ Examples:
         default=False,
         help=(
             "Force-treat the model as a hybrid (linear-attention / Mamba) "
-            "architecture even when AliasProfile says otherwise. Disables "
+            "architecture even when the model profile says otherwise. Disables "
             "spec/suffix decode paths that are unsound on hybrids. "
             "Mutually exclusive with --no-hybrid."
         ),
@@ -11332,7 +11658,7 @@ Examples:
         default=False,
         help=(
             "Force-treat the model as non-hybrid (full attention) even when "
-            "AliasProfile says it's hybrid. Use when the profile mis-labels "
+            "the model profile says it's hybrid. Use when the profile mis-labels "
             "your model and you want spec/suffix decode enabled. "
             "Mutually exclusive with --force-hybrid."
         ),
@@ -11344,7 +11670,7 @@ Examples:
         default=False,
         help=(
             "Force-enable speculative-decode eligibility even when "
-            "AliasProfile says the model doesn't support it. Risky on "
+            "the model profile says it doesn't support it. Risky on "
             "hybrid models — use only when you've verified the profile "
             "is wrong. Mutually exclusive with --no-spec-decode."
         ),
@@ -11356,7 +11682,7 @@ Examples:
         default=False,
         help=(
             "Force-disable speculative-decode eligibility (suffix / MTP / "
-            "DFlash / DDTree) even when AliasProfile says the model supports it. "
+            "DFlash / DDTree) even when the model profile says it is supported. "
             "Mutually exclusive with --force-spec-decode."
         ),
     )
@@ -11372,9 +11698,9 @@ Examples:
         action="store_true",
         default=False,
         help=(
-            "Force-on: construct HarmonyStreamingRouter even when the "
-            "compat gate would reject. Use to debug a regression in the "
-            "gate itself; production should leave this off. Mutually "
+            "Force-on: use the OpenAI Harmony streaming parser even when "
+            "the compatibility check would reject this tokenizer. For "
+            "debugging that check; leave off in production. Mutually "
             "exclusive with --no-openai-harmony-streaming."
         ),
     )
@@ -11384,10 +11710,9 @@ Examples:
         action="store_true",
         default=False,
         help=(
-            "Force-off: skip the HarmonyStreamingRouter upgrade and use "
-            "the legacy custom harmony state machine even on matched-vocab "
-            "gpt-oss tokenizers. Escape hatch for a hypothetical false "
-            "positive in the compat gate. Mutually exclusive with "
+            "Force-off: keep the legacy harmony streaming path even on "
+            "gpt-oss tokenizers the compatibility check accepts. Escape "
+            "hatch for a false positive in that check. Mutually exclusive with "
             "--force-openai-harmony-streaming."
         ),
     )
@@ -11427,14 +11752,14 @@ Examples:
     serve_parser.add_argument(
         "--mllm",
         action="store_true",
-        help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns. Also DISABLES the automatic text-only fallback: normally a vision-config checkpoint that ships no usable vision tower auto-degrades to text-only serving (#1187); with --mllm it hard-fails instead so a deliberate demand for the vision lane is never silently downgraded.",
+        help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns. Also DISABLES the automatic text-only fallback: normally a vision-config checkpoint that ships no usable vision tower auto-degrades to text-only serving; with --mllm it hard-fails instead so a deliberate demand for the vision lane is never silently downgraded.",
     )
     serve_parser.add_argument(
         "--no-mllm",
         "--text-only",
         dest="no_mllm",
         action="store_true",
-        help="Force load model as text-only LLM even when auto-detection would route it to the multimodal/VLM path. Escape hatch for incomplete vision-tower checkpoints (#393) and text-only forks of multimodal architectures whose config.json still declares vision_config.",
+        help="Force load model as text-only LLM even when auto-detection would route it to the multimodal/VLM path. Escape hatch for incomplete vision-tower checkpoints and text-only forks of multimodal architectures whose config.json still declares vision_config.",
     )
     # Generation defaults
     serve_parser.add_argument(
@@ -11544,6 +11869,10 @@ Examples:
     # PFlash long-prompt prefill compression (#287). Off by default; see
     # vllm_mlx/pflash.py for the design and the prefix-cache bypass.
     _add_pflash_args(serve_parser)
+    # Split the (very large) serve flag surface into core / advanced help
+    # sections. Must run after the LAST serve add_argument call. Parsing is
+    # unaffected; only ``--help`` rendering changes (issue #2354).
+    _organize_serve_help(serve_parser)
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument(

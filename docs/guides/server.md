@@ -24,9 +24,10 @@ rapid-mlx serve qwen3.5-9b-4bit --port 8000 --use-paged-cache
 
 ## Server Options
 
-The most consequential `rapid-mlx serve` flags. The exhaustive list — every
-flag visible in `rapid-mlx serve --help`, grouped by category — lives in the
-[CLI reference](../reference/cli.md#rapid-mlx-serve).
+The most consequential `rapid-mlx serve` flags. `rapid-mlx serve --help` shows
+the core startup options; `rapid-mlx serve --help-all` adds the advanced and
+experimental groups. The exhaustive list, grouped by category with defaults,
+lives in the [CLI reference](../reference/cli.md#rapid-mlx-serve).
 
 | Option | Description | Default |
 |--------|-------------|---------|

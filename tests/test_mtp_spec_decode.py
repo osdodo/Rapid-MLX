@@ -591,18 +591,19 @@ def test_cache_patch_is_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def _serve_help_stdout() -> str:
-    """Run ``python -m vllm_mlx.cli serve --help`` and return stdout.
+def _serve_help_stdout(flag: str = "--help-all") -> str:
+    """Run ``python -m vllm_mlx.cli serve <flag>`` and return stdout.
 
     Mirrors :mod:`tests.test_kv_cache_dtype_cli` — the serve parser is
     inlined into ``main()``, so subprocess inspection is the canonical
-    way to assert that the flag landed.
+    way to assert that the flag landed. Defaults to ``--help-all``:
+    issue #2354 tiered the help, and speculative decoding is advanced.
     """
     import subprocess
     import sys
 
     proc = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", flag],
         capture_output=True,
         text=True,
         timeout=60,
@@ -644,24 +645,14 @@ def test_cli_spec_decode_flag_is_hidden_but_recognized():
 
 
 def test_cli_spec_decode_mtp_legacy_choice_absent_from_help():
-    """Deprecated ``--spec-decode mtp`` is absent, not merely hidden."""
-    import subprocess
-    import sys
+    """Deprecated ``--spec-decode mtp`` is absent, not merely hidden.
 
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "vllm_mlx.cli",
-            "serve",
-            "--help",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert "--spec-decode" not in proc.stdout
+    Checked on both help surfaces: ``--help-all`` (issue #2354) reveals the
+    advanced tier, so a deprecated flag leaking back would show up there
+    first.
+    """
+    for surface in ("--help", "--help-all"):
+        assert "--spec-decode" not in _serve_help_stdout(surface)
 
 
 def test_scheduler_config_default_spec_decode_is_none():

@@ -178,8 +178,8 @@ def test_detect_sidecar_default_argument_matches_pre_0913_behaviour():
 # ---------------------------------------------------------------------------
 
 
-def _serve_help_stdout() -> str:
-    """Run ``python -m vllm_mlx.cli serve --help`` and return stdout.
+def _serve_help_stdout(flag: str = "--help") -> str:
+    """Run ``python -m vllm_mlx.cli serve <flag>`` and return stdout.
 
     Mirrors ``tests/test_dflash_spec_decode.py::_serve_help_stdout`` —
     same pattern lets us pin the flag without importing the giant CLI
@@ -189,7 +189,7 @@ def _serve_help_stdout() -> str:
     import sys
 
     proc = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", flag],
         capture_output=True,
         text=True,
         timeout=60,
@@ -199,11 +199,17 @@ def _serve_help_stdout() -> str:
 
 
 def test_cli_serve_help_hides_legacy_mtp_sidecar_flag():
-    """MTP sidecars are configured through ``--speculative-config`` only."""
-    text = _serve_help_stdout()
-    assert "--mtp-sidecar" not in text
-    assert "--mtp-max-k" not in text
-    assert "--mtp-disable-auto-k" not in text
+    """MTP sidecars are configured through ``--speculative-config`` only.
+
+    Both help surfaces are checked: ``--help-all`` (issue #2354) prints the
+    advanced tier, so a deprecated flag regaining a help string would show
+    up there even while the default help stays clean.
+    """
+    for surface in ("--help", "--help-all"):
+        text = _serve_help_stdout(surface)
+        assert "--mtp-sidecar" not in text
+        assert "--mtp-max-k" not in text
+        assert "--mtp-disable-auto-k" not in text
 
 
 # ---------------------------------------------------------------------------

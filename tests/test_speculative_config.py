@@ -210,8 +210,11 @@ def test_spec_decoder_registry_lists_existing_backends() -> None:
 
 
 def test_serve_help_exposes_speculative_config() -> None:
+    """Speculative decoding is an advanced knob, so it lives on the
+    ``--help-all`` surface (issue #2354 moved it out of the default
+    ``serve --help``). It must stay discoverable there."""
     proc = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help-all"],
         capture_output=True,
         text=True,
         timeout=30,

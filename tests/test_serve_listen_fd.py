@@ -796,11 +796,14 @@ def test_serve_command_resets_stale_bind_fields_between_invocations(
 
 
 def test_serve_listen_fd_help_documents_host_port_ignored(capsys):
-    """``rapid-mlx serve --help`` must mention that ``--host``/``--port``
+    """``rapid-mlx serve --help-all`` must mention that ``--host``/``--port``
     are ignored when ``--listen-fd`` is set. Operators reading the help
-    text need to know the precedence without diving into source."""
+    text need to know the precedence without diving into source.
+
+    Socket activation is a deployment-tier flag, so issue #2354 moved it
+    off the default help onto the ``--help-all`` surface."""
     with (
-        patch.object(sys, "argv", ["rapid-mlx", "serve", "--help"]),
+        patch.object(sys, "argv", ["rapid-mlx", "serve", "--help-all"]),
         pytest.raises(SystemExit) as exc,
     ):
         cli.main()
