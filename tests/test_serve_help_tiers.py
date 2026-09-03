@@ -96,6 +96,18 @@ def test_default_help_documents_the_connection_contract(default_help):
     assert "RAPID_MLX_API_KEY" in default_help
 
 
+def test_default_help_examples_do_not_advertise_unauthenticated_lan_binding(
+    default_help,
+):
+    examples = default_help.split("Examples:", 1)[1].split("Connecting:", 1)[0]
+    unsafe = [
+        line
+        for line in examples.splitlines()
+        if "--host 0.0.0.0" in line and "--api-key" not in line
+    ]
+    assert not unsafe, f"unauthenticated wildcard-bind example: {unsafe}"
+
+
 def test_default_help_points_at_the_advanced_surface(default_help):
     assert "--help-all" in default_help
     assert "docs/reference/cli.md" in default_help
@@ -225,6 +237,26 @@ def test_tiering_does_not_change_parsing():
     assert args.listen_fd == 7
     assert args.disk_stream is True
     assert args.pflash == "always"
+
+
+def test_help_all_does_not_change_later_help_rendering(capsys):
+    """A reusable parser must return to the default help tier after --help-all."""
+    pytest.importorskip("websockets")
+    from vllm_mlx.cli import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit) as full_exit:
+        parser.parse_args(["serve", "--help-all"])
+    full_help = capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as default_exit:
+        parser.parse_args(["serve", "--help"])
+    default_help = capsys.readouterr().out
+
+    assert full_exit.value.code == 0
+    assert default_exit.value.code == 0
+    assert "--listen-fd" in full_help
+    assert "--listen-fd" not in default_help
 
 
 def test_every_tiered_flag_exists_on_the_serve_parser():

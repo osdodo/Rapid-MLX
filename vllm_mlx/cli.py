@@ -10620,8 +10620,12 @@ class _ServeHelpAllAction(argparse.Action):
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
-        parser.formatter_class = _ServeFullHelpFormatter
-        parser.print_help()
+        formatter_class = parser.formatter_class
+        try:
+            parser.formatter_class = _ServeFullHelpFormatter
+            parser.print_help()
+        finally:
+            parser.formatter_class = formatter_class
         parser.exit()
 
 
@@ -10727,7 +10731,7 @@ Examples:
 Examples:
   rapid-mlx serve qwen3.5-4b-4bit
   rapid-mlx serve qwen3.5-9b-4bit --port 8000 --api-key sk-local
-  rapid-mlx serve mlx-community/Qwen3.5-9B-4bit --host 0.0.0.0
+  rapid-mlx serve mlx-community/Qwen3.5-9B-4bit
 
 Connecting:
   Base URL   http://<host>:<port>/v1     (point any OpenAI client here)
@@ -11010,7 +11014,7 @@ are hidden here:
         help=(
             "Prefix-cache lookup index: 'radix' (default) uses a token trie "
             "for O(prefix_len) lookups and reports dedup-bytes-saved on "
-            "/metrics; 'hash' falls back to the legacy linear-scan path."
+            "/metrics; 'hash' falls back to bisect over sorted keys."
         ),
     )
     # KV cache quantization options
